@@ -1,0 +1,20 @@
+[project]
+name = "finance-chitti-backend"
+version = "1.0.0"
+description = "Finance & Chitti Management System - Backend API"
+requires-python = ">=3.12"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

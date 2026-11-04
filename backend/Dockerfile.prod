@@ -1,0 +1,38 @@
+# Production image: no bind mounts, no reload, non-root, 2 uvicorn workers.
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    TZ=Asia/Kolkata
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libpq5 tzdata \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# So alembic/console scripts can import the app package.
+ENV PYTHONPATH=/app
+
+COPY alembic.ini ./
+COPY alembic ./alembic
+COPY app ./app
+COPY scripts ./scripts
+
+RUN useradd --system --uid 10001 --create-home appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+# --proxy-headers: trust Caddy's X-Forwarded-* so client IPs / scheme are right.
+CMD ["uvicorn", "app.main:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "2", \
+     "--proxy-headers", "--forwarded-allow-ips", "*", \
+     "--no-server-header"]

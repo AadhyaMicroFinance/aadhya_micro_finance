@@ -1,0 +1,40 @@
+# Single entry point for the whole app.
+#   SITE_ADDRESS=":80"            -> http://<elastic-ip>      (no domain yet)
+#   SITE_ADDRESS="finance.x.com"  -> https://finance.x.com    (automatic TLS)
+{
+	# Local/Let's Encrypt state lives in the caddy_data volume.
+	admin off
+}
+
+{$SITE_ADDRESS} {
+	encode zstd gzip
+
+	# API + docs go straight to FastAPI.
+	@api path /api/* /health /openapi.json /docs /docs/* /redoc /redoc/*
+	handle @api {
+		reverse_proxy backend:8000
+	}
+
+	# Everything else is the Next.js app.
+	handle {
+		reverse_proxy web:3000
+	}
+
+	header {
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "geolocation=(), microphone=(), camera=()"
+		-Server
+	}
+
+	# Financial exports/documents are small; cap request bodies.
+	request_body {
+		max_size 10MB
+	}
+
+	log {
+		output stderr
+		format json
+	}
+}

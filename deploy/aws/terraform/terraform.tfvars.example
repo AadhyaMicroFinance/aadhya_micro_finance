@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and adjust.
+aws_region      = "ap-south-1"
+project_name    = "finance-chitti"
+instance_type   = "t3.medium"
+root_volume_gb  = 40
+
+# Public key registered with the instance (deploy.sh creates this keypair
+# at ~/.ssh/finance-chitti-aws if it is missing).
+ssh_public_key_path = "~/.ssh/finance-chitti-aws.pub"
+
+# Your IP, so SSH is not open to the world: https://checkip.amazonaws.com
+# Leave "10.0.0.0/8" style default empty to rely on SSM Session Manager only.
+admin_cidr = ""
