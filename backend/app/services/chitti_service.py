@@ -371,12 +371,11 @@ class ChittiService:
     ) -> dict:
         """Single source of truth for whether a chitti can be started.
 
-        Rules below are the ones the existing backend already enforced
-        (members must exist, at least one member must have completed the
-        agreement workflow, a period schedule must exist). Nothing new is
-        invented here; partial-agreement state is surfaced as a warning only,
-        because the business owner has not defined whether every agreement
-        must be confirmed before activation.
+        Rules: members must exist, every enrolled member's agreement must be
+        confirmed (i.e. physically signed), and a period schedule must exist.
+        The "all agreements signed" rule is the business owner's decision: a
+        chitti must never start while any enrolled member's agreement is
+        unsigned, because that member cannot be held to the terms.
         """
         enrolled = await self.member_repo.count_enrolled(chitti.id)
         active = await self.member_repo.count_active(chitti.id)
@@ -405,12 +404,12 @@ class ChittiService:
                 ),
             })
         elif pending_agreements > 0:
-            warnings.append({
-                "code": "PARTIAL_AGREEMENTS",
+            blockers.append({
+                "code": "AGREEMENTS_PENDING",
                 "message": (
-                    f"{pending_agreements} enrolled member(s) have not confirmed their agreement. "
-                    "The chitti can start because at least one member is active, but those members "
-                    "cannot contribute until their agreement is confirmed."
+                    f"{pending_agreements} enrolled member(s) have not signed their agreement. "
+                    "Every enrolled member's agreement must be generated, printed and confirmed "
+                    "before this chitti can start."
                 ),
             })
         if not schedules:
@@ -860,12 +859,21 @@ class ChittiService:
             plan = await self.plan_repo.get_by_id(chitti.plan_id)
             enrolled_members = await self.member_repo.count_enrolled(chitti.id)
             active_members = await self.member_repo.count_active(chitti.id)
+            pending_agreements = await self.member_repo.count_pending_agreements(
+                chitti.id
+            )
             schedules = await self.schedule_repo.get_by_chitti_id(chitti.id)
             totals = await self._financial_totals(chitti, schedules=schedules)
-            # Same rule as activation_status(), without a second round of counts.
+            # Same rule as activation_status(): a DRAFT/UPCOMING chitti is only
+            # ready once members exist, every agreement is signed, and periods exist.
             blocked = (
                 chitti.status in ("DRAFT", "UPCOMING")
-                and (enrolled_members == 0 or active_members == 0 or not schedules)
+                and (
+                    enrolled_members == 0
+                    or active_members == 0
+                    or pending_agreements > 0
+                    or not schedules
+                )
             )
             display_state = (
                 "ACTIVATION_BLOCKED"
@@ -887,6 +895,7 @@ class ChittiService:
                 "member_count": enrolled_members,
                 "enrolled_members": enrolled_members,
                 "active_members": active_members,
+                "pending_agreements": pending_agreements,
                 "member_capacity": chitti.member_count,
                 "current_period": chitti.current_period,
                 "total_periods": chitti.plan_snapshot.get("duration", 0),

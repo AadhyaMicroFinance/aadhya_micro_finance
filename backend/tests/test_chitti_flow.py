@@ -219,11 +219,40 @@ async def test_member_count_duplicate_and_activation(client, test_user):
     activated = next(m for m in members_after if m["id"] == members[0]["id"])
     assert activated["status"] == "ACTIVE"
 
+    # Business rule: one signed member is NOT enough — every enrolled member
+    # must sign before the chitti may start.
+    activation_partial = (
+        await client.get(f"/api/v1/chitti/{chitti_id}/activation", headers=headers)
+    ).json()["data"]
+    assert activation_partial["active_members"] == 1
+    assert activation_partial["pending_agreements"] == 9
+    assert activation_partial["can_activate"] is False
+    assert "AGREEMENTS_PENDING" in {b["code"] for b in activation_partial["blockers"]}
+    assert activation_partial["warnings"] == []
+
+    partial_start = await client.post(f"/api/v1/chitti/{chitti_id}/start", headers=headers)
+    assert partial_start.status_code == 400, partial_start.text
+    assert partial_start.json()["error"]["code"] == "ACTIVATION_BLOCKED"
+    assert "AGREEMENTS_PENDING" in {
+        b["code"] for b in partial_start.json()["error"]["details"]["blockers"]
+    }
+    dash_partial = next(
+        i
+        for i in (await client.get("/api/v1/chitti/dashboard", headers=headers)).json()["data"]
+        if i["id"] == chitti_id
+    )
+    assert dash_partial["display_state"] == "ACTIVATION_BLOCKED"
+    assert dash_partial["pending_agreements"] == 9
+
+    # Sign every remaining agreement, then the chitti becomes startable.
+    for member in members[1:]:
+        await _activate_member(client, headers, chitti_id, member["id"])
+
     activation_ready = (await client.get(f"/api/v1/chitti/{chitti_id}/activation", headers=headers)).json()["data"]
+    assert activation_ready["pending_agreements"] == 0
+    assert activation_ready["active_members"] == 10
     assert activation_ready["can_activate"] is True
-    assert activation_ready["active_members"] == 1
-    assert activation_ready["pending_agreements"] == 9
-    assert {w["code"] for w in activation_ready["warnings"]} == {"PARTIAL_AGREEMENTS"}
+    assert activation_ready["blockers"] == []
 
     # ---- BUG-004: start persists and is visible on re-read ---------------
     started = await client.post(f"/api/v1/chitti/{chitti_id}/start", headers=headers)
@@ -242,10 +271,10 @@ async def test_member_count_duplicate_and_activation(client, test_user):
     assert summary_after["display_state"] == "ACTIVE"
     assert summary_after["activation"]["can_activate"] is False
     assert summary_after["financials_source"] == "contributions"
-    # One ACTIVE member => 10 weekly installments of 1000.
-    assert summary_after["expected_collection"] == 10000.0
+    # 10 members x 10 weekly installments of 1000 => 100,000 expected.
+    assert summary_after["expected_collection"] == 100000.0
     assert summary_after["actual_collection"] == 0.0
-    assert summary_after["pending_collection"] == 10000.0
+    assert summary_after["pending_collection"] == 100000.0
 
     # IMP-001: every numeric value in the payload is finite.
     _assert_finite(summary_after)

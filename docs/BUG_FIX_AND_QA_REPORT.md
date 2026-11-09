@@ -128,7 +128,7 @@ guard returns `400 CHITTI_FULL`.
 
 ## 3. BUG-003 — "Start Chitti" does not complete and gives no explanation
 
-**Status: FIXED AND TESTED** (activation rule itself unchanged — see §7)
+**Status: FIXED AND TESTED** (agreement rule tightened by business-owner decision — see §7)
 
 ### Confirmed root cause
 `ChittiService.change_status(..., "RUNNING")` required `count_active() > 0`.
@@ -158,7 +158,10 @@ state change, no explanation.
 
 ### Verified
 Blocked case: `400 ACTIVATION_BLOCKED`, `details.blockers` non-empty, chitti
-still `DRAFT` in the database. Ready case: `can_activate: true`.
+still `DRAFT` in the database. Partial case (some agreements unsigned):
+`AGREEMENTS_PENDING` blocker, start rejected with the same code. Ready case:
+`can_activate: true` **only** once every enrolled member's agreement has been
+generated, printed and confirmed.
 
 ---
 
@@ -250,7 +253,8 @@ are derived, not written.
 
 ## 7. IMP-003 — Chitti lifecycle visibility
 
-**Status: PARTIALLY IMPLEMENTED — display states need business-owner approval**
+**Status: IMPLEMENTED** — display states are derived labels only; the agreement
+prerequisite is now decided by the business owner (below).
 
 Derived, display-only labels are mapped onto the existing backend statuses; **no
 new database status was added**:
@@ -265,11 +269,22 @@ new database status was added**:
 | Completed | `COMPLETED` |
 | Cancelled | `CANCELLED` |
 
-**Business-owner decision required:** whether a chitti may start when *some*
-members still have incomplete agreements. The existing backend rule (at least
-one `ACTIVE` member) is preserved exactly; the new code surfaces pending
-agreements as a **warning**, not a blocker, rather than inventing a stricter
-rule.
+**Decided by the business owner (Nov 2026): a chitti must not start while any
+enrolled member's agreement is unsigned.** Implemented as follows:
+
+- `NO_ACTIVE_MEMBERS` — nobody has signed yet (start blocked).
+- `AGREEMENTS_PENDING` — at least one member signed but `N` enrolled members' 
+  agreements are still unsigned (start blocked, blocker message states `N`).
+- `warnings[]` is kept in the response for API compatibility but is now always
+  empty; nothing about agreements is a mere warning anymore.
+- Resuming a `PAUSED` chitti is **not** a start. A chitti in progress is not
+  re-checked against this rule (its members already signed), so pause → resume
+  keeps working.
+- The dashboard `display_state` follows the same rule: a `DRAFT` chitti with any
+  unsigned agreement shows `ACTIVATION_BLOCKED`, not `READY_TO_START`.
+
+Live demo data is unaffected: `CHIT-000001` has 3 enrolled / 3 signed /
+0 pending, so it remains `READY_TO_START`.
 
 ---
 
@@ -297,8 +312,10 @@ Result: **30 passed, 1 failed** in 27.62s.
 - `tests/test_chitti_flow.py` (new, 4 tests): **4 passed**
   - `test_member_count_duplicate_and_activation` — 10-member dashboard/summary/list
     parity, duplicate rejection, cross-chitti enrollment, capacity guard,
-    blocked activation, agreement confirmation, persisted `RUNNING`, expected
-    financials, finite-number check, double-start rejection.
+    blocked activation, **1-of-10 signed still blocked (`AGREEMENTS_PENDING`) and
+    the dashboard shows `ACTIVATION_BLOCKED`**, all 10 signed → startable,
+    persisted `RUNNING`, expected financials (100,000 for 10 members × 10
+    installments), finite-number check, pause/resume, double-start rejection.
   - `test_activation_requires_members` — `NO_MEMBERS`, stays `DRAFT`.
   - `test_dashboard_financials_are_finite_for_draft_chitti` — no invented pending
     amount before start.
@@ -369,9 +386,9 @@ resolved it. A deployed build does not have this problem.
 
 ## 11. Remaining limitations / open questions
 
-1. **Business-owner decision:** may a chitti start while some agreements are
-   still unconfirmed? Current behaviour (unchanged): yes, provided at least one
-   member is `ACTIVE`; pending agreements are shown as a warning.
+1. ~~May a chitti start while some agreements are still unconfirmed?~~
+   **Resolved by the owner: no.** Every enrolled member's agreement must be
+   confirmed before start; implemented as the `AGREEMENTS_PENDING` blocker.
 2. **Business-owner decision:** the failing `test_with_reversal` test implies a
    disagreement about how reversed payments affect `total_paid`. Left unchanged.
 3. Prize/auction/discount/dividend formulae were intentionally not implemented or
@@ -430,6 +447,12 @@ or a Chitti action was re-audited. Two problems were found and fixed:
    of error). The list endpoint now returns `enrolled_members`/`member_capacity`
    computed in one grouped query, the table shows `enrolled / capacity`, and
    analytics uses the enrolled count.
+3. **A start precondition was too weak.** Partial agreements were reported as a
+   warning, so a chitti could start with members who had signed nothing. Per the
+   owner's decision the rules are now: no members → `NO_MEMBERS`; nobody signed →
+   `NO_ACTIVE_MEMBERS`; some unsigned → `AGREEMENTS_PENDING`; no period schedule →
+   `SCHEDULE_MISSING`. All four block the start, and the dashboard derives
+   `ACTIVATION_BLOCKED` from the same conditions.
 
 Audited surfaces and their count source after the sweep:
 
