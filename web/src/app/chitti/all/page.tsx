@@ -65,7 +65,7 @@ export default function AllChittisPage() {
                     <td><Link href={`/chitti/${c.id}`} className="text-sm font-semibold text-brand-600 hover:text-brand-700">{c.name}</Link></td>
                     <td className="text-sm text-surface-500">{c.plan_name || "—"}</td>
                     <td className="text-sm font-medium">{formatCurrency(c.total_value)}</td>
-                    <td className="text-sm">{c.member_count}</td>
+                    <td className="text-sm">{c.enrolled_members ?? 0} / {c.member_capacity ?? c.member_count}</td>
                     <td className="text-sm text-surface-500">{c.current_period} / {String((c.plan_snapshot as Record<string, unknown>)?.duration || "—")}</td>
                     <td className="text-sm text-surface-500">{formatDate(c.start_date)}</td>
                     <td><span className={cn("badge", getStatusColor(c.status))}>{c.status}</span></td>

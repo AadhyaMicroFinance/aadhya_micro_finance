@@ -19,6 +19,10 @@ from app.models.chitti import (
 )
 from app.repositories.base import BaseRepository
 
+# A member stops counting as enrolled only when the enrollment ends. This must
+# match AnalyticsService._load_members(), which excludes the same three states.
+ENROLLED_EXCLUDED_STATUSES = ("CANCELLED", "REJECTED", "LEFT")
+
 
 # ---------------------------------------------------------------------------
 # Plan
@@ -110,6 +114,50 @@ class ChittiMemberRepository(BaseRepository[ChittiMember]):
             select(func.count()).select_from(ChittiMember).where(
                 ChittiMember.chitti_id == chitti_id,
                 ChittiMember.status == "ACTIVE",
+            )
+        )
+        return result.scalar() or 0
+
+    async def count_enrolled(self, chitti_id: UUID) -> int:
+        """Members that still hold a place in the chitti.
+
+        Members move through PENDING_AGREEMENT -> AGREEMENT_GENERATED ->
+        AGREEMENT_PRINTED -> ACTIVE, so only rows that were explicitly
+        cancelled or rejected stop counting as enrolled. Counting ACTIVE only
+        made dashboards report 0 members while the Members tab listed them all.
+        """
+        result = await self.session.execute(
+            select(func.count()).select_from(ChittiMember).where(
+                ChittiMember.chitti_id == chitti_id,
+                ChittiMember.status.notin_(ENROLLED_EXCLUDED_STATUSES),
+            )
+        )
+        return result.scalar() or 0
+
+    async def count_enrolled_by_chitti(
+        self, chitti_ids: list[UUID]
+    ) -> dict[UUID, int]:
+        """Enrolled-member counts for many chittis in one query (list screens)."""
+        if not chitti_ids:
+            return {}
+        result = await self.session.execute(
+            select(ChittiMember.chitti_id, func.count())
+            .where(
+                ChittiMember.chitti_id.in_(chitti_ids),
+                ChittiMember.status.notin_(ENROLLED_EXCLUDED_STATUSES),
+            )
+            .group_by(ChittiMember.chitti_id)
+        )
+        return {row[0]: row[1] for row in result.all()}
+
+    async def count_pending_agreements(self, chitti_id: UUID) -> int:
+        """Enrolled members that have not completed the agreement workflow."""
+        result = await self.session.execute(
+            select(func.count()).select_from(ChittiMember).where(
+                ChittiMember.chitti_id == chitti_id,
+                ChittiMember.status.in_(
+                    ["PENDING_AGREEMENT", "AGREEMENT_GENERATED", "AGREEMENT_PRINTED"]
+                ),
             )
         )
         return result.scalar() or 0

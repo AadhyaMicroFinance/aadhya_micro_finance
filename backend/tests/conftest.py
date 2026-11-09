@@ -2,7 +2,7 @@
 Pytest configuration and shared fixtures.
 """
 
-import asyncio
+import os
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
@@ -17,27 +17,49 @@ from app.main import app
 from app.core.security import hash_password, create_access_token
 
 
-# Test database URL (use a separate test database)
-TEST_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/finance_chitti_test"
+# Test database URL (use a separate test database).
+# Override with TEST_DATABASE_URL when tests run inside Docker (host becomes
+# the postgres service name instead of localhost).
+TEST_DATABASE_URL = os.getenv(
+    "TEST_DATABASE_URL",
+    "postgresql+asyncpg://postgres:postgres@localhost:5432/finance_chitti_test",
+)
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create event loop for async tests."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
+# The engine and every session fixture share one (function-scoped) event loop.
+# A custom event_loop fixture used to be defined here; it conflicted with
+# pytest-asyncio's own loop and made every test fail during fixture setup with
+# "another operation is in progress".
 
 
-@pytest_asyncio.fixture(scope="session")
+def _assert_scratch_database() -> None:
+    """Refuse to touch anything but a dedicated *_test database."""
+    database = TEST_DATABASE_URL.rsplit("/", 1)[-1]
+    if not database.endswith("_test"):
+        raise RuntimeError(
+            f"Refusing to reset schema of non-test database '{database}'. "
+            "TEST_DATABASE_URL must point at a *_test database."
+        )
+
+
+@pytest_asyncio.fixture
 async def test_engine():
-    """Create test database engine."""
+    """Create the test database engine and schema for a single test.
+
+    The schema is recreated via DROP SCHEMA rather than metadata.drop_all(),
+    because chitti_members <-> chitti_agreements form a circular foreign key
+    that SQLAlchemy cannot order for DROP. Only a *_test database is reset.
+    """
+    _assert_scratch_database()
     engine = create_async_engine(TEST_DATABASE_URL, echo=False)
     async with engine.begin() as conn:
+        await conn.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
+        await conn.exec_driver_sql("CREATE SCHEMA public")
         await conn.run_sync(Base.metadata.create_all)
     yield engine
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+        await conn.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
+        await conn.exec_driver_sql("CREATE SCHEMA public")
     await engine.dispose()
 
 

@@ -148,7 +148,11 @@ class ChittiAnalyticsService:
 
         active_chittis = [c for c in chittis if c.status == "RUNNING"]
         completed_chittis = [c for c in chittis if c.status == "COMPLETED"]
-        active_members = [m for m in members if m.status == "ACTIVE"]
+        # `members` already excludes cancelled/rejected/left enrollments, so its
+        # length is the enrolled count used by the Chitti dashboard. Reporting
+        # ACTIVE-only here made analytics show 0 members for a chitti whose
+        # members are still completing their agreements (BUG-001 class).
+        enrolled_member_count = len(members)
 
         # ---- member-level rows (derived from contributions + schedule dates) ----
         schedule_by_key = {(s.chitti_id, s.period_number): s for s in schedules}
@@ -276,7 +280,7 @@ class ChittiAnalyticsService:
                 "total_collected": _f(collected_lifetime),
                 "total_pending": _f(total_pending),
                 "total_overdue": _f(overdue_amount),
-                "total_members": len(active_members),
+                "total_members": enrolled_member_count,
                 "collection_efficiency": _pct(collected_lifetime, total_expected),
                 "range_expected": _f(expected_range),
                 "range_collected": _f(collected_range),

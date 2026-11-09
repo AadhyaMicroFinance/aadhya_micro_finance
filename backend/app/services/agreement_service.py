@@ -80,36 +80,83 @@ class AgreementService:
         if not customer:
             raise NotFoundException("Customer", customer_id)
 
-        # Check duplicate membership
+        # Check duplicate membership in THIS chitti only. The same customer may
+        # legitimately join other chitti schemes.
         existing = await self.member_repo.get_by_chitti_and_customer(
             chitti.id, UUID(customer_id)
         )
         if existing and existing.status not in ("CANCELLED", "REJECTED"):
             raise ConflictException(
-                f"{customer.full_name} is already a member of this chitti."
+                "This member is already enrolled in this Chitti.",
+                error_code="DUPLICATE_ENROLLMENT",
+                details={
+                    "customer_id": str(customer.id),
+                    "customer_name": customer.full_name,
+                    "chitti_id": str(chitti.id),
+                    "existing_member_id": str(existing.id),
+                    "existing_member_number": existing.member_number,
+                    "existing_status": existing.status,
+                },
             )
 
-        # Check capacity
-        active_count = await self.member_repo.count_active(chitti.id)
-        if active_count >= chitti.member_count:
+        # Capacity counts every member holding a place, not only ACTIVE ones —
+        # pending-agreement members already occupy a slot.
+        enrolled_count = await self.member_repo.count_enrolled(chitti.id)
+        if enrolled_count >= chitti.member_count:
             raise BadRequestException(
-                f"Chitti is full. Maximum {chitti.member_count} members allowed."
+                f"This Chitti is full. Maximum {chitti.member_count} members allowed.",
+                error_code="CHITTI_FULL",
+                details={
+                    "chitti_id": str(chitti.id),
+                    "member_capacity": chitti.member_count,
+                    "enrolled_members": enrolled_count,
+                    "available_slots": 0,
+                },
             )
 
-        # Determine member number
         max_num = await self.member_repo.max_member_number(chitti.id)
         member_number = max_num + 1
 
-        member = await self.member_repo.create(
-            chitti_id=chitti.id,
-            customer_id=UUID(customer_id),
-            member_number=member_number,
-            payout_order=payout_order or member_number,
-            status="PENDING_AGREEMENT",
-            total_expected_amount=Decimal("0"),
-            total_paid_amount=Decimal("0"),
-            outstanding_amount=Decimal("0"),
-            lifted=False,
+        if existing:
+            # uq_chitti_member_customer forbids a second row, so re-enrol the
+            # previous cancelled/rejected membership instead of inserting one.
+            existing.agreement_id = None
+            member = await self.member_repo.update(
+                existing,
+                status="PENDING_AGREEMENT",
+                member_number=member_number,
+                payout_order=payout_order or member_number,
+                total_expected_amount=Decimal("0"),
+                total_paid_amount=Decimal("0"),
+                outstanding_amount=Decimal("0"),
+                lifted=False,
+                left_at=None,
+            )
+        else:
+            member = await self.member_repo.create(
+                chitti_id=chitti.id,
+                customer_id=UUID(customer_id),
+                member_number=member_number,
+                payout_order=payout_order or member_number,
+                status="PENDING_AGREEMENT",
+                total_expected_amount=Decimal("0"),
+                total_paid_amount=Decimal("0"),
+                outstanding_amount=Decimal("0"),
+                lifted=False,
+            )
+
+        from app.services.audit_service import AuditService
+        await AuditService(self.session).log(
+            user_id=created_by,
+            action="CHITTI_MEMBER_ENROLLED",
+            entity_type="chitti_member",
+            entity_id=member.id,
+            new_value={
+                "chitti_id": str(chitti.id),
+                "customer_id": str(customer.id),
+                "member_number": member_number,
+                "status": "PENDING_AGREEMENT",
+            },
         )
 
         return self._member_to_dict(member, customer)
@@ -301,6 +348,7 @@ class AgreementService:
         member_id: UUID,
         *,
         reason: str = "",
+        created_by: Optional[UUID] = None,
     ) -> dict:
         """Cancel a member enrollment."""
         member = await self.member_repo.get_by_id(member_id)
@@ -322,7 +370,19 @@ class AgreementService:
                     cancellation_reason=reason,
                 )
 
+        previous_status = member.status
         await self.member_repo.update(member, status="CANCELLED")
+
+        from app.services.audit_service import AuditService
+        await AuditService(self.session).log(
+            user_id=created_by,
+            action="CHITTI_MEMBER_CANCELLED",
+            entity_type="chitti_member",
+            entity_id=member.id,
+            previous_value={"status": previous_status},
+            new_value={"status": "CANCELLED", "reason": reason},
+        )
+
         await self.session.commit()
         return {"message": "Member cancelled."}
 

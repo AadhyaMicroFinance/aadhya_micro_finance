@@ -37,11 +37,17 @@ class NotFoundException(AppException):
 class BadRequestException(AppException):
     """Invalid request / bad input."""
 
-    def __init__(self, message: str, error_code: str = "BAD_REQUEST"):
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "BAD_REQUEST",
+        details: Optional[Any] = None,
+    ):
         super().__init__(
             message=message,
             error_code=error_code,
             status_code=400,
+            details=details,
         )
 
 
@@ -70,11 +76,17 @@ class ForbiddenException(AppException):
 class ConflictException(AppException):
     """Resource already exists or conflicting state."""
 
-    def __init__(self, message: str, error_code: str = "CONFLICT"):
+    def __init__(
+        self,
+        message: str,
+        error_code: str = "CONFLICT",
+        details: Optional[Any] = None,
+    ):
         super().__init__(
             message=message,
             error_code=error_code,
             status_code=409,
+            details=details,
         )
 
 

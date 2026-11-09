@@ -4,12 +4,36 @@ export function cn(...inputs: ClassValue[]) {
   return clsx(inputs);
 }
 
-export function formatCurrency(amount: number): string {
+/**
+ * Coerce an API value to a finite number.
+ *
+ * Financial dashboards must never print ₹NaN. Invalid values are reported to
+ * the console (so a real calculation bug is not silently hidden) and rendered
+ * as 0.
+ */
+export function toNumber(value: unknown, field?: string): number {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      console.error(`[finance] non-finite value${field ? ` in ${field}` : ""}:`, value);
+      return 0;
+    }
+    return value;
+  }
+  if (value === null || value === undefined || value === "") return 0;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    console.error(`[finance] unparseable numeric value${field ? ` in ${field}` : ""}:`, value);
+    return 0;
+  }
+  return parsed;
+}
+
+export function formatCurrency(amount: unknown, field?: string): string {
   return new Intl.NumberFormat("en-IN", {
     style: "currency",
     currency: "INR",
     maximumFractionDigits: 0,
-  }).format(amount);
+  }).format(toNumber(amount, field));
 }
 
 export function formatDate(dateStr: string): string {

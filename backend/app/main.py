@@ -49,15 +49,18 @@ def create_app() -> FastAPI:
     # Exception handlers
     @app.exception_handler(AppException)
     async def app_exception_handler(request: Request, exc: AppException):
+        error: dict = {
+            "code": exc.error_code,
+            "message": exc.message,
+        }
+        # Machine-readable context (blocked prerequisites, duplicate enrollment
+        # details, ...) so the UI can explain the failure instead of showing
+        # a bare HTTP status.
+        if exc.details is not None:
+            error["details"] = exc.details
         return JSONResponse(
             status_code=exc.status_code,
-            content={
-                "success": False,
-                "error": {
-                    "code": exc.error_code,
-                    "message": exc.message,
-                },
-            },
+            content={"success": False, "error": error},
         )
 
     @app.exception_handler(Exception)

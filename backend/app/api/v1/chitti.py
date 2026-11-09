@@ -216,6 +216,17 @@ async def update_chitti(
     return ApiResponse(data=chitti)
 
 
+@router.get("/{chitti_id}/activation", response_model=ApiResponse)
+async def chitti_activation(
+    chitti_id: UUID,
+    db: DBSession,
+    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+):
+    """Activation prerequisites: can this chitti start, and if not, why."""
+    svc = ChittiService(db)
+    return ApiResponse(data=await svc.evaluate_activation(chitti_id))
+
+
 @router.post("/{chitti_id}/start", response_model=ApiResponse)
 async def start_chitti(
     chitti_id: UUID,
@@ -223,7 +234,7 @@ async def start_chitti(
     current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
 ):
     svc = ChittiService(db)
-    chitti = await svc.change_status(chitti_id, "RUNNING")
+    chitti = await svc.change_status(chitti_id, "RUNNING", created_by=current_user.id)
     return ApiResponse(data=chitti)
 
 
@@ -234,7 +245,7 @@ async def pause_chitti(
     current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
 ):
     svc = ChittiService(db)
-    chitti = await svc.change_status(chitti_id, "PAUSED")
+    chitti = await svc.change_status(chitti_id, "PAUSED", created_by=current_user.id)
     return ApiResponse(data=chitti)
 
 
@@ -245,7 +256,7 @@ async def resume_chitti(
     current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
 ):
     svc = ChittiService(db)
-    chitti = await svc.change_status(chitti_id, "RUNNING")
+    chitti = await svc.change_status(chitti_id, "RUNNING", created_by=current_user.id)
     return ApiResponse(data=chitti)
 
 
@@ -256,7 +267,7 @@ async def complete_chitti(
     current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
 ):
     svc = ChittiService(db)
-    chitti = await svc.change_status(chitti_id, "COMPLETED")
+    chitti = await svc.change_status(chitti_id, "COMPLETED", created_by=current_user.id)
     return ApiResponse(data=chitti)
 
 
@@ -267,7 +278,7 @@ async def cancel_chitti(
     current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
 ):
     svc = ChittiService(db)
-    chitti = await svc.change_status(chitti_id, "CANCELLED")
+    chitti = await svc.change_status(chitti_id, "CANCELLED", created_by=current_user.id)
     return ApiResponse(data=chitti)
 
 
@@ -424,7 +435,9 @@ async def cancel_member(
     """Cancel a member enrollment."""
     from app.services.agreement_service import AgreementService
     svc = AgreementService(db)
-    result = await svc.cancel_member(member_id, reason=body.reason or "")
+    result = await svc.cancel_member(
+        member_id, reason=body.reason or "", created_by=current_user.id
+    )
     return ApiResponse(data=result)
 
 

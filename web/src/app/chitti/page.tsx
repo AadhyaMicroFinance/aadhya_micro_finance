@@ -8,6 +8,7 @@ import {
   type ChittiDashboardItem,
 } from "@/services/chitti";
 import { formatCurrency, formatDate, cn } from "@/lib/utils";
+import { getApiErrorMessage } from "@/services/api-client";
 import ProgressBar from "@/components/ui/ProgressBar";
 import EmptyState from "@/components/ui/EmptyState";
 import { CardSkeleton } from "@/components/ui/Skeleton";
@@ -18,6 +19,7 @@ type StatusTab = "all" | "running" | "upcoming" | "completed";
 export default function ChittiDashboardPage() {
   const [items, setItems] = useState<ChittiDashboardItem[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<StatusTab>("all");
 
   useEffect(() => {
@@ -27,6 +29,7 @@ export default function ChittiDashboardPage() {
         setItems(data);
       } catch (e) {
         console.error(e);
+        setError(getApiErrorMessage(e, "Could not load the Chitti dashboard."));
       } finally {
         setLoading(false);
       }
@@ -60,6 +63,10 @@ export default function ChittiDashboardPage() {
             Create Chitti
           </Link>
         </div>
+
+        {error && (
+          <div className="rounded-xl border border-danger-100 bg-danger-50 p-4 text-sm text-danger-700">{error}</div>
+        )}
 
         {/* Stats */}
         {!loading && items.length > 0 && (
@@ -214,7 +221,7 @@ export default function ChittiDashboardPage() {
                       <div className="flex items-center gap-4 text-xs text-surface-500">
                         <span className="flex items-center gap-1">
                           <Users size={12} />
-                          {item.member_count} members
+                          {item.member_count} / {item.member_capacity ?? item.member_count} members
                         </span>
                         <span className="flex items-center gap-1">
                           <Calendar size={12} />

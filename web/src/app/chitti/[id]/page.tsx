@@ -12,9 +12,10 @@ import {
   type ChittiPeriodSchedule,
   type ChittiPayout,
   type Agreement,
+  type ActivationStatus,
 } from "@/services/chitti";
 import type { Customer } from "@/types";
-import apiClient from "@/services/api-client";
+import apiClient, { getApiErrorMessage, getApiErrorDetails } from "@/services/api-client";
 import type { ApiResponse } from "@/types";
 import { formatCurrency, formatDate, cn, getStatusColor, getInitials } from "@/lib/utils";
 import ProgressBar from "@/components/ui/ProgressBar";
@@ -42,6 +43,24 @@ import {
 } from "lucide-react";
 
 type Tab = "overview" | "members" | "schedule" | "payouts";
+
+// Display-only lifecycle labels mapped onto the existing backend statuses.
+const DISPLAY_STATE_LABELS: Record<string, string> = {
+  READY_TO_START: "Ready to Start",
+  ACTIVATION_BLOCKED: "Activation Blocked",
+  ACTIVE: "Active",
+  PAUSED: "Paused",
+  COMPLETED: "Completed",
+  CANCELLED: "Cancelled",
+  DRAFT: "Draft",
+  UPCOMING: "Upcoming",
+  ARCHIVED: "Archived",
+};
+
+function displayStateLabel(state?: string | null): string {
+  if (!state) return "—";
+  return DISPLAY_STATE_LABELS[state] ?? state.replace(/_/g, " ");
+}
 
 // ============================================================
 // Agreement Preview Modal
@@ -186,12 +205,14 @@ function AddMemberModal({
   chittiId,
   currentCount,
   maxCount,
+  enrolledCustomerIds,
   onClose,
   onAdded,
 }: {
   chittiId: string;
   currentCount: number;
   maxCount: number;
+  enrolledCustomerIds: Set<string>;
   onClose: () => void;
   onAdded: () => void;
 }) {
@@ -228,7 +249,10 @@ function AddMemberModal({
       });
       onAdded();
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "Failed to add member");
+      // The API sends a specific 409 (DUPLICATE_ENROLLMENT) message; show it
+      // instead of the generic "Request failed with status code 409". The
+      // dialog stays open with the selected customer preserved.
+      setError(getApiErrorMessage(e, "Failed to add member. Please try again."));
     } finally {
       setAdding(false);
     }
@@ -265,20 +289,31 @@ function AddMemberModal({
             {loading && <p className="text-sm text-surface-500 text-center py-2">Searching...</p>}
             {customers.length > 0 && (
               <div className="max-h-60 overflow-y-auto rounded-xl border border-surface-100 divide-y divide-surface-50">
-                {customers.map((c) => (
-                  <button
-                    key={c.id}
-                    onClick={() => setSelectedCustomer(c)}
-                    className="w-full text-left p-4 hover:bg-surface-50 transition-colors flex items-center gap-3"
-                  >
-                    <Avatar name={c.full_name} size="md" />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-surface-900 truncate">{c.full_name}</p>
-                      <p className="text-xs text-surface-500">{c.customer_code} • {c.mobile_number}</p>
-                    </div>
-                    <ChevronRight size={16} className="text-surface-300" />
-                  </button>
-                ))}
+                {customers.map((c) => {
+                  const alreadyEnrolled = enrolledCustomerIds.has(c.id);
+                  return (
+                    <button
+                      key={c.id}
+                      onClick={() => { if (!alreadyEnrolled) setSelectedCustomer(c); }}
+                      disabled={alreadyEnrolled}
+                      className={cn(
+                        "w-full text-left p-4 flex items-center gap-3 transition-colors",
+                        alreadyEnrolled ? "cursor-not-allowed opacity-60" : "hover:bg-surface-50"
+                      )}
+                    >
+                      <Avatar name={c.full_name} size="md" />
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-medium text-surface-900 truncate">{c.full_name}</p>
+                        <p className="text-xs text-surface-500">{c.customer_code} • {c.mobile_number}</p>
+                      </div>
+                      {alreadyEnrolled ? (
+                        <span className="badge badge-warning">Already enrolled</span>
+                      ) : (
+                        <ChevronRight size={16} className="text-surface-300" />
+                      )}
+                    </button>
+                  );
+                })}
               </div>
             )}
             {!loading && search.length >= 2 && customers.length === 0 && (
@@ -332,6 +367,13 @@ export default function ChittiDetailPage() {
   const [payouts, setPayouts] = useState<ChittiPayout[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab>("overview");
+  const [activation, setActivation] = useState<ActivationStatus | null>(null);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [feedback, setFeedback] = useState<{
+    type: "success" | "error";
+    message: string;
+    blockers?: { code: string; message: string }[];
+  } | null>(null);
   const [selectedMember, setSelectedMember] = useState<
     (ChittiMember & { agreement?: Agreement | null }) | null
   >(null);
@@ -341,14 +383,20 @@ export default function ChittiDetailPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [c, s] = await Promise.all([
+      const [c, s, m, a] = await Promise.all([
         chittiApi.getChitti(chittiId),
         chittiApi.getSummary(chittiId),
+        chittiApi.listMembers(chittiId),
+        chittiApi.getActivation(chittiId),
       ]);
       setChitti(c);
       setSummary(s);
-    } catch (e) { console.error(e); }
-    finally { setLoading(false); }
+      setMembers(m);
+      setActivation(a);
+    } catch (e) {
+      console.error(e);
+      setFeedback({ type: "error", message: getApiErrorMessage(e, "Could not load this Chitti.") });
+    } finally { setLoading(false); }
   }, [chittiId]);
 
   useEffect(() => { loadData(); }, [loadData]);
@@ -371,11 +419,49 @@ export default function ChittiDetailPage() {
   };
 
   const handleStatusChange = async (action: "start" | "pause" | "resume" | "complete" | "cancel") => {
+    if (actionLoading) return; // guard against double submission
     if (!confirm(`Are you sure you want to ${action} this chitti?`)) return;
+    setActionLoading(action);
+    setFeedback(null);
     try {
-      setChitti(await chittiApi.changeStatus(chittiId, action));
-      setSummary(await chittiApi.getSummary(chittiId));
-    } catch (e) { console.error(e); }
+      await chittiApi.changeStatus(chittiId, action);
+      // Re-read everything from the backend so the badge, counts and financials
+      // show the persisted state rather than a locally guessed one.
+      await loadData();
+      setFeedback({
+        type: "success",
+        message:
+          action === "start" ? "Chitti started successfully."
+          : action === "pause" ? "Chitti paused."
+          : action === "resume" ? "Chitti resumed."
+          : action === "complete" ? "Chitti completed."
+          : "Chitti cancelled.",
+      });
+    } catch (e: unknown) {
+      const details = getApiErrorDetails<ActivationStatus>(e);
+      if (details?.blockers) setActivation(details);
+      setFeedback({
+        type: "error",
+        message: getApiErrorMessage(e, `Could not ${action} this Chitti.`),
+        blockers: details?.blockers,
+      });
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleStart = async () => {
+    // Explain the exact blocked prerequisites instead of sending a request
+    // that is guaranteed to fail.
+    if (activation && !activation.can_activate) {
+      setFeedback({
+        type: "error",
+        message: "This Chitti cannot be started yet.",
+        blockers: activation.blockers,
+      });
+      return;
+    }
+    await handleStatusChange("start");
   };
 
   const handleViewMember = async (member: ChittiMember) => {
@@ -426,7 +512,11 @@ export default function ChittiDetailPage() {
   const payoutRules = snapshot?.payout_rules as Record<string, unknown> | undefined;
   const progressPct = summary.total_periods > 0 ? Math.round((summary.current_period / summary.total_periods) * 100) : 0;
   const canAddMembers = chitti.status === "DRAFT" || chitti.status === "UPCOMING";
-  const currentMemberCount = members.length || summary.active_members;
+  // Enrolled members, not ACTIVE-only: pending-agreement members already hold
+  // a seat and must be counted the same way the Members tab counts them.
+  const memberCapacity = summary.member_capacity ?? summary.member_count;
+  const currentMemberCount = summary.enrolled_members ?? members.length;
+  const enrolledCustomerIds = new Set(members.map((m) => m.customer_id));
 
   return (
     <DashboardLayout>
@@ -441,7 +531,7 @@ export default function ChittiDetailPage() {
               <div>
                 <h1 className="text-2xl font-bold text-surface-900 tracking-tight">{chitti.name}</h1>
                 <div className="flex items-center gap-2 mt-1">
-                  <span className={cn("badge", getStatusColor(chitti.status))}>{chitti.status}</span>
+                  <span className={cn("badge", getStatusColor(chitti.status))}>{displayStateLabel(activation?.display_state ?? chitti.status)}</span>
                   <span className="text-sm text-surface-500">{chitti.chitti_code} • {String(snapshot?.frequency ?? "MONTHLY")}</span>
                 </div>
               </div>
@@ -453,19 +543,94 @@ export default function ChittiDetailPage() {
                 <Plus size={16} /> Add Member
               </button>
             )}
-            {chitti.status === "DRAFT" && <button onClick={() => handleStatusChange("start")} className="btn-primary"><Play size={16} /> Start</button>}
+            {chitti.status === "DRAFT" && (
+              <button
+                onClick={handleStart}
+                disabled={actionLoading !== null}
+                title={activation && !activation.can_activate ? activation.blockers.map((b) => b.message).join(" ") : undefined}
+                className="btn-primary disabled:opacity-60"
+              >
+                <Play size={16} /> {actionLoading === "start" ? "Starting..." : "Start"}
+              </button>
+            )}
             {chitti.status === "RUNNING" && (
               <>
-                <button onClick={() => handleStatusChange("pause")} className="btn-secondary"><Pause size={16} /> Pause</button>
-                <button onClick={() => handleStatusChange("complete")} className="btn-secondary"><CheckCircle2 size={16} /> Complete</button>
+                <button onClick={() => handleStatusChange("pause")} disabled={actionLoading !== null} className="btn-secondary disabled:opacity-60"><Pause size={16} /> {actionLoading === "pause" ? "Pausing..." : "Pause"}</button>
+                <button onClick={() => handleStatusChange("complete")} disabled={actionLoading !== null} className="btn-secondary disabled:opacity-60"><CheckCircle2 size={16} /> {actionLoading === "complete" ? "Completing..." : "Complete"}</button>
               </>
             )}
-            {chitti.status === "PAUSED" && <button onClick={() => handleStatusChange("resume")} className="btn-primary"><Play size={16} /> Resume</button>}
+            {chitti.status === "PAUSED" && <button onClick={() => handleStatusChange("resume")} disabled={actionLoading !== null} className="btn-primary disabled:opacity-60"><Play size={16} /> Resume</button>}
             {(chitti.status === "DRAFT" || chitti.status === "RUNNING") && (
-              <button onClick={() => handleStatusChange("cancel")} className="btn-danger"><XCircle size={16} /> Cancel</button>
+              <button onClick={() => handleStatusChange("cancel")} disabled={actionLoading !== null} className="btn-danger disabled:opacity-60"><XCircle size={16} /> Cancel</button>
             )}
           </div>
         </div>
+
+        {feedback && (
+          <div
+            role="status"
+            className={cn(
+              "rounded-xl border p-4 text-sm",
+              feedback.type === "error"
+                ? "border-danger-100 bg-danger-50 text-danger-700"
+                : "border-success-100 bg-success-50 text-success-700"
+            )}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <p className="font-semibold">{feedback.message}</p>
+                {feedback.blockers && feedback.blockers.length > 0 && (
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    {feedback.blockers.map((b) => (
+                      <li key={b.code}>{b.message}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+              <button onClick={() => setFeedback(null)} className="text-xs font-medium underline">
+                Dismiss
+              </button>
+            </div>
+          </div>
+        )}
+
+        {activation && (chitti.status === "DRAFT" || chitti.status === "UPCOMING") && (
+          <div className="card space-y-3">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-semibold text-surface-900">Activation readiness</h3>
+                <p className="text-sm text-surface-500">
+                  {activation.enrolled_members} of {activation.member_capacity} seats filled •{" "}
+                  {activation.active_members} active • {activation.pending_agreements} pending agreement(s)
+                </p>
+              </div>
+              <span className={cn("badge", activation.can_activate ? "badge-success" : "badge-warning")}>
+                {activation.can_activate ? "Ready to start" : "Activation blocked"}
+              </span>
+            </div>
+            {activation.blockers.length > 0 && (
+              <div className="rounded-xl bg-warning-50 p-3">
+                <p className="text-xs font-semibold uppercase tracking-wide text-warning-700">
+                  Must be resolved before starting
+                </p>
+                <ul className="mt-1 list-disc space-y-1 pl-5 text-sm text-warning-700">
+                  {activation.blockers.map((b) => (
+                    <li key={b.code}>{b.message}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {activation.warnings.length > 0 && (
+              <div className="rounded-xl bg-surface-50 p-3">
+                <ul className="list-disc space-y-1 pl-5 text-sm text-surface-600">
+                  {activation.warnings.map((w) => (
+                    <li key={w.code}>{w.message}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* Progress */}
         <div className="card">
@@ -482,7 +647,7 @@ export default function ChittiDetailPage() {
             { label: "Total Value", value: formatCurrency(summary.total_value), icon: <IndianRupee size={18} />, color: "bg-brand-50 text-brand-600" },
             { label: "Collected", value: formatCurrency(summary.actual_collection), icon: <TrendingUp size={18} />, color: "bg-success-50 text-success-600" },
             { label: "Pending", value: formatCurrency(summary.pending_collection), icon: <TrendingDown size={18} />, color: "bg-warning-50 text-warning-600" },
-            { label: "Members", value: `${currentMemberCount} / ${summary.member_count}`, icon: <Users size={18} />, color: "bg-purple-50 text-purple-600" },
+            { label: "Members", value: `${currentMemberCount} / ${memberCapacity}`, icon: <Users size={18} />, color: "bg-purple-50 text-purple-600" },
           ].map((stat) => (
             <div key={stat.label} className="card flex items-center gap-4">
               <div className={cn("rounded-xl p-3", stat.color)}>{stat.icon}</div>
@@ -617,8 +782,8 @@ export default function ChittiDetailPage() {
               <div className="card">
                 {canAddMembers && (
                   <div className="flex items-center justify-between mb-6">
-                    <p className="text-sm text-surface-500">Members: <span className="font-semibold text-surface-900">{currentMemberCount} / {summary.member_count}</span></p>
-                    <button onClick={() => setShowAddMember(true)} className="btn-primary btn-sm" disabled={currentMemberCount >= summary.member_count}><Plus size={14} /> Add Member</button>
+                    <p className="text-sm text-surface-500">Members: <span className="font-semibold text-surface-900">{currentMemberCount} / {memberCapacity}</span> • <span className="text-surface-400">{Math.max(memberCapacity - currentMemberCount, 0)} slot(s) available</span></p>
+                    <button onClick={() => setShowAddMember(true)} className="btn-primary btn-sm" disabled={currentMemberCount >= memberCapacity}><Plus size={14} /> Add Member</button>
                   </div>
                 )}
 
@@ -704,7 +869,7 @@ export default function ChittiDetailPage() {
       </div>
 
       {/* Modals */}
-      {showAddMember && <AddMemberModal chittiId={chittiId} currentCount={currentMemberCount} maxCount={summary.member_count} onClose={() => setShowAddMember(false)} onAdded={async () => { setShowAddMember(false); await loadMembers(); }} />}
+      {showAddMember && <AddMemberModal chittiId={chittiId} currentCount={currentMemberCount} maxCount={memberCapacity} enrolledCustomerIds={enrolledCustomerIds} onClose={() => setShowAddMember(false)} onAdded={async () => { setShowAddMember(false); await loadData(); setFeedback({ type: "success", message: "Member enrolled successfully." }); }} />}
       {showAgreement && selectedMember && <AgreementPreviewModal agreement={showAgreement} chittiName={chitti.name} memberName={selectedMember.customer_name || ""} onClose={() => setShowAgreement(null)} onPrint={() => handlePrintAgreement(selectedMember.id)} onConfirm={() => handleConfirmAgreement(selectedMember.id)} />}
     </DashboardLayout>
   );

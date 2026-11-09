@@ -12,6 +12,39 @@ const apiClient = axios.create({
   headers: { "Content-Type": "application/json" },
 });
 
+interface ApiErrorBody {
+  success?: boolean;
+  error?: { code?: string; message?: string; details?: unknown };
+}
+
+/**
+ * Extract the backend's human-readable error message.
+ *
+ * Without this, a 409/400 surfaces as "Request failed with status code 409"
+ * even though the API sent a specific explanation.
+ */
+export function getApiErrorMessage(error: unknown, fallback = "Something went wrong. Please try again."): string {
+  const body = (error as AxiosError<ApiErrorBody>)?.response?.data;
+  const message = body?.error?.message;
+  if (typeof message === "string" && message.trim().length > 0) return message;
+  if (error instanceof Error && error.message && !/^Request failed with status code/.test(error.message)) {
+    return error.message;
+  }
+  return fallback;
+}
+
+/** Structured `error.details` payload (blockers, duplicate info, ...). */
+export function getApiErrorDetails<T>(error: unknown): T | null {
+  const body = (error as AxiosError<ApiErrorBody>)?.response?.data;
+  const details = body?.error?.details;
+  return details && typeof details === "object" ? (details as T) : null;
+}
+
+/** HTTP status of a failed request, or null when the request never completed. */
+export function getApiErrorStatus(error: unknown): number | null {
+  return (error as AxiosError)?.response?.status ?? null;
+}
+
 // Request interceptor: attach access token
 apiClient.interceptors.request.use((config: InternalAxiosRequestConfig) => {
   if (typeof window !== "undefined") {

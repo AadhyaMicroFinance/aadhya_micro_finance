@@ -35,7 +35,11 @@ export interface ChittiInstance {
   branch: string | null;
   start_date: string;
   end_date: string;
+  /** Plan capacity (kept for backwards compatibility). */
   member_count: number;
+  member_capacity?: number;
+  /** Members actually enrolled, matching the dashboard and Members tab. */
+  enrolled_members?: number | null;
   total_value: number;
   current_period: number;
   status: string;
@@ -52,16 +56,42 @@ export interface ChittiDashboardItem {
   name: string;
   plan_name: string | null;
   status: string;
+  /** Enrolled members (any agreement state except cancelled/rejected). */
   member_count: number;
-  current_period: number;
-  total_periods: number;
+  enrolled_members?: number;
+  active_members?: number;
+  member_capacity?: number;
+  display_state?: string;
   total_value: number;
   expected_collection: number;
   actual_collection: number;
   pending_collection: number;
+  financials_source?: "contributions" | "schedule" | "not_generated";
+  current_period: number;
+  total_periods: number;
   next_due_date: string | null;
   start_date: string;
   end_date: string;
+}
+
+export interface ActivationBlocker {
+  code: string;
+  message: string;
+}
+
+export interface ActivationStatus {
+  chitti_id: string;
+  status: string;
+  display_state: string;
+  can_activate: boolean;
+  blockers: ActivationBlocker[];
+  warnings: ActivationBlocker[];
+  enrolled_members: number;
+  active_members: number;
+  pending_agreements: number;
+  member_capacity: number;
+  available_slots: number;
+  schedule_periods: number;
 }
 
 export interface ChittiMember {
@@ -114,8 +144,15 @@ export interface ChittiSummary {
   chitti_id: string;
   chitti_name: string;
   status: string;
+  display_state?: string;
+  /** Plan capacity (kept for backwards compatibility). */
   member_count: number;
+  member_capacity?: number;
+  /** Members actually enrolled, matching the Members tab. */
+  enrolled_members?: number;
   active_members: number;
+  financials_source?: "contributions" | "schedule" | "not_generated";
+  activation?: ActivationStatus;
   current_period: number;
   total_periods: number;
   total_value: number;
@@ -298,6 +335,13 @@ export const chittiApi = {
   getSummary: async (id: string): Promise<ChittiSummary> => {
     const res = await apiClient.get<ApiResponse<ChittiSummary>>(
       `/chitti/${id}/summary`
+    );
+    return res.data.data;
+  },
+
+  getActivation: async (id: string): Promise<ActivationStatus> => {
+    const res = await apiClient.get<ApiResponse<ActivationStatus>>(
+      `/chitti/${id}/activation`
     );
     return res.data.data;
   },

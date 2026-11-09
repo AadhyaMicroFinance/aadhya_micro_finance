@@ -34,6 +34,11 @@ install -d -o ec2-user -g ec2-user /opt/finance-chitti
 install -d -m 700 /var/backups/finance-chitti
 
 # --- Nightly Postgres backup at 02:15 IST ----------------------------------
+# Amazon Linux 2023 ships without cron; install it before writing the schedule.
+dnf -y install cronie || true
+systemctl enable --now crond || true
+install -d -m 755 /etc/cron.d
+
 cat > /etc/cron.d/finance-chitti-backup <<'CRON'
 SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin

@@ -4,7 +4,8 @@ Chitti service — orchestrates plans, instances, members, schedules, contributi
 All business logic lives here. API handlers should only call service methods.
 """
 
-from decimal import Decimal
+import logging
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from uuid import UUID
 
@@ -33,6 +34,7 @@ from app.services.chitti_calculation import ChittiCalculationEngine
 from app.utils.codes import generate_chitti_code, generate_plan_code
 from app.utils.timezone import today_ist
 
+logger = logging.getLogger("app.chitti")
 
 # Valid status transitions
 VALID_TRANSITIONS = {
@@ -249,7 +251,10 @@ class ChittiService:
 
         plan = await self.plan_repo.get_by_id(chitti.plan_id)
         plan_name = plan.name if plan else None
-        return self._chitti_to_dict(chitti, plan_name=plan_name)
+        enrolled = await self.member_repo.count_enrolled(chitti.id)
+        return self._chitti_to_dict(
+            chitti, plan_name=plan_name, enrolled_members=enrolled
+        )
 
     async def list_chittis(
         self,
@@ -269,8 +274,15 @@ class ChittiService:
             if plan:
                 plan_names[pid] = plan.name
 
+        enrolled_map = await self.member_repo.count_enrolled_by_chitti(
+            [c.id for c in chittis]
+        )
         return [
-            self._chitti_to_dict(c, plan_name=plan_names.get(c.plan_id))
+            self._chitti_to_dict(
+                c,
+                plan_name=plan_names.get(c.plan_id),
+                enrolled_members=enrolled_map.get(c.id, 0),
+            )
             for c in chittis
         ], total
 
@@ -284,7 +296,9 @@ class ChittiService:
         plan = await self.plan_repo.get_by_id(chitti.plan_id)
         return self._chitti_to_dict(chitti, plan_name=plan.name if plan else None)
 
-    async def change_status(self, chitti_id: UUID, new_status: str) -> dict:
+    async def change_status(
+        self, chitti_id: UUID, new_status: str, created_by: Optional[UUID] = None
+    ) -> dict:
         """Change chitti status with validation."""
         chitti = await self.chitti_repo.get_by_id(chitti_id)
         if not chitti:
@@ -294,21 +308,146 @@ class ChittiService:
         if new_status not in allowed:
             raise BadRequestException(
                 f"Cannot transition from {chitti.status} to {new_status}. "
-                f"Allowed: {', '.join(allowed) or 'none'}"
+                f"Allowed: {', '.join(allowed) or 'none'}",
+                error_code="INVALID_STATUS_TRANSITION",
+                details={
+                    "current_status": chitti.status,
+                    "requested_status": new_status,
+                    "allowed": allowed,
+                },
             )
 
-        # Validate RUNNING requires members
+        previous_status = chitti.status
+
         if new_status == "RUNNING":
-            active_count = await self.member_repo.count_active(chitti.id)
-            if active_count == 0:
-                raise BadRequestException("Cannot start a chitti with no active members.")
+            # Activation is evaluated once, in activation_status(), so the
+            # API, the UI and this transition can never disagree about
+            # whether a chitti is startable. Resuming a PAUSED chitti is not a
+            # start, so the "only DRAFT can start" rule is not applied there.
+            activation = await self.activation_status(
+                chitti,
+                require_startable_status=chitti.status in ("DRAFT", "UPCOMING"),
+            )
+            if not activation["can_activate"]:
+                reasons = " ".join(b["message"] for b in activation["blockers"])
+                raise BadRequestException(
+                    f"This chitti cannot be started yet. {reasons}",
+                    error_code="ACTIVATION_BLOCKED",
+                    details=activation,
+                )
             # Members enrolled through the agreement flow may predate contribution
             # generation; materialise their schedules so payments work from day one.
             await self._ensure_member_contributions(chitti)
 
         chitti = await self.chitti_repo.update(chitti, status=new_status)
+
+        from app.services.audit_service import AuditService
+        await AuditService(self.session).log(
+            user_id=created_by,
+            action=f"CHITTI_STATUS_{new_status}",
+            entity_type="chitti",
+            entity_id=chitti.id,
+            previous_value={"status": previous_status},
+            new_value={"status": new_status},
+        )
+
         plan = await self.plan_repo.get_by_id(chitti.plan_id)
         return self._chitti_to_dict(chitti, plan_name=plan.name if plan else None)
+
+    # ===========================================================================
+    # Activation prerequisites
+    # ===========================================================================
+
+    async def evaluate_activation(self, chitti_id: UUID) -> dict:
+        chitti = await self.chitti_repo.get_by_id(chitti_id)
+        if not chitti:
+            raise NotFoundException("Chitti", chitti_id)
+        return await self.activation_status(
+            chitti, require_startable_status=chitti.status in ("DRAFT", "UPCOMING")
+        )
+
+    async def activation_status(
+        self, chitti, *, require_startable_status: bool = True
+    ) -> dict:
+        """Single source of truth for whether a chitti can be started.
+
+        Rules below are the ones the existing backend already enforced
+        (members must exist, at least one member must have completed the
+        agreement workflow, a period schedule must exist). Nothing new is
+        invented here; partial-agreement state is surfaced as a warning only,
+        because the business owner has not defined whether every agreement
+        must be confirmed before activation.
+        """
+        enrolled = await self.member_repo.count_enrolled(chitti.id)
+        active = await self.member_repo.count_active(chitti.id)
+        pending_agreements = await self.member_repo.count_pending_agreements(chitti.id)
+        schedules = await self.schedule_repo.get_by_chitti_id(chitti.id)
+
+        blockers: list[dict] = []
+        warnings: list[dict] = []
+
+        if require_startable_status and chitti.status not in ("DRAFT", "UPCOMING"):
+            blockers.append({
+                "code": "NOT_STARTABLE",
+                "message": f"Chitti is already {chitti.status}; only DRAFT chittis can be started.",
+            })
+        if enrolled == 0:
+            blockers.append({
+                "code": "NO_MEMBERS",
+                "message": "No members are enrolled in this chitti.",
+            })
+        elif active == 0:
+            blockers.append({
+                "code": "NO_ACTIVE_MEMBERS",
+                "message": (
+                    f"{pending_agreements} member(s) still have an incomplete agreement. "
+                    "Generate, print and confirm each agreement to activate them before starting."
+                ),
+            })
+        elif pending_agreements > 0:
+            warnings.append({
+                "code": "PARTIAL_AGREEMENTS",
+                "message": (
+                    f"{pending_agreements} enrolled member(s) have not confirmed their agreement. "
+                    "The chitti can start because at least one member is active, but those members "
+                    "cannot contribute until their agreement is confirmed."
+                ),
+            })
+        if not schedules:
+            blockers.append({
+                "code": "SCHEDULE_MISSING",
+                "message": "This chitti has no period schedule, so no dues can be generated.",
+            })
+
+        return {
+            "chitti_id": str(chitti.id),
+            "status": chitti.status,
+            "display_state": self._display_state(chitti.status, blockers),
+            "can_activate": not blockers,
+            "blockers": blockers,
+            "warnings": warnings,
+            "enrolled_members": enrolled,
+            "active_members": active,
+            "pending_agreements": pending_agreements,
+            "member_capacity": chitti.member_count,
+            "available_slots": max(chitti.member_count - enrolled, 0),
+            "schedule_periods": len(schedules),
+        }
+
+    @staticmethod
+    def _display_state(status: str, blockers: list[dict]) -> str:
+        """Derived, display-only lifecycle label (no database state added)."""
+        if status in ("DRAFT", "UPCOMING"):
+            return "ACTIVATION_BLOCKED" if blockers else "READY_TO_START"
+        if status == "RUNNING":
+            return "ACTIVE"
+        if status == "PAUSED":
+            return "PAUSED"
+        if status == "COMPLETED":
+            return "COMPLETED"
+        if status == "CANCELLED":
+            return "CANCELLED"
+        return status
 
     # ===========================================================================
     # Members
@@ -331,8 +470,17 @@ class ChittiService:
 
         # Check not duplicate
         existing = await self.member_repo.get_by_chitti_and_customer(chitti.id, UUID(customer_id))
-        if existing:
-            raise ConflictException("Customer is already a member of this chitti.")
+        if existing and existing.status not in ("CANCELLED", "REJECTED"):
+            raise ConflictException(
+                "This member is already enrolled in this Chitti.",
+                error_code="DUPLICATE_ENROLLMENT",
+                details={
+                    "customer_id": str(customer.id),
+                    "chitti_id": str(chitti.id),
+                    "existing_member_id": str(existing.id),
+                    "existing_status": existing.status,
+                },
+            )
 
         # Check member number not taken
         existing_num = await self.member_repo.get_by_chitti_and_member_number(
@@ -696,9 +844,13 @@ class ChittiService:
     # ===========================================================================
 
     async def get_dashboard(self) -> list[dict]:
-        """Get summary for all active chittis (DRAFT, UPCOMING, RUNNING, PAUSED)."""
-        from sqlalchemy import select
-        from app.models.chitti import Chitti as ChittiModel
+        """Get summary for all active chittis (DRAFT, UPCOMING, RUNNING, PAUSED).
+
+        member_count is the number of enrolled members (any agreement state
+        except cancelled/rejected), which is the same number the Members tab
+        lists. active_members and member_capacity are reported separately so
+        callers never have to guess which meaning they hold.
+        """
         result_chittis = []
         for status in ["RUNNING", "DRAFT", "UPCOMING", "PAUSED"]:
             chittis, _ = await self.chitti_repo.list_by_status(status, limit=100)
@@ -706,11 +858,20 @@ class ChittiService:
         result = []
         for chitti in result_chittis:
             plan = await self.plan_repo.get_by_id(chitti.plan_id)
+            enrolled_members = await self.member_repo.count_enrolled(chitti.id)
             active_members = await self.member_repo.count_active(chitti.id)
             schedules = await self.schedule_repo.get_by_chitti_id(chitti.id)
-            total_expected = sum(s.expected_collection for s in schedules)
-            total_actual = sum(s.actual_collection for s in schedules)
-            total_pending = sum(s.pending_collection for s in schedules)
+            totals = await self._financial_totals(chitti, schedules=schedules)
+            # Same rule as activation_status(), without a second round of counts.
+            blocked = (
+                chitti.status in ("DRAFT", "UPCOMING")
+                and (enrolled_members == 0 or active_members == 0 or not schedules)
+            )
+            display_state = (
+                "ACTIVATION_BLOCKED"
+                if blocked
+                else self._display_state(chitti.status, [])
+            )
 
             next_period = next(
                 (s for s in schedules if s.status in ("UPCOMING", "ACTIVE")), None
@@ -722,13 +883,18 @@ class ChittiService:
                 "name": chitti.name,
                 "plan_name": plan.name if plan else None,
                 "status": chitti.status,
-                "member_count": active_members,
+                "display_state": display_state,
+                "member_count": enrolled_members,
+                "enrolled_members": enrolled_members,
+                "active_members": active_members,
+                "member_capacity": chitti.member_count,
                 "current_period": chitti.current_period,
                 "total_periods": chitti.plan_snapshot.get("duration", 0),
-                "total_value": chitti.total_value,
-                "expected_collection": total_expected,
-                "actual_collection": total_actual,
-                "pending_collection": total_pending,
+                "total_value": self._money(chitti.total_value),
+                "expected_collection": self._money(totals["expected"]),
+                "actual_collection": self._money(totals["collected"]),
+                "pending_collection": self._money(totals["pending"]),
+                "financials_source": totals["source"],
                 "next_due_date": str(next_period.due_date) if next_period else None,
                 "start_date": str(chitti.start_date),
                 "end_date": str(chitti.end_date),
@@ -741,14 +907,17 @@ class ChittiService:
             raise NotFoundException("Chitti", chitti_id)
 
         plan = await self.plan_repo.get_by_id(chitti.plan_id)
+        enrolled_members = await self.member_repo.count_enrolled(chitti.id)
         active_members = await self.member_repo.count_active(chitti.id)
         schedules = await self.schedule_repo.get_by_chitti_id(chitti.id)
         payouts = await self.payout_repo.get_by_chitti_id(chitti.id)
+        totals = await self._financial_totals(chitti, schedules=schedules)
+        activation = await self.activation_status(chitti)
 
-        total_expected = sum(s.expected_collection for s in schedules)
-        total_actual = sum(s.actual_collection for s in schedules)
-        total_pending = sum(s.pending_collection for s in schedules)
-        total_payouts = sum(p.net_payout for p in payouts if p.status == "PAID")
+        total_payouts = sum(
+            (self._decimal(p.net_payout) for p in payouts if p.status == "PAID"),
+            Decimal("0"),
+        )
 
         next_period = next(
             (s for s in schedules if s.status in ("UPCOMING", "ACTIVE")), None
@@ -761,16 +930,23 @@ class ChittiService:
             "chitti_id": str(chitti.id),
             "chitti_name": chitti.name,
             "status": chitti.status,
+            "display_state": activation["display_state"],
+            # member_count stays the plan capacity for backwards compatibility;
+            # enrolled_members is the number of members actually holding a place.
             "member_count": chitti.member_count,
+            "member_capacity": chitti.member_count,
+            "enrolled_members": enrolled_members,
             "active_members": active_members,
             "current_period": chitti.current_period,
             "total_periods": chitti.plan_snapshot.get("duration", 0),
-            "total_value": chitti.total_value,
-            "expected_collection": total_expected,
-            "actual_collection": total_actual,
-            "pending_collection": total_pending,
-            "total_payouts": total_payouts,
-            "outstanding": total_expected - total_actual,
+            "total_value": self._money(chitti.total_value),
+            "expected_collection": self._money(totals["expected"]),
+            "actual_collection": self._money(totals["collected"]),
+            "pending_collection": self._money(totals["pending"]),
+            "financials_source": totals["source"],
+            "total_payouts": self._money(total_payouts),
+            "outstanding": self._money(totals["expected"] - totals["collected"]),
+            "activation": activation,
             "next_due_date": str(next_period.due_date) if next_period else None,
             "next_payout_date": str(next_payout.paid_at) if next_payout else None,
         }
@@ -778,6 +954,92 @@ class ChittiService:
     # ===========================================================================
     # Helpers
     # ===========================================================================
+
+    async def _financial_totals(self, chitti, schedules=None) -> dict:
+        """Money totals for a chitti from one consistent source.
+
+        Contribution rows are authoritative because record_contribution writes
+        them and refreshes member aggregates from them. Period schedules are
+        only a fallback for chittis created before any contribution row existed,
+        and that fallback is logged rather than hidden.
+        """
+        contributions = await self.contribution_repo.get_by_chitti_id(chitti.id)
+        if contributions:
+            return {
+                "expected": sum(
+                    (self._decimal(c.expected_amount) for c in contributions), Decimal("0")
+                ),
+                "collected": sum(
+                    (self._decimal(c.paid_amount) for c in contributions), Decimal("0")
+                ),
+                "pending": sum(
+                    (self._decimal(c.remaining_amount) for c in contributions), Decimal("0")
+                ),
+                "source": "contributions",
+            }
+
+        # A started chitti must always have contribution rows; if it does not
+        # (legacy data), fall back to the period schedule instead of showing 0.
+        if chitti.status in ("RUNNING", "PAUSED", "COMPLETED"):
+            if schedules is None:
+                schedules = await self.schedule_repo.get_by_chitti_id(chitti.id)
+            logger.warning(
+                "Chitti %s (%s) has no contribution rows; falling back to period schedule totals",
+                chitti.chitti_code,
+                chitti.status,
+            )
+            return {
+                "expected": sum(
+                    (self._decimal(s.expected_collection) for s in schedules), Decimal("0")
+                ),
+                "collected": sum(
+                    (self._decimal(s.actual_collection) for s in schedules), Decimal("0")
+                ),
+                "pending": sum(
+                    (self._decimal(s.pending_collection) for s in schedules), Decimal("0")
+                ),
+                "source": "schedule",
+            }
+
+        # Not started yet: no member dues have been generated, so reporting the
+        # plan-wide schedule total here would overstate pending money.
+        return {
+            "expected": Decimal("0"),
+            "collected": Decimal("0"),
+            "pending": Decimal("0"),
+            "source": "not_generated",
+        }
+
+    @staticmethod
+    def _decimal(value) -> Decimal:
+        """Coerce a stored money value to a finite Decimal, logging bad input.
+
+        Returning 0 for genuinely invalid data would hide a financial bug, so
+        every conversion failure and every non-finite value is logged loudly.
+        """
+        if value is None:
+            logger.warning("Money value is NULL; treated as 0")
+            return Decimal("0")
+        if isinstance(value, Decimal):
+            result = value
+        elif isinstance(value, bool):
+            logger.error("Boolean used as money value: %r", value)
+            return Decimal("0")
+        else:
+            try:
+                result = Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                logger.error("Unparseable money value: %r", value)
+                return Decimal("0")
+        if not result.is_finite():
+            logger.error("Non-finite money value %r coerced to 0", value)
+            return Decimal("0")
+        return result
+
+    @classmethod
+    def _money(cls, value) -> float:
+        """Money as a JSON-safe float (never NaN/Infinity)."""
+        return float(cls._decimal(value))
 
     async def _ensure_member_contributions(self, chitti) -> None:
         """Generate missing per-member schedules and refresh member totals."""
@@ -848,7 +1110,12 @@ class ChittiService:
             "updated_at": str(plan.updated_at),
         }
 
-    def _chitti_to_dict(self, chitti, plan_name: Optional[str] = None) -> dict:
+    def _chitti_to_dict(
+        self,
+        chitti,
+        plan_name: Optional[str] = None,
+        enrolled_members: Optional[int] = None,
+    ) -> dict:
         return {
             "id": str(chitti.id),
             "chitti_code": chitti.chitti_code,
@@ -858,8 +1125,11 @@ class ChittiService:
             "branch": chitti.branch,
             "start_date": str(chitti.start_date),
             "end_date": str(chitti.end_date),
+            # member_count is the plan capacity (backwards compatible).
             "member_count": chitti.member_count,
-            "total_value": chitti.total_value,
+            "member_capacity": chitti.member_count,
+            "enrolled_members": enrolled_members,
+            "total_value": self._money(chitti.total_value),
             "current_period": chitti.current_period,
             "status": chitti.status,
             "notes": chitti.notes,
@@ -881,7 +1151,7 @@ class ChittiService:
             "payout_order": member.payout_order,
             "status": member.status,
             "joined_at": str(member.joined_at),
-            "total_expected": total_expected,
-            "total_paid": total_paid,
-            "outstanding": total_expected - total_paid,
+            "total_expected": self._money(total_expected),
+            "total_paid": self._money(total_paid),
+            "outstanding": self._money(self._decimal(total_expected) - self._decimal(total_paid)),
         }
