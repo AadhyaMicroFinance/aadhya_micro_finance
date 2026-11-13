@@ -97,7 +97,7 @@
 
   /* ============ Cards ============ */
   .card {
-    @apply rounded-2xl border border-surface-100 bg-white p-6 shadow-card transition-all duration-200;
+    @apply rounded-2xl border border-surface-100 bg-white p-4 shadow-card transition-all duration-200 sm:p-6;
   }
 
   .card-hover {
@@ -151,11 +151,11 @@
   }
 
   .table th {
-    @apply px-5 py-3.5 text-xs font-semibold uppercase tracking-wider text-surface-500;
+    @apply px-3 py-3 text-[11px] font-semibold uppercase tracking-wider text-surface-500 sm:px-5 sm:py-3.5 sm:text-xs;
   }
 
   .table td {
-    @apply px-5 py-4;
+    @apply px-3 py-3 sm:px-5 sm:py-4;
   }
 
   .table tbody tr {
@@ -172,11 +172,12 @@
 
   /* ============ Tabs ============ */
   .tabs {
-    @apply inline-flex rounded-xl bg-surface-100 p-1 gap-0.5;
+    @apply inline-flex max-w-full items-center gap-0.5 overflow-x-auto rounded-xl bg-surface-100 p-1;
+    -webkit-overflow-scrolling: touch;
   }
 
   .tab {
-    @apply rounded-lg px-4 py-2 text-sm font-medium text-surface-500 transition-all duration-200;
+    @apply shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-sm font-medium text-surface-500 transition-all duration-200 sm:px-4;
     @apply hover:text-surface-700;
   }
 
@@ -186,11 +187,25 @@
 
   /* ============ Modal ============ */
   .modal-backdrop {
-    @apply fixed inset-0 z-50 bg-surface-900/40 backdrop-blur-sm flex items-center justify-center p-4;
+    @apply fixed inset-0 z-50 flex items-end justify-center bg-surface-900/40 backdrop-blur-sm p-0 sm:items-center sm:p-4;
   }
 
   .modal-content {
-    @apply bg-white rounded-2xl shadow-modal w-full animate-scale-in;
+    @apply max-h-[92dvh] w-full animate-scale-in overflow-y-auto overscroll-contain rounded-t-2xl bg-white shadow-modal sm:rounded-2xl;
+  }
+
+  /* Comfortable tap targets on touch-sized screens without changing desktop density. */
+  @media (max-width: 640px) {
+    .btn-primary,
+    .btn-secondary,
+    .btn-danger,
+    .btn-ghost {
+      min-height: 2.75rem;
+    }
+
+    .btn-sm {
+      min-height: 2.5rem;
+    }
   }
 
   /* ============ Skeleton ============ */

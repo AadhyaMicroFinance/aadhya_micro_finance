@@ -403,13 +403,13 @@ export default function ChittiAnalyticsPage() {
     <DashboardLayout>
       <div className="space-y-7">
         {/* ============================ Header ============================ */}
-        <div className="flex flex-wrap items-end justify-between gap-4">
-          <div>
+        <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end sm:justify-between sm:gap-4">
+          <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span className="rounded-lg bg-brand-50 p-1.5 text-brand-600">
                 <TrendingUp size={16} />
               </span>
-              <h1 className="text-2xl font-bold tracking-tight text-surface-900">
+              <h1 className="text-xl font-bold tracking-tight text-surface-900 sm:text-2xl">
                 Chitti Analytics
               </h1>
             </div>
@@ -418,13 +418,13 @@ export default function ChittiAnalyticsPage() {
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <button type="button" onClick={load} className="btn-secondary btn-sm" disabled={loading}>
+            <button type="button" onClick={load} className="btn-secondary btn-sm flex-1 sm:flex-none" disabled={loading}>
               <RefreshCw size={14} className={cn(loading && "animate-spin")} />
               Refresh
             </button>
             <button
               type="button"
-              className="btn-secondary btn-sm"
+              className="btn-secondary btn-sm flex-1 sm:flex-none"
               onClick={() =>
                 data &&
                 exportCsv(

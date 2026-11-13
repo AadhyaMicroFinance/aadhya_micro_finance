@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect } from "react";
-import { useRouter } from "next/navigation";
+import { useEffect, useState } from "react";
+import { usePathname, useRouter } from "next/navigation";
 import { useAuthStore } from "@/hooks/useAuth";
 import Sidebar from "./Sidebar";
 import TopBar from "./TopBar";
@@ -9,6 +9,8 @@ import TopBar from "./TopBar";
 export default function DashboardLayout({ children }: { children: React.ReactNode }) {
   const { isAuthenticated, isLoading, initialize } = useAuthStore();
   const router = useRouter();
+  const pathname = usePathname();
+  const [navOpen, setNavOpen] = useState(false);
 
   useEffect(() => {
     initialize();
@@ -19,6 +21,11 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
       router.push("/login");
     }
   }, [isLoading, isAuthenticated, router]);
+
+  // Any navigation closes the mobile drawer.
+  useEffect(() => {
+    setNavOpen(false);
+  }, [pathname]);
 
   if (isLoading) {
     return (
@@ -40,10 +47,10 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
 
   return (
     <div className="min-h-screen bg-surface-50">
-      <Sidebar />
-      <div className="ml-64">
-        <TopBar />
-        <main className="p-8">{children}</main>
+      <Sidebar open={navOpen} onClose={() => setNavOpen(false)} />
+      <div className="lg:ml-64">
+        <TopBar onMenu={() => setNavOpen(true)} />
+        <main className="p-3 pb-12 sm:p-5 lg:p-8">{children}</main>
       </div>
     </div>
   );

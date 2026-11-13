@@ -1,12 +1,39 @@
 "use client";
 
-import { Suspense, useState, useEffect } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
+import Link from "next/link";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import { chittiApi, type ChittiPlan, type ChittiPreview } from "@/services/chitti";
-import { formatCurrency } from "@/lib/utils";
+import { getApiErrorMessage } from "@/services/api-client";
+import { formatCurrency, cn } from "@/lib/utils";
+import { ArrowLeft, ArrowRight, CheckCircle2, Check, Plus, Sparkles } from "lucide-react";
 
-type Step = 1 | 2 | 3 | 4;
+type Step = 1 | 2;
+
+function todayIso(): string {
+  const d = new Date();
+  const off = d.getTimezoneOffset();
+  return new Date(d.getTime() - off * 60000).toISOString().slice(0, 10);
+}
+
+function suggestedName(plan: ChittiPlan): string {
+  const month = new Date().toLocaleDateString("en-IN", { month: "short", year: "numeric" });
+  return `${plan.name} — ${month}`;
+}
+
+/** Per-period contribution shown before creating, straight from the plan rules. */
+function planContributionLabel(plan: ChittiPlan): string {
+  const rules = (plan.contribution_rules ?? {}) as Record<string, unknown>;
+  const type = String(rules.type || "FIXED");
+  if (type === "FIXED" && rules.installment_amount) {
+    return `${formatCurrency(Number(rules.installment_amount))} per member / period`;
+  }
+  if (type === "LIFT_BASED") {
+    return `${formatCurrency(Number(rules.pre_lift_amount || 0))} before lifting, ${formatCurrency(Number(rules.post_lift_amount || 0))} after`;
+  }
+  return "Custom schedule";
+}
 
 function NewChittiForm() {
   const router = useRouter();
@@ -18,11 +45,12 @@ function NewChittiForm() {
   const [selectedPlan, setSelectedPlan] = useState<ChittiPlan | null>(null);
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const [form, setForm] = useState({
     name: "",
     branch: "",
-    start_date: "2026-09-15",
+    start_date: todayIso(),
     member_count: "",
     notes: "",
   });
@@ -37,30 +65,43 @@ function NewChittiForm() {
         setPlans(res.data);
         if (preselectedPlanId) {
           const plan = res.data.find((p) => p.id === preselectedPlanId);
-          if (plan) setSelectedPlan(plan);
+          if (plan) choosePlan(plan);
         }
       } catch (e) {
-        console.error(e);
+        setError(getApiErrorMessage(e, "Could not load chitti plans."));
       } finally {
         setLoading(false);
       }
     };
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [preselectedPlanId]);
+
+  /** Selecting a plan fills everything we already know, so nothing is re-typed. */
+  const choosePlan = (plan: ChittiPlan) => {
+    setSelectedPlan(plan);
+    setForm((prev) => ({
+      ...prev,
+      name: prev.name || suggestedName(plan),
+      member_count: prev.member_count || String(plan.member_count),
+    }));
+    setPreview(null);
+    setError(null);
+    setStep(2);
+  };
 
   const generatePreview = async () => {
     if (!selectedPlan) return;
     setPreviewLoading(true);
+    setError(null);
     try {
-      const mc = form.member_count ? parseInt(form.member_count) : undefined;
       const result = await chittiApi.previewPlan(selectedPlan.id, {
         start_date: form.start_date,
-        member_count: mc,
+        member_count: form.member_count ? parseInt(form.member_count) : undefined,
       });
       setPreview(result);
-      setStep(3);
     } catch (e) {
-      console.error(e);
+      setError(getApiErrorMessage(e, "Could not build the schedule preview."));
     } finally {
       setPreviewLoading(false);
     }
@@ -68,19 +109,25 @@ function NewChittiForm() {
 
   const handleCreate = async () => {
     if (!selectedPlan) return;
+    if (!form.name.trim()) {
+      setError("Give the chitti a name so your team can recognise it.");
+      return;
+    }
     setCreating(true);
+    setError(null);
     try {
       const chitti = await chittiApi.createChitti({
         plan_id: selectedPlan.id,
-        name: form.name,
+        name: form.name.trim(),
         branch: form.branch || undefined,
         start_date: form.start_date,
         member_count: form.member_count ? parseInt(form.member_count) : undefined,
         notes: form.notes || undefined,
       });
-      router.push(`/chitti/${chitti.id}`);
+      // Straight to adding members — the next thing that has to happen.
+      router.push(`/chitti/${chitti.id}#members`);
     } catch (e) {
-      console.error(e);
+      setError(getApiErrorMessage(e, "Could not create this chitti."));
     } finally {
       setCreating(false);
     }
@@ -88,312 +135,333 @@ function NewChittiForm() {
 
   return (
     <DashboardLayout>
-      <div className="space-y-6 max-w-4xl mx-auto">
-        <div>
-          <h2 className="text-2xl font-bold text-gray-900">Create Chitti</h2>
-          <p className="text-sm text-gray-500">Set up a new chitti from an existing plan</p>
+      <div className="mx-auto max-w-4xl space-y-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end sm:justify-between">
+          <div className="min-w-0">
+            <h1 className="text-xl font-bold tracking-tight text-surface-900 sm:text-2xl">
+              New chitti
+            </h1>
+            <p className="mt-1 text-sm leading-snug text-surface-500">
+              Pick a plan, check the name and start date, then add members. It saves as a
+              draft — nothing is collected until you start it.
+            </p>
+          </div>
+          <Link href="/chitti" className="btn-secondary w-full sm:w-auto">
+            <ArrowLeft size={16} /> Back to workspace
+          </Link>
         </div>
 
-        {/* Progress Steps */}
-        <div className="flex items-center gap-4">
+        {/* Two steps, always visible */}
+        <ol className="flex flex-wrap items-center gap-2 text-xs sm:gap-3 sm:text-sm">
           {[
-            { num: 1, label: "Select Plan" },
-            { num: 2, label: "Details" },
-            { num: 3, label: "Review" },
-            { num: 4, label: "Create" },
-          ].map((s) => (
-            <div key={s.num} className="flex items-center gap-2">
-              <div
-                className={`flex h-8 w-8 items-center justify-center rounded-full text-sm font-medium ${
-                  step >= s.num
-                    ? "bg-primary-600 text-white"
-                    : "bg-gray-200 text-gray-500"
-                }`}
-              >
-                {s.num}
-              </div>
+            { n: 1, label: "Choose a plan" },
+            { n: 2, label: "Name, date & create" },
+          ].map((s, index) => (
+            <li key={s.n} className="flex items-center gap-2">
               <span
-                className={`text-sm ${
-                  step >= s.num ? "text-gray-900 font-medium" : "text-gray-500"
-                }`}
+                className={cn(
+                  "flex h-7 w-7 items-center justify-center rounded-full text-xs font-bold",
+                  step >= s.n ? "bg-brand-600 text-white" : "bg-surface-200 text-surface-500"
+                )}
               >
+                {step > s.n ? <Check size={14} /> : s.n}
+              </span>
+              <span className={cn(step >= s.n ? "font-semibold text-surface-900" : "text-surface-500")}>
                 {s.label}
               </span>
-              {s.num < 4 && <div className="w-8 border-t border-gray-300" />}
-            </div>
+              {index === 0 && <span className="mx-1 hidden h-px w-6 bg-surface-200 sm:block sm:w-8" />}
+            </li>
           ))}
-        </div>
+        </ol>
 
-        {/* Step 1: Select Plan */}
+        {error && (
+          <div className="rounded-xl border border-danger-100 bg-danger-50 px-4 py-3 text-sm text-danger-700">
+            {error}
+          </div>
+        )}
+
+        {/* Step 1 — plans */}
         {step === 1 && (
           <div className="card">
-            <h3 className="mb-4 text-lg font-semibold">Select a Chitti Plan</h3>
+            <h2 className="text-base font-semibold text-surface-900">Choose a chitti plan</h2>
+            <p className="mt-0.5 text-sm text-surface-500">
+              A plan sets the amount, duration and payout rules. Everything can be reviewed
+              after you pick it.
+            </p>
+
             {loading ? (
-              <p className="text-gray-500">Loading plans...</p>
+              <p className="mt-4 text-sm text-surface-500">Loading plans…</p>
             ) : plans.length === 0 ? (
-              <div className="text-center py-8">
-                <p className="text-gray-500">No active plans. Create a plan first.</p>
+              <div className="mt-4 rounded-xl border border-surface-100 p-6 text-center">
+                <p className="font-medium text-surface-900">No active plans yet</p>
+                <p className="mt-1 text-sm text-surface-500">
+                  Create a plan first, then come back here to start a chitti from it.
+                </p>
+                <Link href="/chitti/plans/new" className="btn-primary mt-4 inline-flex">
+                  <Plus size={16} /> Create a plan
+                </Link>
               </div>
             ) : (
-              <div className="space-y-3">
+              <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {plans.map((plan) => (
-                  <div
+                  <button
                     key={plan.id}
-                    onClick={() => {
-                      setSelectedPlan(plan);
-                      setStep(2);
-                    }}
-                    className={`cursor-pointer rounded-lg border-2 p-4 transition-colors ${
+                    onClick={() => choosePlan(plan)}
+                    className={cn(
+                      "rounded-2xl border p-4 text-left transition-all hover:-translate-y-0.5 hover:shadow-md",
                       selectedPlan?.id === plan.id
-                        ? "border-primary-500 bg-primary-50"
-                        : "border-gray-200 hover:border-gray-300"
-                    }`}
+                        ? "border-brand-400 bg-brand-50/50"
+                        : "border-surface-200 bg-white"
+                    )}
                   >
-                    <div className="flex items-center justify-between">
+                    <div className="flex items-start justify-between gap-2">
                       <div>
-                        <h4 className="font-medium text-gray-900">{plan.name}</h4>
-                        <p className="text-sm text-gray-500">
-                          {plan.plan_code} • {plan.chitti_type} • {plan.frequency}
+                        <p className="font-semibold text-surface-900">{plan.name}</p>
+                        <p className="text-xs text-surface-500">
+                          {plan.plan_code} • {plan.chitti_type} • {plan.frequency.toLowerCase()}
                         </p>
                       </div>
-                      <div className="text-right">
-                        <p className="font-bold text-gray-900">{formatCurrency(plan.total_value)}</p>
-                        <p className="text-sm text-gray-500">
-                          {plan.member_count} members • {plan.duration} periods
-                        </p>
+                      <span className="badge badge-brand">{plan.duration} periods</span>
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                      <div>
+                        <p className="text-[10px] uppercase text-surface-400">Value</p>
+                        <p className="font-bold text-surface-900">{formatCurrency(plan.total_value)}</p>
+                      </div>
+                      <div>
+                        <p className="text-[10px] uppercase text-surface-400">Members</p>
+                        <p className="font-bold text-surface-900">{plan.member_count}</p>
                       </div>
                     </div>
-                  </div>
+                    <p className="mt-2 text-xs text-surface-500">{planContributionLabel(plan)}</p>
+                  </button>
                 ))}
               </div>
             )}
           </div>
         )}
 
-        {/* Step 2: Chitti Details */}
+        {/* Step 2 — details + create */}
         {step === 2 && selectedPlan && (
-          <div className="card">
-            <h3 className="mb-4 text-lg font-semibold">Chitti Details</h3>
-            <div className="mb-4 p-3 bg-gray-50 rounded-lg">
-              <p className="text-sm font-medium text-gray-700">
-                Selected Plan: {selectedPlan.name} ({selectedPlan.plan_code})
-              </p>
-              <p className="text-sm text-gray-500">
-                {formatCurrency(selectedPlan.total_value)} • {selectedPlan.member_count} members • {selectedPlan.frequency}
-              </p>
+          <div className="space-y-4">
+            <div className="card">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-base font-semibold text-surface-900">
+                    {selectedPlan.name}
+                  </h2>
+                  <p className="text-sm text-surface-500">
+                    {formatCurrency(selectedPlan.total_value)} • {selectedPlan.member_count} seats •{" "}
+                    {selectedPlan.duration} {selectedPlan.frequency.toLowerCase()} periods
+                  </p>
+                  <p className="mt-1 text-xs text-surface-500">
+                    {planContributionLabel(selectedPlan)}
+                  </p>
+                </div>
+                <button onClick={() => setStep(1)} className="btn-secondary btn-sm">
+                  Change plan
+                </button>
+              </div>
             </div>
-            <div className="space-y-4">
+
+            <div className="card space-y-4">
+              <h2 className="text-base font-semibold text-surface-900">Name and dates</h2>
+
               <div>
-                <label className="mb-1 block text-sm font-medium">Chitti Name *</label>
+                <label className="label">Chitti name</label>
                 <input
-                  type="text"
+                  className="input-field"
                   value={form.name}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
-                  className="input-field"
-                  placeholder="e.g., Hyderabad Weekly - Sep 2026"
-                  required
+                  placeholder="e.g. Hyderabad Weekly — Nov 2026"
+                  autoFocus
                 />
+                <p className="mt-1 text-xs text-surface-500">
+                  Pre-filled for you — change it if your team uses another naming style.
+                </p>
               </div>
-              <div className="grid grid-cols-2 gap-4">
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div>
-                  <label className="mb-1 block text-sm font-medium">Start Date *</label>
+                  <label className="label">First due date</label>
                   <input
                     type="date"
-                    value={form.start_date}
-                    onChange={(e) => setForm({ ...form, start_date: e.target.value })}
                     className="input-field"
-                    required
+                    value={form.start_date}
+                    onChange={(e) => {
+                      setForm({ ...form, start_date: e.target.value });
+                      setPreview(null);
+                    }}
+                  />
+                  <p className="mt-1 text-xs text-surface-500">
+                    Defaults to today. Period 1 is due on this date.
+                  </p>
+                </div>
+                <div>
+                  <label className="label">Seats</label>
+                  <input
+                    type="number"
+                    className="input-field"
+                    value={form.member_count}
+                    onChange={(e) => {
+                      setForm({ ...form, member_count: e.target.value });
+                      setPreview(null);
+                    }}
+                    placeholder={String(selectedPlan.member_count)}
+                  />
+                  <p className="mt-1 text-xs text-surface-500">
+                    Plan default: {selectedPlan.member_count}. You can enroll fewer.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div>
+                  <label className="label">Branch (optional)</label>
+                  <input
+                    className="input-field"
+                    value={form.branch}
+                    onChange={(e) => setForm({ ...form, branch: e.target.value })}
+                    placeholder="e.g. Hyderabad"
                   />
                 </div>
                 <div>
-                  <label className="mb-1 block text-sm font-medium">Branch (optional)</label>
+                  <label className="label">Notes (optional)</label>
                   <input
-                    type="text"
-                    value={form.branch}
-                    onChange={(e) => setForm({ ...form, branch: e.target.value })}
                     className="input-field"
-                    placeholder="e.g., Hyderabad"
+                    value={form.notes}
+                    onChange={(e) => setForm({ ...form, notes: e.target.value })}
+                    placeholder="Anything the team should know"
                   />
                 </div>
               </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium">
-                  Member Count (default: {selectedPlan.member_count})
-                </label>
-                <input
-                  type="number"
-                  value={form.member_count}
-                  onChange={(e) => setForm({ ...form, member_count: e.target.value })}
-                  className="input-field"
-                  placeholder={String(selectedPlan.member_count)}
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium">Notes</label>
-                <textarea
-                  value={form.notes}
-                  onChange={(e) => setForm({ ...form, notes: e.target.value })}
-                  className="input-field"
-                  rows={2}
-                  placeholder="Optional notes"
-                />
-              </div>
-            </div>
-            <div className="mt-6 flex justify-end gap-3">
-              <button onClick={() => setStep(1)} className="btn-secondary">
-                Back
-              </button>
-              <button
-                onClick={async () => {
-                  if (!form.name) return;
-                  await generatePreview();
-                }}
-                disabled={!form.name || previewLoading}
-                className="btn-primary"
-              >
-                {previewLoading ? "Generating Preview..." : "Preview Schedule →"}
-              </button>
-            </div>
-          </div>
-        )}
 
-        {/* Step 3: Review */}
-        {step === 3 && preview && (
-          <div className="card">
-            <h3 className="mb-4 text-lg font-semibold">Review & Confirm</h3>
-            <div className="grid grid-cols-2 gap-6 mb-6">
-              <div className="space-y-2">
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Chitti Name</span>
-                  <span className="font-medium">{form.name}</span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Plan</span>
-                  <span className="font-medium">{preview.plan_name}</span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Type</span>
-                  <span className="font-medium">{preview.chitti_type}</span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Frequency</span>
-                  <span className="font-medium">{preview.frequency}</span>
-                </div>
-              </div>
-              <div className="space-y-2">
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Total Value</span>
-                  <span className="font-medium">{formatCurrency(preview.total_value)}</span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Members</span>
-                  <span className="font-medium">{preview.member_count}</span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Duration</span>
-                  <span className="font-medium">{preview.duration} periods</span>
-                </div>
-                <div className="flex justify-between text-sm">
-                  <span className="text-gray-500">Start Date</span>
-                  <span className="font-medium">{form.start_date}</span>
+              <div className="flex flex-col gap-3 border-t border-surface-100 pt-4 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+                <button
+                  onClick={generatePreview}
+                  disabled={previewLoading}
+                  className="btn-secondary btn-sm w-full sm:w-auto"
+                >
+                  <Sparkles size={14} />
+                  {previewLoading ? "Building…" : preview ? "Refresh schedule preview" : "Preview schedule"}
+                </button>
+                {/* Primary action first on a phone, side by side on larger screens. */}
+                <div className="flex flex-col-reverse gap-2 sm:flex-row sm:items-center">
+                  <button onClick={() => setStep(1)} className="btn-secondary w-full sm:w-auto">
+                    Back
+                  </button>
+                  <button
+                    onClick={handleCreate}
+                    disabled={creating || !form.name.trim()}
+                    className="btn-primary w-full sm:w-auto"
+                  >
+                    {creating ? "Creating…" : "Create chitti & add members"}
+                    {!creating && <ArrowRight size={16} />}
+                  </button>
                 </div>
               </div>
             </div>
 
-            <div className="p-4 bg-gray-50 rounded-lg mb-6">
-              <div className="grid grid-cols-2 gap-4">
-                <p className="text-sm text-gray-600">
-                  Total expected collection:{" "}
-                  <span className="font-bold text-gray-900">
-                    {formatCurrency(preview.total_expected_collection)}
-                  </span>
-                </p>
+            {/* Optional schedule preview — never required to create */}
+            {preview && (
+              <div className="card space-y-4">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 size={16} className="text-success-600" />
+                  <h2 className="text-base font-semibold text-surface-900">Schedule preview</h2>
+                </div>
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                  <div className="rounded-xl bg-surface-50 p-3">
+                    <p className="text-[10px] uppercase text-surface-400">Members</p>
+                    <p className="text-sm font-bold">{preview.member_count}</p>
+                  </div>
+                  <div className="rounded-xl bg-surface-50 p-3">
+                    <p className="text-[10px] uppercase text-surface-400">Periods</p>
+                    <p className="text-sm font-bold">{preview.duration}</p>
+                  </div>
+                  <div className="rounded-xl bg-surface-50 p-3">
+                    <p className="text-[10px] uppercase text-surface-400">Total collection</p>
+                    <p className="text-sm font-bold">{formatCurrency(preview.total_expected_collection)}</p>
+                  </div>
+                  <div className="rounded-xl bg-surface-50 p-3">
+                    <p className="text-[10px] uppercase text-surface-400">Total payout</p>
+                    <p className="text-sm font-bold">{formatCurrency(preview.total_expected_payout)}</p>
+                  </div>
+                </div>
+
                 {Array.isArray(preview.per_member_installment_schedule) &&
                 preview.per_member_installment_schedule.length > 0 &&
                 "member_number" in (preview.per_member_installment_schedule[0] || {}) ? (
-                  <p className="text-sm text-gray-600">
-                    Lift Based: {preview.member_count} members • Different amounts before/after lift
+                  <p className="rounded-xl bg-brand-50 p-3 text-sm text-brand-800">
+                    Lift-based plan: each member&apos;s amount changes after they lift. The full
+                    member-wise schedule is created automatically when the chitti starts.
                   </p>
                 ) : (
-                  <p className="text-sm text-gray-600">
-                    Per member per period:{" "}
-                    <span className="font-bold text-gray-900">
-                      {preview.per_member_installment_schedule[0]
-                        ? formatCurrency((preview.per_member_installment_schedule[0] as { amount: number }).amount)
-                        : "—"}
-                    </span>
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {/* Lift-based schedule preview */}
-            {Array.isArray(preview.per_member_installment_schedule) &&
-            preview.per_member_installment_schedule.length > 0 &&
-            "member_number" in (preview.per_member_installment_schedule[0] || {}) ? (
-              <div className="space-y-3">
-                <h4 className="font-medium text-gray-800">🏆 Lift Based Schedule (sample members)</h4>
-                {(preview.per_member_installment_schedule as unknown as {
-                  member_number: number;
-                  lift_period: number;
-                  schedule: { period: number; due_date: string; amount: number }[];
-                  total: number;
-                }[]).map((ms) => (
-                  <div key={ms.member_number} className="rounded border p-3">
-                    <p className="text-sm font-medium">
-                      Member #{ms.member_number}: Lifts period {ms.lift_period} • Total {formatCurrency(ms.total)}
-                    </p>
-                    <div className="mt-2 flex gap-2 flex-wrap text-xs">
-                      {ms.schedule.slice(0, 6).map((s) => (
-                        <span key={s.period} className="rounded bg-gray-100 px-2 py-1">
-                          P{s.period}: {formatCurrency(s.amount)}
-                          {s.period === ms.lift_period && " 🏆"}
-                        </span>
+                  <>
+                    <div className="space-y-2 sm:hidden">
+                      {preview.periods.slice(0, 8).map((p) => (
+                        <div
+                          key={p.period_number}
+                          className="flex items-center justify-between gap-3 rounded-xl border border-surface-100 p-3"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-sm font-semibold text-surface-900">Period {p.period_number}</p>
+                            <p className="text-[11px] text-surface-500">{p.due_date}</p>
+                          </div>
+                          <div className="shrink-0 text-right">
+                            <p className="text-sm font-semibold text-surface-900">
+                              {formatCurrency(p.expected_collection)}
+                            </p>
+                            <p className="text-[11px] text-surface-500">
+                              {formatCurrency(
+                                (
+                                  preview.per_member_installment_schedule as {
+                                    period: number;
+                                    amount: number;
+                                  }[]
+                                )[p.period_number - 1]?.amount || 0
+                              )}{" "}
+                              / member
+                            </p>
+                          </div>
+                        </div>
                       ))}
                     </div>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <>
-                <h4 className="mb-3 font-medium text-gray-800">Schedule Preview (first 5 periods)</h4>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-sm">
-                    <thead className="border-b border-gray-200 text-xs font-medium uppercase text-gray-500">
-                      <tr>
-                        <th className="px-3 py-2">Period</th>
-                        <th className="px-3 py-2">Due Date</th>
-                        <th className="px-3 py-2">Per Member</th>
-                        <th className="px-3 py-2">Total Collection</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-50">
-                      {preview.periods.slice(0, 5).map((p) => (
-                        <tr key={p.period_number}>
-                          <td className="px-3 py-2">{p.period_number}</td>
-                          <td className="px-3 py-2">{p.due_date}</td>
-                          <td className="px-3 py-2">
-                            {formatCurrency(
-                              (preview.per_member_installment_schedule as { period: number; due_date: string; amount: number }[])[p.period_number - 1]?.amount || 0
-                            )}
-                          </td>
-                          <td className="px-3 py-2">{formatCurrency(p.expected_collection)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            )}
 
-            <div className="mt-6 flex justify-end gap-3">
-              <button onClick={() => setStep(2)} className="btn-secondary">
-                Back
-              </button>
-              <button onClick={handleCreate} disabled={creating} className="btn-primary">
-                {creating ? "Creating..." : "✓ Create Chitti"}
-              </button>
-            </div>
+                    <div className="hidden overflow-x-auto sm:block">
+                      <table className="table">
+                        <thead>
+                          <tr>
+                            <th>Period</th>
+                            <th>Due date</th>
+                            <th>Per member</th>
+                            <th>Total collection</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {preview.periods.slice(0, 8).map((p) => (
+                            <tr key={p.period_number}>
+                              <td>{p.period_number}</td>
+                              <td>{p.due_date}</td>
+                              <td>
+                                {formatCurrency(
+                                  (
+                                    preview.per_member_installment_schedule as {
+                                      period: number;
+                                      amount: number;
+                                    }[]
+                                  )[p.period_number - 1]?.amount || 0
+                                )}
+                              </td>
+                              <td className="font-medium">{formatCurrency(p.expected_collection)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -408,7 +476,7 @@ export default function NewChittiPage() {
     <Suspense
       fallback={
         <DashboardLayout>
-          <div className="p-8 text-sm text-surface-500">Loading…</div>
+          <div className="p-4 text-sm text-surface-500 sm:p-8">Loading…</div>
         </DashboardLayout>
       }
     >

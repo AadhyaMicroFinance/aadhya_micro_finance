@@ -91,13 +91,13 @@ export default function PlanDetailPage() {
   return (
     <DashboardLayout>
       <div className="space-y-6">
-        <div className="flex items-center justify-between">
-          <div>
-            <div className="flex items-center gap-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2 sm:gap-3">
               <Link href="/chitti/plans" className="text-gray-400 hover:text-gray-600">
                 ← Back
               </Link>
-              <h2 className="text-2xl font-bold text-gray-900">{plan.name}</h2>
+              <h2 className="break-words text-xl font-bold text-gray-900 sm:text-2xl">{plan.name}</h2>
               <span
                 className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${
                   plan.is_active ? "bg-green-100 text-green-800" : "bg-gray-100 text-gray-800"
@@ -110,7 +110,7 @@ export default function PlanDetailPage() {
           </div>
           <Link
             href={`/chitti/new?plan_id=${plan.id}`}
-            className="btn-primary"
+            className="btn-primary w-full sm:w-auto"
           >
             + Create Chitti from this Plan
           </Link>
@@ -353,7 +353,7 @@ export default function PlanDetailPage() {
 
           {preview && (
             <div className="space-y-4">
-              <div className="grid grid-cols-3 gap-4">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 sm:gap-4">
                 <div>
                   <p className="text-xs text-gray-500">Total Expected Collection</p>
                   <p className="text-lg font-bold text-gray-900">

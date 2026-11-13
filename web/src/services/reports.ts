@@ -12,9 +12,17 @@ export interface DailySummary {
   finance_expected: number;
   chitti_expected: number;
   collected_total: number;
+  finance_collected: number;
+  chitti_collected: number;
   reversals_total: number;
+  finance_reversals: number;
+  chitti_reversals: number;
   net_collections: number;
+  finance_net: number;
+  chitti_net: number;
   pending_total: number;
+  finance_pending: number;
+  chitti_pending: number;
   collection_rate: number;
 }
 
@@ -23,12 +31,16 @@ export interface CollectionByUser {
   full_name: string;
   username: string;
   role: string;
+  finance_collected: number;
+  chitti_collected: number;
   collected_total: number;
   payment_count: number;
 }
 
 export interface CollectionByMethod {
   method: string;
+  finance_total: number;
+  chitti_total: number;
   total: number;
   count: number;
 }
@@ -42,6 +54,8 @@ export interface PendingDetail {
   customer_code: string | null;
   mobile_number: string | null;
   period_label: string;
+  chitti_name?: string | null;
+  member_number?: number | null;
   expected: number;
   paid: number;
   pending: number;

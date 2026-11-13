@@ -39,24 +39,58 @@ export default function ChittiPlansPage() {
   return (
     <DashboardLayout>
       <div className="space-y-6">
-        <div className="flex items-end justify-between">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h1 className="text-2xl font-bold text-surface-900 tracking-tight">Chitti Plans</h1>
+            <h1 className="text-xl font-bold tracking-tight text-surface-900 sm:text-2xl">Chitti Plans</h1>
             <p className="mt-1 text-sm text-surface-500">Reusable templates for creating chittis</p>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex flex-wrap items-center gap-2 sm:gap-4">
             <button onClick={() => setShowAll(!showAll)} className="btn-ghost text-sm">
               {showAll ? <ToggleRight size={16} className="text-brand-600" /> : <ToggleLeft size={16} />}
               Show inactive
             </button>
-            <Link href="/chitti/plans/new" className="btn-primary"><Plus size={16} /> New Plan</Link>
+            <Link href="/chitti/plans/new" className="btn-primary flex-1 sm:flex-none"><Plus size={16} /> New Plan</Link>
           </div>
         </div>
 
         {loading ? <TableSkeleton rows={5} cols={8} /> : plans.length === 0 ? (
           <EmptyState icon="📋" title="No plans yet" description="Create your first plan to get started." action={<Link href="/chitti/plans/new" className="btn-primary"><Plus size={16} /> New Plan</Link>} />
         ) : (
-          <div className="table-container">
+          <>
+          {/* Phones: one card per plan with the same actions. */}
+          <div className="space-y-2 md:hidden">
+            {plans.map((plan) => (
+              <div key={plan.id} className="rounded-xl border border-surface-100 p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0">
+                    <Link href={`/chitti/plans/${plan.id}`} className="truncate text-sm font-semibold text-brand-600 hover:text-brand-700">
+                      {plan.name}
+                    </Link>
+                    <p className="text-[11px] text-surface-500">
+                      {plan.plan_code} • {plan.frequency}
+                    </p>
+                  </div>
+                  <span className={cn("badge shrink-0 text-[10px]", plan.is_active ? "badge-success" : "badge-neutral")}>
+                    {plan.is_active ? "Active" : "Inactive"}
+                  </span>
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-surface-600">
+                  <span className="font-semibold text-surface-900">{formatCurrency(plan.total_value)}</span>
+                  <span>• {plan.member_count} members</span>
+                  <span className="badge-info text-[10px]">{plan.chitti_type}</span>
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1 border-t border-surface-50 pt-2">
+                  <Link href={`/chitti/plans/${plan.id}`} className="btn-ghost btn-sm">View</Link>
+                  <button onClick={() => handleDuplicate(plan.id)} className="btn-ghost btn-sm"><Copy size={12} /> Duplicate</button>
+                  <button onClick={() => handleToggleActive(plan)} className={cn("btn-ghost btn-sm", plan.is_active ? "text-warning-600 hover:text-warning-700" : "text-success-600 hover:text-success-700")}>
+                    {plan.is_active ? "Deactivate" : "Activate"}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="table-container hidden md:block">
             <table className="table">
               <thead>
                 <tr><th>Code</th><th>Name</th><th>Type</th><th>Value</th><th>Members</th><th>Frequency</th><th>Status</th><th>Actions</th></tr>
@@ -85,6 +119,7 @@ export default function ChittiPlansPage() {
               </tbody>
             </table>
           </div>
+          </>
         )}
       </div>
     </DashboardLayout>

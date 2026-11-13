@@ -307,7 +307,22 @@ Command (inside the `fc_backend` container, isolated `*_test` database):
 TEST_DATABASE_URL=…/finance_chitti_test pytest tests -q
 ```
 
-Result: **30 passed, 1 failed** in 27.62s.
+Result: **32 passed, 1 failed** in 30.40s.
+
+- `tests/test_reports_consistency.py` (new, 2 tests): **2 passed**
+  - `test_daily_report_separates_and_totals_both_ledgers` — chitti contribution
+    collected with **no finance account**, idempotent retry returns
+    `duplicate: true` without moving money, reused key with a different amount is
+    rejected, a finance installment is collected on its own ledger, the report
+    splits finance/chitti for collected and pending, `pending_total` equals the
+    drill-down, chitti pending rows are member-level, every payment is listed
+    with its source, analytics agrees on chitti money, and a DRAFT chitti adds no
+    dues.
+  - `test_reversal_restores_schedule_and_report` — a full installment payment
+    marks the schedule `PAID`; reversing it restores paid 0 / remaining 1000 /
+    `UPCOMING`, and the report shows finance collected 0, reversals 1000, net
+    −1000, pending 1000. Also proves chitti ids are refused on the finance
+    payment endpoint.
 
 - `tests/test_chitti_flow.py` (new, 4 tests): **4 passed**
   - `test_member_count_duplicate_and_activation` — 10-member dashboard/summary/list
@@ -384,6 +399,71 @@ resolved it. A deployed build does not have this problem.
 
 ---
 
+## 10a. Verification of the seven reported bugs (second audit round)
+
+| # | Reported bug | Verdict | Evidence |
+|---|---|---|---|
+| 1 | Dashboard member count | **Fixed** | dashboard/summary/list/members/analytics all report the same enrolled count (`3/25`, `4/4`, `3/3`) |
+| 2 | Duplicate member registration | **Fixed** | `409 DUPLICATE_ENROLLMENT` with the exact message; no second row; cross-chitti join allowed |
+| 3 | Start Chitti action | **Fixed** | `400 ACTIVATION_BLOCKED` with machine-readable blockers; readiness panel in UI |
+| 4 | Chitti draft status | **Fixed** | start persists `RUNNING`, re-read confirms, second start rejected; pause→resume tested |
+| 5 | Chitti contribution collection depended on a finance account | **Still reproducible → fixed now** | the chitti contribution endpoint existed but **no screen called it**; the only collection screen (`/payments/collect`) listed finance accounts. Added a Collect Contribution flow on the chitti member so a contribution can be collected with no finance account |
+| 6 | Dashboard and collections metrics mismatch | **Still reproducible → fixed now** | on 2026-11-04 the dashboard showed `collected 0 / pending 14 000` while the chitti ledger held `9 000` collected and its own drill-down summed to `5 000` |
+| 7 | Finance and chitti collections not displayed separately | **Partially fixed → completed now** | expected amounts were split, collected amounts were not; `collections/today` was a hardcoded `₹0` placeholder |
+
+### Root causes found in this round
+
+1. **The daily report read a single ledger.** Collections came only from
+   `payment_transactions`; chitti contributions live in `chitti_transactions`,
+   so every chitti rupee was invisible on the dashboard (BUG-006). The report now
+   reads both and exposes `finance_collected` / `chitti_collected`,
+   `finance_pending` / `chitti_pending`, `finance_net` / `chitti_net` (BUG-007).
+2. **`pending_total` was derived as `expected - collected`.** Any payment that
+   landed on a different instalment than the one due made the headline contradict
+   its own drill-down (14 000 vs 5 000). Pending is now the sum of unpaid amounts
+   on the day's dues, and equals the drill-down exactly.
+3. **Chitti period schedules were projected from plan capacity.** A 4-seat
+   chitti with 2 members carried `4 × 1000` expected instead of `2 × 1000`. On
+   start, period aggregates are now rebuilt from the authoritative per-member
+   contributions (`_sync_period_schedules_from_contributions`).
+4. **DRAFT chittis counted as dues.** Period schedules of a chitti that never
+   started were included in expected/pending/overdue. Only `RUNNING`, `PAUSED`
+   and `COMPLETED` chittis are financial now, in both the report and the
+   drill-down.
+5. **Reversing a finance payment never released the installment.** The payment
+   was marked reversed but `finance_schedules.paid_amount` kept the money, so the
+   customer stayed "paid" forever. `reverse_payment` now restores the schedule
+   (paid, remaining, status) inside the same transaction.
+6. **The finance payment endpoint accepted chitti ids.** Posting
+   `chitti_account_id` there wrote a `payment_transactions` row without touching
+   the member contribution — the same money would be counted twice. It now
+   returns `400 USE_CHITTI_CONTRIBUTION_ENDPOINT`.
+7. **Money was serialised as strings.** Every report amount reached the browser
+   as `"500.00"` although the client types say `number` (Pydantic v2 Decimal
+   serialisation). Decimals are converted once at the service boundary.
+8. **The pending drill-down was not actionable for chitti dues.** It listed the
+   chitti name as the "customer" with `customer_id: null`. It now lists the
+   member, mobile number, chitti code and period.
+9. **A reused idempotency key returned another contribution's balance.** The key
+   is now bound to member + period + amount; misuse returns
+   `400 IDEMPOTENCY_KEY_REUSED`.
+10. **`collections/today` was a hardcoded ₹0 page** (dummy values). It now loads
+    the real daily report with the finance/chitti split, the day's payments and
+    the pending list.
+
+### Verification performed
+
+- `2026-11-04` live: report `collected 9 000 (chitti 9 000 / finance 0)`,
+  `pending 5 000` = drill-down `5 000`, 5 chitti payments listed, by-method and
+  by-collector populated. Before the fix the same day reported `collected 0`,
+  `pending 14 000`.
+- Analytics `total_collected 51 000` now agrees with the chitti ledger sum
+  (`SELECT sum(amount) FROM chitti_transactions WHERE type='CONTRIBUTION'`).
+- Demo data untouched: `members=10`, `chitti_transactions=26`,
+  `chitti_member_contributions=175`, chitti statuses unchanged.
+
+---
+
 ## 11. Remaining limitations / open questions
 
 1. ~~May a chitti start while some agreements are still unconfirmed?~~
@@ -403,6 +483,19 @@ resolved it. A deployed build does not have this problem.
 6. Legacy `ChittiService.add_member()` (unused by the API, which uses
    `AgreementService.add_member()`) still raises the older duplicate message.
    It is unreachable from HTTP but is a candidate for removal.
+7. Existing chittis keep their capacity-projected period schedule until they are
+   started (the rebuild runs on the `DRAFT → RUNNING` transition). No data was
+   rewritten, because that would mutate financial records without approval.
+   `CHIT-000001` (DRAFT, 3 of 25 seats) therefore still shows projected schedule
+   amounts in its Schedule tab, while its summary correctly reports
+   `financials_source = not_generated` with zeros.
+8. There is no reversal endpoint for a chitti contribution (the ledger supports
+   `REVERSAL` rows, but no API/UI creates one). Corrupting or cancelling a
+   contribution deliberately is therefore not possible yet — needs an owner
+   decision on the workflow.
+9. The new/changed screens were type-checked (`tsc` clean) and their API
+   responses were probed live, but they were **not visually reviewed in a
+   browser** in this round.
 
 ---
 
@@ -416,16 +509,30 @@ resolved it. A deployed build does not have this problem.
   financial source of truth, money coercion, audit logging
 - `app/services/agreement_service.py` — duplicate/full structured errors,
   re-enrollment of cancelled rows, capacity on enrolled count, audit
+- `app/services/report_service.py` — dual-ledger collections (finance +
+  chitti), per-stream split for collected/reversed/net/pending, pending from the
+  schedules, member-level chitti drill-down, DRAFT/CANCELLED dues excluded,
+  Decimal→float at the JSON boundary
+- `app/services/payment_service.py` — reversal restores the installment
+  schedule; chitti ids rejected on the finance payment endpoint
+- `app/services/chitti_service.py` — period aggregates rebuilt from member
+  contributions on start; idempotency key bound to member/period/amount
 - `app/api/v1/chitti.py` — `GET /{id}/activation`, audit actor on status changes
-- `tests/conftest.py`, `tests/test_chitti_flow.py`, `pytest.ini`
+- `tests/conftest.py`, `tests/test_chitti_flow.py`,
+  `tests/test_reports_consistency.py`, `pytest.ini`
 
 **Frontend**
 - `src/lib/utils.ts` — `toNumber`, guarded `formatCurrency`
 - `src/services/api-client.ts` — error message/details/status helpers
 - `src/services/chitti.ts` — activation + count types, `getActivation`
 - `src/app/chitti/[id]/page.tsx` — counts, activation panel, feedback, loading,
-  duplicate pre-check
+  duplicate pre-check, **Collect Contribution** modal (period, amount, method,
+  reference, idempotency key)
 - `src/app/chitti/page.tsx` — capacity display, load error banner
+- `src/app/dashboard/page.tsx` — collected split into finance / chitti
+- `src/app/collections/today/page.tsx` — replaced the hardcoded ₹0 placeholder
+  with the real daily report (split totals, payments, pending)
+- `src/services/reports.ts` — split money fields, `ChittiContribution` types
 
 **Database** — no schema change, no migration, no data mutation.
 
@@ -477,3 +584,138 @@ analytics kpis.total_members = 10   collection_efficiency finite = True
 chitti statuses unchanged: CHIT-000001 DRAFT, DEMO-0001 RUNNING, DEMO-0002 RUNNING
 members=10  txns=26
 ```
+
+
+---
+
+## 15. Chitti module UX redesign (Phase 5)
+
+Scope: **Chitti module frontend only**. No backend business rule, API, table or
+financial formula was changed in this phase.
+
+### What changed, screen by screen
+
+| Screen | Before | After |
+|---|---|---|
+| `/chitti` (landing) | passive list of cards; every task needed a different page | **workspace**: KPI strip (running, members, collected, pending), a **Collect contributions** table with one-click Collect for every member who owes money, search + status tabs, and inline `Collect` / `Start chitti` / `Add members` / `Open` on each card, plus a 4-step "how chittis work" guide |
+| Collecting a contribution | chitti → Members tab → member → Collect (4 clicks + page loads) | **1 click** from the workspace pending table, **1 click** from a member row, **1 click** from the chitti overview; dialog pre-selects the overdue period and its outstanding amount |
+| `/chitti/[id]` overview | only "Next Due" + notes | adds a **Collect from members** panel listing who owes, how much, with a Collect button; agreement step chips (Generate → Print → Mark signed) |
+| `/chitti/[id]` members | plain rows, actions only inside the member | row-level **Collect** for ACTIVE members; one single agreement path (the duplicate Generate button was removed); `#members` deep link |
+| `/chitti/new` | 4 steps, name/date typed by hand, hardcoded start date `2026-09-15`, preview mandatory | **2 steps**; selecting a plan prefills name (`<plan> — Nov 2026`), today's date and seat count; schedule preview is optional; primary button **"Create chitti & add members"** lands directly on the member list |
+| Empty/blocked states | generic | actionable: no plans → create a plan; no members → Add First Member; activation blocked → exact blocker list and a Start button on the card when ready |
+
+### Click counts (measured on the running app)
+
+| Task | Before | After |
+|---|---|---|
+| Collect a contribution | 4 clicks | 1–2 clicks (member + confirm) |
+| See who owes money | 3 clicks (analytics) | 0 — visible on the workspace |
+| Create a chitti | 7+ clicks and 4 screens | 3 clicks, 2 screens |
+| Add a member | 3 clicks | 1 click from a draft card (`Add members`) |
+| Understand what to do next | not stated anywhere | 4-step guide + contextual hints on every field |
+
+### Employee usability test (executed in the browser with live demo data)
+
+1. Create a chitti without assistance — plan card → prefilled form → create. Pass.
+2. Add an existing customer — member list opens directly, search + duplicate guard. Pass.
+3. Generate and print an agreement — single step-by-step path with the next action highlighted. Pass (unchanged backend).
+4. Start a chitti — `Start chitti` on the card, blockers shown inline if any. Pass.
+5. Collect a contribution quickly — Collect → period/amount prefilled → confirm. Pass.
+6. Identify pending payments — pending table on the landing page, overdue first. Pass.
+7. Understand the dashboard — KPIs + "how chittis work" + one-line explanations. Pass.
+
+### Data safety during verification
+
+Opening the collect dialog during the browser test accidentally submitted one
+₹2,000 cash contribution (period 4, DEMO-0001). It was reverted in a single SQL
+transaction: the transaction row deleted, the contribution row restored to
+unpaid/OVERDUE, the period totals and the member balance decremented, then
+verified that member totals and period `actual_collection` equal the sum of
+their contribution rows. Ledger is back to 26 transactions / ₹51,000 and no
+other demo data changed.
+
+### Files changed in this phase
+
+- new `web/src/components/chitti/CollectContributionModal.tsx` — one shared collection flow
+- `web/src/app/chitti/page.tsx` — workspace rewrite
+- `web/src/app/chitti/[id]/page.tsx` — overview collect panel, row-level collect, agreement steps, `#members` deep link
+- `web/src/app/chitti/new/page.tsx` — two-step create with prefilled defaults
+- No backend file, migration or database shape changed.
+
+
+---
+
+## 16. Chitti module responsive pass (mobile-first)
+
+Scope: the Chitti module (`/chitti`, `/chitti/[id]`, `/chitti/new`, `/chitti/all`,
+`/chitti/plans`, `/chitti/plans/new`, `/chitti/plans/[id]`, `/chitti/analytics`)
+and the shared app frame they sit in. No business logic, API, query or schema
+changed.
+
+### Root cause on phones
+
+The app frame was desktop-only: a permanently visible `w-64` sidebar plus
+`ml-64` and `p-8` on `<main>`, which left roughly **119px** of usable width on a
+375px phone — every Chitti screen was being squeezed into a sliver. Tables and
+multi-column grids then forced horizontal scrolling.
+
+### App frame
+
+| Item | Before | After |
+|---|---|---|
+| Sidebar | fixed 256px, always visible, covered the phone screen | off-canvas drawer below `lg` (288px, `max-w-[85vw]`), opened from a hamburger in the top bar, closed by the scrim, the X, or any navigation; body scroll locked while open |
+| Content | `ml-64 p-8` | `lg:ml-64`, padding `12px → 20px → 32px` across phone / tablet / desktop |
+| Top bar | `px-8`, no menu affordance | compact 56px on phones with menu button, hidden subtitle, icon-only actions |
+
+### Screen changes
+
+- **Workspace `/chitti`** — KPIs in a 2-column grid on phones (4 on desktop)
+  with smaller type and icon hidden under `sm`; header actions become a 2-column
+  button grid with *New Chitti* first and full width; the pending-collections
+  table is replaced below `md` by one card per member (name, phone, chitti,
+  period, due/late badge, amount, full-width Collect); tabs scroll horizontally
+  in one row and search is full width; chitti cards use compact 3-up money
+  blocks with truncation instead of overflow, and their actions share the row.
+- **Chitti detail** — header stacks, title wraps, the six status actions form a
+  two-column grid; financial summary is 2×2 on phones; tab strip scrolls; the
+  "Collect from members" rows stack with a full-width Collect; member rows become
+  two-line cards (avatar, name, phone, badge, paid) with a full-width Collect
+  button under them; schedule and payouts render as per-period / per-payout cards
+  below `md` and keep their tables on desktop; agreement modal content, signature
+  blocks, member stats and agreement details all stack.
+- **Create chitti** — steps wrap, plan cards single column, primary action
+  "Create chitti & add members" is full width above "Back", optional preview
+  table becomes period cards on phones.
+- **Plans, All Chittis** — 9- and 8-column tables replaced below `md` by cards
+  that keep every value and action (View / Duplicate / Activate).
+- **Plan detail / create plan** — headers stack, all 2-column form grids become
+  single column on phones, summary grid stacks, action row reverses so the
+  primary button is on top.
+- **Analytics** — header and export/refresh buttons stack; KPI and chart grids
+  were already breakpoint-aware. The four detailed ledger tables remain
+  horizontally scrollable **inside their own card**, so the page itself never
+  scrolls sideways.
+- **Shared primitives** (`globals.css`) — cards `p-4 → p-6`; table cells
+  `px-3 → px-5`; tab strip scrolls without wrapping; modals dock to the bottom as
+  a sheet (`items-end`, rounded top, `max-h: 92dvh`, internal scroll) and become
+  centred dialogs from `sm`; 44px minimum tap height for buttons under 640px.
+
+### Verified in the running app (measured in the browser, not by eye)
+
+| Check | Result |
+|---|---|
+| Page-level horizontal overflow at 320 / 375 / 768 / 1440 on `/chitti` | none (scrollWidth ≤ viewport at every width) |
+| KPI grid | 2 columns at 320/375, 4 columns at 1440 |
+| Pending table | hidden below `md`, 8 member cards with Collect rendered instead |
+| Member list | 8 cards at 375, no overflow |
+| Detail page at 375 | no overflow, 4 inline Collect buttons, tab strip scrolls, schedule cards render |
+| Collect dialog at 375 | full-width bottom sheet (370/370px), period 4 and ₹2,000 pre-selected, stacked actions, no overflow |
+| Create chitti at 375 | no overflow, plan cards single column, step 2 actions full width (312px) |
+| Plans at 375 | no overflow, table replaced by cards |
+| Drawer | opens from hamburger (left 0, scrim visible, body locked), closes via scrim |
+| Desktop 1440 | sidebar fixed at 256px, content offset 256px, 4 KPIs, tables visible, hamburger hidden |
+| Shared shell on `/dashboard` at 375 | no overflow, content starts at x=0 |
+
+Not verified: real devices and iOS Safari specifically, landscape tablet, and
+visual review of every screen (checks were DOM measurements; no screenshots were
+taken). Analytics detail tables still scroll horizontally by design.

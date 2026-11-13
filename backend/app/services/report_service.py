@@ -16,15 +16,43 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import Date, and_, case, cast, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.chitti import ChittiPeriodSchedule
+from app.models.chitti import (
+    Chitti,
+    ChittiMember,
+    ChittiMemberContribution,
+    ChittiPeriodSchedule,
+    ChittiTransaction,
+)
 from app.models.customer import Customer
 from app.models.finance import FinanceSchedule
 from app.models.payment import PaymentTransaction
 from app.models.user import User
 from app.utils.timezone import today_ist
+
+
+def present(value):
+    """Decimal -> float at the JSON boundary.
+
+    All money is Decimal internally; the API contract (and the web client's
+    types) says numbers, so decimals are converted once, here, instead of
+    silently serialising as strings.
+    """
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, dict):
+        return {key: present(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [present(item) for item in value]
+    return value
+
+
+# Chitti dues only exist once a chitti is running (or finished). DRAFT and
+# CANCELLED chittis keep schedule rows from the plan preview; counting those as
+# "due today" inflated the dashboard and disagreed with Chitti analytics.
+FINANCIAL_CHITTI_STATUSES = ("RUNNING", "PAUSED", "COMPLETED")
 
 
 class ReportService:
@@ -42,12 +70,21 @@ class ReportService:
         d = report_date or today_ist()
 
         expected = await self._expected_for_date(d)
-        collected = await self._collected_for_date(d)
-        reversals = await self._reversals_for_date(d)
+        money = await self._collections_for_date(d)
+        pending = await self._pending_for_date(d)
+
+        finance_collected = money["finance_collected"]
+        chitti_collected = money["chitti_collected"]
+        finance_reversals = money["finance_reversals"]
+        chitti_reversals = money["chitti_reversals"]
+
+        # Finance and chitti money live in different ledgers; both are real
+        # collections and they are reported together but never mixed up.
+        collected = finance_collected + chitti_collected
+        reversals = finance_reversals + chitti_reversals
         net = collected - reversals
 
         expected_count = expected["finance_count"] + expected["chitti_count"]
-        pending = max(expected["total"] - net, Decimal("0"))
 
         collection_rate = (
             (net / expected["total"] * Decimal("100")).quantize(Decimal("0.1"))
@@ -55,18 +92,29 @@ class ReportService:
             else Decimal("0")
         )
 
-        return {
+        return present({
             "date": str(d),
             "expected_total": expected["total"],
             "expected_count": expected_count,
             "finance_expected": expected["finance_total"],
             "chitti_expected": expected["chitti_total"],
             "collected_total": collected,
+            "finance_collected": finance_collected,
+            "chitti_collected": chitti_collected,
             "reversals_total": reversals,
+            "finance_reversals": finance_reversals,
+            "chitti_reversals": chitti_reversals,
             "net_collections": net,
-            "pending_total": pending,
+            "finance_net": finance_collected - finance_reversals,
+            "chitti_net": chitti_collected - chitti_reversals,
+            # Pending is what is still unpaid on the day's dues, read from the
+            # schedules themselves. expected - collected was wrong whenever a
+            # payment landed on a different instalment than the one due.
+            "pending_total": pending["total"],
+            "finance_pending": pending["finance"],
+            "chitti_pending": pending["chitti"],
             "collection_rate": float(collection_rate),
-        }
+        })
 
     # ===========================================================================
     # Detailed daily report (metrics + by-user + pending + recent)
@@ -83,13 +131,13 @@ class ReportService:
         payments = await self.get_day_payments(d)
         by_method = await self.collections_by_method(d)
 
-        return {
+        return present({
             **summary,
             "by_user": by_user,
             "by_method": by_method,
             "pending_details": pending,
             "payments": payments,
-        }
+        })
 
     # ===========================================================================
     # Collections grouped by collector (user)
@@ -98,8 +146,26 @@ class ReportService:
     async def collections_by_user(self, report_date: Optional[date] = None) -> list[dict]:
         """Collections for the day grouped by the collector (user) who recorded them."""
         d = report_date or today_ist()
+        buckets: dict = {}
 
-        result = await self.session.execute(
+        def bucket(user_id, full_name, username, role) -> dict:
+            key = str(user_id) if user_id else "unknown"
+            entry = buckets.setdefault(
+                key,
+                {
+                    "user_id": str(user_id) if user_id else None,
+                    "full_name": full_name or "Unknown",
+                    "username": username or "—",
+                    "role": role or "—",
+                    "finance_collected": Decimal("0"),
+                    "chitti_collected": Decimal("0"),
+                    "collected_total": Decimal("0"),
+                    "payment_count": 0,
+                },
+            )
+            return entry
+
+        fin = await self.session.execute(
             select(
                 PaymentTransaction.collected_by,
                 func.coalesce(func.sum(PaymentTransaction.amount), Decimal("0")).label("total"),
@@ -115,21 +181,46 @@ class ReportService:
                 PaymentTransaction.is_reversal == False,  # noqa: E712
             )
             .group_by(PaymentTransaction.collected_by, User.full_name, User.username, User.role)
-            .order_by(func.sum(PaymentTransaction.amount).desc())
         )
-        rows = result.all()
+        for r in fin.all():
+            entry = bucket(r.collected_by, r.full_name, r.username, r.role)
+            entry["finance_collected"] += r.total
+            entry["collected_total"] += r.total
+            entry["payment_count"] += r.count
 
-        return [
-            {
-                "user_id": str(r.collected_by) if r.collected_by else None,
-                "full_name": r.full_name or "Unknown",
-                "username": r.username or "—",
-                "role": r.role or "—",
-                "collected_total": r.total,
-                "payment_count": r.count,
-            }
-            for r in rows
-        ]
+        chit = await self.session.execute(
+            select(
+                ChittiTransaction.created_by,
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                ChittiTransaction.transaction_type == "CONTRIBUTION",
+                                ChittiTransaction.amount,
+                            ),
+                            else_=-ChittiTransaction.amount,
+                        )
+                    ),
+                    Decimal("0"),
+                ).label("total"),
+                func.count(ChittiTransaction.id).label("count"),
+                User.full_name,
+                User.username,
+                User.role,
+            )
+            .outerjoin(User, User.id == ChittiTransaction.created_by)
+            .where(self._chitti_business_date() == d)
+            .group_by(ChittiTransaction.created_by, User.full_name, User.username, User.role)
+        )
+        for r in chit.all():
+            entry = bucket(r.created_by, r.full_name, r.username, r.role)
+            entry["chitti_collected"] += r.total
+            entry["collected_total"] += r.total
+            entry["payment_count"] += r.count
+
+        rows = list(buckets.values())
+        rows.sort(key=lambda x: x["collected_total"], reverse=True)
+        return rows
 
     # ===========================================================================
     # Collections grouped by payment method
@@ -137,7 +228,22 @@ class ReportService:
 
     async def collections_by_method(self, report_date: Optional[date] = None) -> list[dict]:
         d = report_date or today_ist()
-        result = await self.session.execute(
+        buckets: dict = {}
+
+        def bucket(method) -> dict:
+            mode = method or "OTHER"
+            return buckets.setdefault(
+                mode,
+                {
+                    "method": mode,
+                    "finance_total": Decimal("0"),
+                    "chitti_total": Decimal("0"),
+                    "total": Decimal("0"),
+                    "count": 0,
+                },
+            )
+
+        fin = await self.session.execute(
             select(
                 PaymentTransaction.payment_method,
                 func.coalesce(func.sum(PaymentTransaction.amount), Decimal("0")).label("total"),
@@ -149,16 +255,42 @@ class ReportService:
                 PaymentTransaction.is_reversal == False,  # noqa: E712
             )
             .group_by(PaymentTransaction.payment_method)
-            .order_by(func.sum(PaymentTransaction.amount).desc())
         )
-        return [
-            {
-                "method": r.payment_method,
-                "total": r.total,
-                "count": r.count,
-            }
-            for r in result.all()
-        ]
+        for r in fin.all():
+            entry = bucket(r.payment_method)
+            entry["finance_total"] += r.total
+            entry["total"] += r.total
+            entry["count"] += r.count
+
+        chit = await self.session.execute(
+            select(
+                ChittiTransaction.payment_method,
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                ChittiTransaction.transaction_type == "CONTRIBUTION",
+                                ChittiTransaction.amount,
+                            ),
+                            else_=-ChittiTransaction.amount,
+                        )
+                    ),
+                    Decimal("0"),
+                ).label("total"),
+                func.count(ChittiTransaction.id).label("count"),
+            )
+            .where(self._chitti_business_date() == d)
+            .group_by(ChittiTransaction.payment_method)
+        )
+        for r in chit.all():
+            entry = bucket(r.payment_method)
+            entry["chitti_total"] += r.total
+            entry["total"] += r.total
+            entry["count"] += r.count
+
+        rows = [row for row in buckets.values() if row["count"] > 0]
+        rows.sort(key=lambda x: x["total"], reverse=True)
+        return rows
 
     # ===========================================================================
     # Pending details (due that day, not fully collected)
@@ -190,7 +322,10 @@ class ReportService:
             )
             .join(FinanceAccount, FinanceAccount.id == FinanceSchedule.finance_account_id)
             .join(Customer, Customer.id == FinanceAccount.customer_id)
-            .where(FinanceSchedule.due_date == d)
+            .where(
+                FinanceSchedule.due_date == d,
+                FinanceSchedule.remaining_amount > 0,
+            )
         )
         for r in fin_rows.all():
             if r.status in ("CANCELLED",):
@@ -210,27 +345,54 @@ class ReportService:
                 "status": r.status,
             })
 
-        # ---- Chitti periods due on the day ----
+        # ---- Chitti contributions due on the day (member level) ----
+        # A period schedule only carries aggregates; the drill-down must name the
+        # member who still owes money, otherwise it cannot be acted on.
         chitti_rows = await self.session.execute(
-            select(ChittiPeriodSchedule).where(ChittiPeriodSchedule.due_date == d)
+            select(
+                ChittiMemberContribution,
+                Chitti.chitti_code,
+                Chitti.name.label("chitti_name"),
+                ChittiMember.member_number,
+                Customer.id.label("customer_id"),
+                Customer.full_name,
+                Customer.customer_code,
+                Customer.mobile_number,
+            )
+            .join(
+                ChittiPeriodSchedule,
+                and_(
+                    ChittiPeriodSchedule.chitti_id == ChittiMemberContribution.chitti_id,
+                    ChittiPeriodSchedule.period_number
+                    == ChittiMemberContribution.period_number,
+                ),
+            )
+            .join(Chitti, Chitti.id == ChittiMemberContribution.chitti_id)
+            .join(ChittiMember, ChittiMember.id == ChittiMemberContribution.member_id)
+            .join(Customer, Customer.id == ChittiMember.customer_id)
+            .where(
+                ChittiPeriodSchedule.due_date == d,
+                ChittiMemberContribution.remaining_amount > 0,
+                Chitti.status.in_(FINANCIAL_CHITTI_STATUSES),
+            )
         )
-        for sched in chitti_rows.scalars().all():
-            if sched.pending_collection <= 0:
-                continue
-            chitti = await self._get_chitti_customer_group(sched.chitti_id)
+        for r in chitti_rows.all():
+            con = r.ChittiMemberContribution
             items.append({
                 "source": "CHITTI",
-                "reference_id": str(sched.id),
-                "account_number": chitti.get("chitti_code"),
-                "customer_id": None,
-                "customer_name": chitti.get("name"),
-                "customer_code": None,
-                "mobile_number": None,
-                "period_label": f"Period {sched.period_number}",
-                "expected": sched.expected_collection,
-                "paid": sched.actual_collection,
-                "pending": sched.pending_collection,
-                "status": sched.status,
+                "reference_id": str(con.id),
+                "account_number": r.chitti_code,
+                "customer_id": str(r.customer_id),
+                "customer_name": r.full_name,
+                "customer_code": r.customer_code,
+                "mobile_number": r.mobile_number,
+                "period_label": f"Period {con.period_number}",
+                "chitti_name": r.chitti_name,
+                "member_number": r.member_number,
+                "expected": con.expected_amount,
+                "paid": con.paid_amount,
+                "pending": con.remaining_amount,
+                "status": con.status,
             })
 
         return items
@@ -240,8 +402,11 @@ class ReportService:
     # ===========================================================================
 
     async def get_day_payments(self, report_date: Optional[date] = None) -> list[dict]:
+        """Every payment recorded on the day, from both money streams."""
         d = report_date or today_ist()
-        result = await self.session.execute(
+        merged: list[tuple] = []
+
+        fin = await self.session.execute(
             select(
                 PaymentTransaction,
                 Customer.full_name.label("customer_name"),
@@ -251,27 +416,63 @@ class ReportService:
             .outerjoin(Customer, Customer.id == PaymentTransaction.customer_id)
             .outerjoin(User, User.id == PaymentTransaction.collected_by)
             .where(PaymentTransaction.payment_date == d)
-            .order_by(PaymentTransaction.created_at.desc())
         )
-        return [
-            {
-                "id": str(p.PaymentTransaction.id),
-                "transaction_id": p.PaymentTransaction.transaction_id,
-                "customer_name": p.customer_name or "—",
-                "customer_code": p.customer_code,
-                "collector_name": p.collector_name or "—",
-                "amount": p.PaymentTransaction.amount,
-                "payment_method": p.PaymentTransaction.payment_method,
-                "status": p.PaymentTransaction.status,
-                "is_reversal": p.PaymentTransaction.is_reversal,
-                "source": (
-                    "CHITTI" if p.PaymentTransaction.chitti_account_id
-                    else "FINANCE" if p.PaymentTransaction.finance_account_id
-                    else "OTHER"
-                ),
-            }
-            for p in result.all()
-        ]
+        for p in fin.all():
+            txn = p.PaymentTransaction
+            merged.append((
+                txn.created_at,
+                {
+                    "id": str(txn.id),
+                    "transaction_id": txn.transaction_id,
+                    "customer_name": p.customer_name or "—",
+                    "customer_code": p.customer_code,
+                    "collector_name": p.collector_name or "—",
+                    "amount": txn.amount,
+                    "payment_method": txn.payment_method,
+                    "status": txn.status,
+                    "is_reversal": txn.is_reversal,
+                    "source": (
+                        "CHITTI" if txn.chitti_account_id
+                        else "FINANCE" if txn.finance_account_id
+                        else "OTHER"
+                    ),
+                },
+            ))
+
+        chit = await self.session.execute(
+            select(
+                ChittiTransaction,
+                Customer.full_name.label("customer_name"),
+                Customer.customer_code,
+                User.full_name.label("collector_name"),
+            )
+            .outerjoin(ChittiMember, ChittiMember.id == ChittiTransaction.member_id)
+            .outerjoin(Customer, Customer.id == ChittiMember.customer_id)
+            .outerjoin(User, User.id == ChittiTransaction.created_by)
+            .where(self._chitti_business_date() == d)
+        )
+        for row in chit.all():
+            txn = row.ChittiTransaction
+            merged.append((
+                txn.created_at,
+                {
+                    "id": str(txn.id),
+                    "transaction_id": f"CTX-{str(txn.id).split('-')[0].upper()}",
+                    "customer_name": row.customer_name or "—",
+                    "customer_code": row.customer_code,
+                    "collector_name": row.collector_name or "—",
+                    "amount": txn.amount,
+                    "payment_method": txn.payment_method or "OTHER",
+                    "status": (
+                        "REVERSED" if txn.transaction_type == "REVERSAL" else "COMPLETED"
+                    ),
+                    "is_reversal": txn.transaction_type == "REVERSAL",
+                    "source": "CHITTI",
+                },
+            ))
+
+        merged.sort(key=lambda item: item[0], reverse=True)
+        return [item[1] for item in merged]
 
     # ===========================================================================
     # Plan-specific metrics (for the Chitti plan detail page)
@@ -313,7 +514,10 @@ class ReportService:
 
         # Member count
         member_count = await self.session.execute(
-            select(func.count(ChittiMember.id)).where(ChittiMember.chitti_id.in_(chitti_ids))
+            select(func.count(ChittiMember.id)).where(
+                ChittiMember.chitti_id.in_(chitti_ids),
+                ChittiMember.status.notin_(("CANCELLED", "REJECTED", "LEFT")),
+            )
         )
         total_members = member_count.scalar() or 0
 
@@ -364,8 +568,7 @@ class ReportService:
     # ===========================================================================
 
     async def _expected_for_date(self, d: date) -> dict:
-        """Sum of amounts due on a date across finance + chitti schedules."""
-        # Finance installments due on the day (exclude cancelled)
+        """Amounts due on a date: finance installments + running chitti periods."""
         fin = await self.session.execute(
             select(
                 func.coalesce(func.sum(FinanceSchedule.expected_amount), Decimal("0")),
@@ -377,12 +580,16 @@ class ReportService:
         )
         finance_total, finance_count = fin.one()
 
-        # Chitti periods due on the day
         chit = await self.session.execute(
             select(
                 func.coalesce(func.sum(ChittiPeriodSchedule.expected_collection), Decimal("0")),
                 func.count(ChittiPeriodSchedule.id),
-            ).where(ChittiPeriodSchedule.due_date == d)
+            )
+            .join(Chitti, Chitti.id == ChittiPeriodSchedule.chitti_id)
+            .where(
+                ChittiPeriodSchedule.due_date == d,
+                Chitti.status.in_(FINANCIAL_CHITTI_STATUSES),
+            )
         )
         chitti_total, chitti_count = chit.one()
 
@@ -394,25 +601,129 @@ class ReportService:
             "total": finance_total + chitti_total,
         }
 
-    async def _collected_for_date(self, d: date) -> Decimal:
-        result = await self.session.execute(
-            select(func.coalesce(func.sum(PaymentTransaction.amount), Decimal("0"))).where(
-                PaymentTransaction.payment_date == d,
-                PaymentTransaction.status == "COMPLETED",
-                PaymentTransaction.is_reversal == False,  # noqa: E712
-            )
-        )
-        return result.scalar() or Decimal("0")
+    async def _collections_for_date(self, d: date) -> dict:
+        """Money actually collected on a date, kept separate per stream.
 
-    async def _reversals_for_date(self, d: date) -> Decimal:
-        result = await self.session.execute(
-            select(func.coalesce(func.sum(PaymentTransaction.amount), Decimal("0"))).where(
-                PaymentTransaction.payment_date == d,
-                PaymentTransaction.status == "COMPLETED",
-                PaymentTransaction.is_reversal == True,  # noqa: E712
+        Finance collections live only in `payment_transactions`; chitti
+        contributions live only in `chitti_transactions`. Reading a single
+        ledger is what made the dashboard disagree with Chitti analytics.
+        """
+        fin = await self.session.execute(
+            select(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                and_(
+                                    PaymentTransaction.is_reversal.is_(False),
+                                    PaymentTransaction.status == "COMPLETED",
+                                ),
+                                PaymentTransaction.amount,
+                            ),
+                            else_=Decimal("0"),
+                        )
+                    ),
+                    Decimal("0"),
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                PaymentTransaction.is_reversal.is_(True),
+                                PaymentTransaction.amount,
+                            ),
+                            else_=Decimal("0"),
+                        )
+                    ),
+                    Decimal("0"),
+                ),
+            ).where(PaymentTransaction.payment_date == d)
+        )
+        finance_collected, finance_reversals = fin.one()
+
+        chit = await self.session.execute(
+            select(
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                ChittiTransaction.transaction_type == "CONTRIBUTION",
+                                ChittiTransaction.amount,
+                            ),
+                            else_=Decimal("0"),
+                        )
+                    ),
+                    Decimal("0"),
+                ),
+                func.coalesce(
+                    func.sum(
+                        case(
+                            (
+                                ChittiTransaction.transaction_type == "REVERSAL",
+                                ChittiTransaction.amount,
+                            ),
+                            else_=Decimal("0"),
+                        )
+                    ),
+                    Decimal("0"),
+                ),
+            ).where(self._chitti_business_date() == d)
+        )
+        chitti_collected, chitti_reversals = chit.one()
+
+        return {
+            "finance_collected": finance_collected,
+            "chitti_collected": chitti_collected,
+            "finance_reversals": finance_reversals,
+            "chitti_reversals": chitti_reversals,
+        }
+
+    async def _pending_for_date(self, d: date) -> dict:
+        """Amount still unpaid on the dues of a date, per stream."""
+        fin = await self.session.execute(
+            select(
+                func.coalesce(func.sum(FinanceSchedule.remaining_amount), Decimal("0"))
+            ).where(
+                FinanceSchedule.due_date == d,
+                FinanceSchedule.status != "CANCELLED",
+                FinanceSchedule.remaining_amount > 0,
             )
         )
-        return result.scalar() or Decimal("0")
+        finance_pending = fin.scalar() or Decimal("0")
+
+        chit = await self.session.execute(
+            select(
+                func.coalesce(
+                    func.sum(ChittiPeriodSchedule.pending_collection), Decimal("0")
+                )
+            )
+            .join(Chitti, Chitti.id == ChittiPeriodSchedule.chitti_id)
+            .where(
+                ChittiPeriodSchedule.due_date == d,
+                ChittiPeriodSchedule.pending_collection > 0,
+                Chitti.status.in_(FINANCIAL_CHITTI_STATUSES),
+            )
+        )
+        chitti_pending = chit.scalar() or Decimal("0")
+
+        return {
+            "finance": finance_pending,
+            "chitti": chitti_pending,
+            "total": finance_pending + chitti_pending,
+        }
+
+    @staticmethod
+    def _chitti_business_date():
+        """Business (IST) date a chitti transaction belongs to.
+
+        An explicit payment_date always wins; legacy rows without one fall back
+        to the insertion timestamp converted to IST (not UTC, which would move
+        late-evening collections into the next day).
+        """
+        return func.coalesce(
+            ChittiTransaction.payment_date,
+            cast(func.timezone("Asia/Kolkata", ChittiTransaction.created_at), Date),
+        )
 
     async def _get_chitti_customer_group(self, chitti_id: UUID) -> dict:
         from app.models.chitti import Chitti

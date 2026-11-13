@@ -217,7 +217,7 @@ export default function NewPlanPage() {
     <DashboardLayout>
       <div className="space-y-6">
         <div>
-          <h2 className="text-2xl font-bold text-gray-900">Create Chitti Plan</h2>
+          <h2 className="text-xl font-bold text-gray-900 sm:text-2xl">Create Chitti Plan</h2>
           <p className="text-sm text-gray-500">
             Define your own plan — every chitti is unique
           </p>
@@ -252,7 +252,7 @@ export default function NewPlanPage() {
                 />
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div>
                   <label className="mb-1 block text-sm font-medium">Frequency *</label>
                   <select value={frequency} onChange={(e) => setFrequency(e.target.value)} className="input-field">
@@ -278,7 +278,7 @@ export default function NewPlanPage() {
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div>
                   <label className="mb-1 block text-sm font-medium">Total Value (₹) *</label>
                   <input
@@ -311,7 +311,7 @@ export default function NewPlanPage() {
                 Choose the calculation method that matches your chitti. You can add custom fields below.
               </p>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {CALC_METHODS.map((method) => (
                   <button
                     key={method.id}
@@ -336,7 +336,7 @@ export default function NewPlanPage() {
                 <h3 className="font-semibold text-gray-800 border-b pb-2">
                   {selectedMethod.label} — Fields
                 </h3>
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                   {selectedMethod.fields.map((fieldDef) => (
                     <div key={fieldDef.key}>
                       <label className="mb-1 block text-sm font-medium">{fieldDef.label} *</label>
@@ -461,7 +461,7 @@ export default function NewPlanPage() {
             {name && totalValue && memberCount && duration && (
               <div className="rounded-lg bg-gray-50 p-4 space-y-2">
                 <h3 className="font-semibold text-gray-800">Plan Summary</h3>
-                <div className="grid grid-cols-2 gap-2 text-sm">
+                <div className="grid grid-cols-1 gap-1.5 text-sm sm:grid-cols-2 sm:gap-2">
                   <p><span className="text-gray-500">Name:</span> {name}</p>
                   <p><span className="text-gray-500">Method:</span> {selectedMethod?.label}</p>
                   <p><span className="text-gray-500">Total Value:</span> ₹{parseFloat(totalValue).toLocaleString("en-IN")}</p>
@@ -492,7 +492,7 @@ export default function NewPlanPage() {
               </div>
             )}
 
-            <div className="flex justify-end gap-3">
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end sm:gap-3">
               <button type="button" onClick={() => router.back()} className="btn-secondary">
                 Cancel
               </button>

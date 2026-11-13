@@ -2,29 +2,37 @@
 
 import { useAuthStore } from "@/hooks/useAuth";
 import { getInitials } from "@/lib/utils";
-import { LogOut, Bell } from "lucide-react";
+import { LogOut, Bell, Menu } from "lucide-react";
 
-export default function TopBar() {
+export default function TopBar({ onMenu }: { onMenu?: () => void }) {
   const { user, logout } = useAuthStore();
 
   return (
-    <header className="sticky top-0 z-30 flex h-16 items-center justify-between border-b border-surface-100 bg-white/80 backdrop-blur-xl px-8">
-      <div className="flex items-center gap-3">
-        <div>
-          <h1 className="text-sm font-semibold text-surface-900">Finance & Chitti</h1>
-          <p className="text-[11px] text-surface-400">Management Dashboard</p>
+    <header className="sticky top-0 z-30 flex h-14 items-center justify-between gap-2 border-b border-surface-100 bg-white/90 px-3 backdrop-blur-xl sm:h-16 sm:px-5 lg:px-8">
+      <div className="flex min-w-0 items-center gap-2">
+        <button
+          type="button"
+          onClick={onMenu}
+          className="rounded-xl p-2 text-surface-500 transition-colors hover:bg-surface-100 hover:text-surface-700 lg:hidden"
+          aria-label="Open navigation menu"
+        >
+          <Menu size={22} />
+        </button>
+        <div className="min-w-0">
+          <h1 className="truncate text-sm font-semibold text-surface-900">Finance & Chitti</h1>
+          <p className="hidden text-[11px] text-surface-400 sm:block">Management Dashboard</p>
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-1.5 sm:gap-3">
         {/* Notification Bell */}
-        <button className="relative rounded-xl p-2.5 text-surface-400 transition-colors hover:bg-surface-100 hover:text-surface-600">
+        <button className="relative rounded-xl p-2 text-surface-400 transition-colors hover:bg-surface-100 hover:text-surface-600 sm:p-2.5">
           <Bell size={18} />
           <span className="absolute right-2 top-2 h-2 w-2 rounded-full bg-danger-500" />
         </button>
 
         {/* Divider */}
-        <div className="h-8 w-px bg-surface-200" />
+        <div className="hidden h-8 w-px bg-surface-200 sm:block" />
 
         {/* User Profile */}
         <div className="flex items-center gap-3">
@@ -40,7 +48,7 @@ export default function TopBar() {
         {/* Logout */}
         <button
           onClick={logout}
-          className="rounded-xl p-2.5 text-surface-400 transition-colors hover:bg-danger-50 hover:text-danger-600"
+          className="rounded-xl p-2 text-surface-400 transition-colors hover:bg-danger-50 hover:text-danger-600 sm:p-2.5"
           title="Sign out"
         >
           <LogOut size={18} />

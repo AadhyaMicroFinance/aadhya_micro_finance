@@ -192,7 +192,7 @@ export default function DashboardPage() {
             <GradientStat
               label="Collected Today"
               value={fmt(report?.collected_total || 0)}
-              sub={`${report?.by_method?.length || 0} payment methods`}
+              sub={`${fmt(report?.finance_collected || 0)} finance • ${fmt(report?.chitti_collected || 0)} chitti`}
               icon={<Wallet size={20} />}
               gradient="bg-gradient-to-br from-success-500 via-emerald-600 to-teal-600"
             />
@@ -262,6 +262,35 @@ export default function DashboardPage() {
                   </p>
                   <p className="text-sm font-bold text-danger-700">
                     {fmt(report.reversals_total)}
+                  </p>
+                </div>
+              </div>
+              {/* Collected is split per stream: finance and chitti money are
+                  separate ledgers and must never be blended into one number
+                  without showing which is which. */}
+              <div className="mt-3 grid grid-cols-3 gap-3 text-center">
+                <div className="rounded-xl bg-success-50 p-3">
+                  <p className="text-[11px] font-medium text-success-600 uppercase">
+                    Finance collected
+                  </p>
+                  <p className="text-sm font-bold text-success-700">
+                    {fmt(report.finance_collected)}
+                  </p>
+                </div>
+                <div className="rounded-xl bg-purple-50 p-3">
+                  <p className="text-[11px] font-medium text-purple-600 uppercase">
+                    Chitti collected
+                  </p>
+                  <p className="text-sm font-bold text-purple-700">
+                    {fmt(report.chitti_collected)}
+                  </p>
+                </div>
+                <div className="rounded-xl bg-surface-50 p-3">
+                  <p className="text-[11px] font-medium text-surface-500 uppercase">
+                    Total
+                  </p>
+                  <p className="text-sm font-bold text-surface-800">
+                    {fmt(report.collected_total)}
                   </p>
                 </div>
               </div>

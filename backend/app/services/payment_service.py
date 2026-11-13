@@ -63,7 +63,17 @@ class PaymentService:
         if existing:
             raise DuplicatePaymentException()
 
-        # 2. Validate finance account if provided
+        # 2. Chitti money must never enter the finance ledger. Recording it here
+        # would count the same collection twice (finance ledger + chitti ledger)
+        # and leave the member's contribution row untouched.
+        if chitti_account_id or chitti_schedule_id:
+            raise BadRequestException(
+                "Chitti contributions must be recorded through the Chitti contribution "
+                "endpoint so member balances and period totals stay in sync.",
+                error_code="USE_CHITTI_CONTRIBUTION_ENDPOINT",
+            )
+
+        # 3. Validate finance account if provided
         if finance_account_id:
             account = await self.finance_repo.get_by_id(UUID(finance_account_id))
             if not account:
@@ -148,6 +158,37 @@ class PaymentService:
             completed_at=completed_at,
         )
 
+    async def _restore_finance_schedule(
+        self, schedule_id: UUID, payment_amount: Decimal
+    ) -> None:
+        """Undo the allocation a payment made to its installment."""
+        from app.utils.timezone import today_ist
+
+        schedule = await self.schedule_repo.get_by_id(schedule_id)
+        if not schedule:
+            return
+
+        new_paid = max(schedule.paid_amount - payment_amount, Decimal("0"))
+        new_remaining = schedule.expected_amount - new_paid
+
+        if new_paid <= 0:
+            status = "OVERDUE" if schedule.due_date < today_ist() else "UPCOMING"
+            completed_at = None
+        elif new_remaining > 0:
+            status = "PARTIALLY_PAID"
+            completed_at = None
+        else:
+            status = "PAID"
+            completed_at = schedule.completed_at
+
+        await self.schedule_repo.update(
+            schedule,
+            paid_amount=new_paid,
+            remaining_amount=max(new_remaining, Decimal("0")),
+            status=status,
+            completed_at=completed_at,
+        )
+
     async def reverse_payment(
         self,
         payment_id: UUID,
@@ -190,6 +231,13 @@ class PaymentService:
 
         # Mark original as reversed
         await self.payment_repo.update(original, status="REVERSED")
+
+        # Undo the installment allocation, otherwise the schedule keeps showing
+        # money that was handed back and the customer looks overpaid forever.
+        if original.finance_schedule_id:
+            await self._restore_finance_schedule(
+                original.finance_schedule_id, original.amount
+            )
 
         return {
             "id": str(reversal.id),

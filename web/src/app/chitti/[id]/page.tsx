@@ -21,6 +21,7 @@ import { formatCurrency, formatDate, cn, getStatusColor, getInitials } from "@/l
 import ProgressBar from "@/components/ui/ProgressBar";
 import Avatar from "@/components/ui/Avatar";
 import EmptyState from "@/components/ui/EmptyState";
+import CollectContributionModal from "@/components/chitti/CollectContributionModal";
 import { PageSkeleton } from "@/components/ui/Skeleton";
 import {
   ArrowLeft,
@@ -95,7 +96,7 @@ function AgreementPreviewModal({
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal-content max-w-2xl max-h-[90vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
         {/* Print-friendly agreement content */}
-        <div id="agreement-content" className="p-8 print:p-4">
+        <div id="agreement-content" className="p-4 print:p-4 sm:p-8">
           {/* Header */}
           <div className="text-center border-b-2 border-surface-900 pb-4 mb-6">
             <h1 className="text-2xl font-bold tracking-wide text-surface-900">CHITTI AGREEMENT</h1>
@@ -145,22 +146,20 @@ function AgreementPreviewModal({
           </Section>
 
           {/* Signature Area */}
-          <div className="mt-8 pt-4 border-t border-surface-300">
-            <div className="flex justify-between text-sm">
+            <div className="mt-8 flex flex-col gap-6 border-t border-surface-300 pt-4 text-sm sm:flex-row sm:justify-between">
               <div className="text-center">
-                <div className="border-b border-surface-400 w-40 mb-1">&nbsp;</div>
+                <div className="mb-1 w-48 max-w-full border-b border-surface-400 sm:w-40">&nbsp;</div>
                 <p className="text-surface-500">Member Signature</p>
               </div>
               <div className="text-center">
-                <div className="border-b border-surface-400 w-40 mb-1">&nbsp;</div>
+                <div className="mb-1 w-48 max-w-full border-b border-surface-400 sm:w-40">&nbsp;</div>
                 <p className="text-surface-500">Authorized Signatory</p>
               </div>
             </div>
-          </div>
         </div>
 
         {/* Action buttons */}
-        <div className="flex gap-3 p-6 border-t border-surface-100 print:hidden">
+        <div className="flex flex-col gap-2 border-t border-surface-100 p-4 print:hidden sm:flex-row sm:gap-3 sm:p-6">
           <button onClick={onClose} className="btn-secondary flex-1">
             Close
           </button>
@@ -191,8 +190,8 @@ function Section({ title, children }: { title: string; children: React.ReactNode
 
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex text-sm">
-      <span className="w-32 text-surface-500">{label}:</span>
+    <div className="flex flex-col gap-0.5 text-sm sm:flex-row sm:gap-0">
+      <span className="shrink-0 text-surface-500 sm:w-32">{label}:</span>
       <span className="font-medium text-surface-900">{value}</span>
     </div>
   );
@@ -260,7 +259,7 @@ function AddMemberModal({
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal-content max-w-lg p-6" onClick={(e) => e.stopPropagation()}>
+      <div className="modal-content max-w-lg p-4 sm:p-6" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-6">
           <div>
             <h2 className="text-lg font-bold text-surface-900">Add Member</h2>
@@ -322,7 +321,7 @@ function AddMemberModal({
           </div>
         ) : (
           <div className="space-y-4">
-            <div className="rounded-xl bg-surface-50 p-4 flex items-center gap-4">
+            <div className="flex flex-wrap items-center gap-3 rounded-xl bg-surface-50 p-3 sm:gap-4 sm:p-4">
               <Avatar name={selectedCustomer.full_name} size="lg" />
               <div className="flex-1">
                 <p className="font-semibold text-surface-900">{selectedCustomer.full_name}</p>
@@ -340,7 +339,7 @@ function AddMemberModal({
               <div className="rounded-xl bg-danger-50 border border-danger-100 p-3 text-sm text-danger-700">{error}</div>
             )}
 
-            <div className="flex gap-3">
+            <div className="flex flex-col-reverse gap-2 sm:flex-row sm:gap-3">
               <button onClick={onClose} className="btn-secondary flex-1">Cancel</button>
               <button onClick={handleAdd} disabled={adding} className="btn-primary flex-1">
                 {adding ? "Adding..." : `Add as Member #${currentCount + 1}`}
@@ -380,6 +379,8 @@ export default function ChittiDetailPage() {
 
   const [showAddMember, setShowAddMember] = useState(false);
   const [showAgreement, setShowAgreement] = useState<Agreement | null>(null);
+  const [showCollect, setShowCollect] = useState(false);
+  const [collectMember, setCollectMember] = useState<ChittiMember | null>(null);
 
   const loadData = useCallback(async () => {
     try {
@@ -401,6 +402,15 @@ export default function ChittiDetailPage() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
+  // Deep link from the workspace: /chitti/{id}#members opens the member list
+  // directly so "Add members" is one click from the landing page.
+  useEffect(() => {
+    if (typeof window !== "undefined" && window.location.hash === "#members") {
+      loadTab("members");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const loadMembers = async () => {
     try { setMembers(await chittiApi.listMembers(chittiId)); }
     catch (e) { console.error(e); }
@@ -417,6 +427,12 @@ export default function ChittiDetailPage() {
       try { setPayouts(await chittiApi.listPayouts(chittiId)); } catch (e) { console.error(e); }
     }
   };
+
+  // Members who still owe money, biggest debt first — the overview lists them
+  // with a Collect button so nobody has to hunt through tabs.
+  const owingMembers = [...members]
+    .filter((m) => Number(m.outstanding || 0) > 0)
+    .sort((a, b) => Number(b.outstanding || 0) - Number(a.outstanding || 0));
 
   const handleStatusChange = async (action: "start" | "pause" | "resume" | "complete" | "cancel") => {
     if (actionLoading) return; // guard against double submission
@@ -504,7 +520,7 @@ export default function ChittiDetailPage() {
     } catch (e) { console.error(e); }
   };
 
-  if (loading) return <DashboardLayout><div className="p-8"><PageSkeleton /></div></DashboardLayout>;
+  if (loading) return <DashboardLayout><div className="p-4 sm:p-8"><PageSkeleton /></div></DashboardLayout>;
   if (!chitti || !summary) return <DashboardLayout><div className="card text-center py-12 text-surface-500">Chitti not found</div></DashboardLayout>;
 
   const snapshot = chitti.plan_snapshot as Record<string, unknown> | null;
@@ -520,24 +536,24 @@ export default function ChittiDetailPage() {
 
   return (
     <DashboardLayout>
-      <div className="space-y-8">
+      <div className="space-y-5 sm:space-y-8">
         {/* Header */}
-        <div className="flex items-start justify-between">
-          <div className="space-y-1">
-            <div className="flex items-center gap-3">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0 space-y-1">
+            <div className="flex items-start gap-2 sm:gap-3">
               <Link href="/chitti" className="rounded-lg p-2 text-surface-400 hover:bg-surface-100 hover:text-surface-600 transition-colors">
                 <ArrowLeft size={18} />
               </Link>
               <div>
-                <h1 className="text-2xl font-bold text-surface-900 tracking-tight">{chitti.name}</h1>
-                <div className="flex items-center gap-2 mt-1">
+                <h1 className="break-words text-xl font-bold tracking-tight text-surface-900 sm:text-2xl">{chitti.name}</h1>
+                <div className="mt-1 flex flex-wrap items-center gap-2">
                   <span className={cn("badge", getStatusColor(chitti.status))}>{displayStateLabel(activation?.display_state ?? chitti.status)}</span>
                   <span className="text-sm text-surface-500">{chitti.chitti_code} • {String(snapshot?.frequency ?? "MONTHLY")}</span>
                 </div>
               </div>
             </div>
           </div>
-          <div className="flex gap-2">
+          <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap sm:items-start">
             {canAddMembers && (
               <button onClick={() => setShowAddMember(true)} className="btn-primary">
                 <Plus size={16} /> Add Member
@@ -642,25 +658,25 @@ export default function ChittiDetailPage() {
         </div>
 
         {/* Financial Summary */}
-        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <div className="grid grid-cols-2 gap-2.5 sm:gap-4 lg:grid-cols-4">
           {[
             { label: "Total Value", value: formatCurrency(summary.total_value), icon: <IndianRupee size={18} />, color: "bg-brand-50 text-brand-600" },
             { label: "Collected", value: formatCurrency(summary.actual_collection), icon: <TrendingUp size={18} />, color: "bg-success-50 text-success-600" },
             { label: "Pending", value: formatCurrency(summary.pending_collection), icon: <TrendingDown size={18} />, color: "bg-warning-50 text-warning-600" },
             { label: "Members", value: `${currentMemberCount} / ${memberCapacity}`, icon: <Users size={18} />, color: "bg-purple-50 text-purple-600" },
           ].map((stat) => (
-            <div key={stat.label} className="card flex items-center gap-4">
-              <div className={cn("rounded-xl p-3", stat.color)}>{stat.icon}</div>
-              <div>
-                <p className="text-xs font-medium text-surface-500 uppercase">{stat.label}</p>
-                <p className="text-xl font-bold text-surface-900 tabular-nums">{stat.value}</p>
+            <div key={stat.label} className="card flex items-center gap-2.5 p-3 sm:gap-4 sm:p-6">
+              <div className={cn("rounded-lg p-2 sm:rounded-xl sm:p-3", stat.color)}>{stat.icon}</div>
+              <div className="min-w-0">
+                <p className="text-[10px] font-medium uppercase text-surface-500 sm:text-xs">{stat.label}</p>
+                <p className="truncate text-base font-bold text-surface-900 tabular-nums sm:text-xl">{stat.value}</p>
               </div>
             </div>
           ))}
         </div>
 
         {/* Quick Info */}
-        <div className="grid grid-cols-2 gap-4 lg:grid-cols-3">
+        <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 sm:gap-4 lg:grid-cols-3">
           <div className="card text-sm">
             <div className="flex items-center gap-2 text-surface-500 mb-1"><Calendar size={14} /> Duration</div>
             <p className="font-medium text-surface-900">{formatDate(chitti.start_date)} → {formatDate(chitti.end_date)}</p>
@@ -683,7 +699,7 @@ export default function ChittiDetailPage() {
         </div>
 
         {/* Tabs */}
-        <div className="tabs">
+        <div className="tabs w-full sm:w-auto">
           {(["overview", "members", "schedule", "payouts"] as const).map((tab) => (
             <button
               key={tab}
@@ -698,6 +714,7 @@ export default function ChittiDetailPage() {
 
         {/* ============ OVERVIEW TAB ============ */}
         {activeTab === "overview" && (
+          <div className="space-y-4">
           <div className="card">
             <h3 className="text-sm font-semibold text-surface-900 mb-4">Next Due</h3>
             {summary.next_due_date ? (
@@ -711,6 +728,36 @@ export default function ChittiDetailPage() {
             ) : <p className="text-surface-500">No upcoming dues</p>}
             {chitti.notes && <div className="mt-4 pt-4 border-t border-surface-100"><p className="text-sm text-surface-600">{chitti.notes}</p></div>}
           </div>
+
+          {chitti.status === "RUNNING" && owingMembers.length > 0 && (
+            <div className="card">
+              <div className="mb-3">
+                <h3 className="text-sm font-semibold text-surface-900">Collect from members</h3>
+                <p className="text-xs text-surface-500">
+                  {owingMembers.length} member{owingMembers.length === 1 ? "" : "s"} still owe money — collect without opening the member.
+                </p>
+              </div>
+              <div className="space-y-2">
+                {owingMembers.slice(0, 5).map((m) => (
+                  <div key={m.id} className="flex flex-col gap-2 rounded-xl border border-surface-100 p-3 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-surface-900">{m.customer_name || m.customer_code}</p>
+                      <p className="text-xs text-surface-500">
+                        #{m.member_number} • paid {formatCurrency(m.total_paid)} of {formatCurrency(m.total_expected)}
+                      </p>
+                    </div>
+                    <div className="flex items-center justify-between gap-3 sm:justify-end">
+                      <span className="text-sm font-bold text-warning-600">{formatCurrency(m.outstanding)}</span>
+                      <button className="btn-primary btn-sm flex-1 sm:flex-none" onClick={() => setCollectMember(m)}>
+                        <IndianRupee size={14} /> Collect
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+          </div>
         )}
 
         {/* ============ MEMBERS TAB ============ */}
@@ -718,8 +765,8 @@ export default function ChittiDetailPage() {
           <div className="space-y-4">
             {selectedMember ? (
               <div className="card animate-fade-in">
-                <div className="flex items-center justify-between mb-6">
-                  <div className="flex items-center gap-4">
+                <div className="mb-4 flex flex-col gap-3 sm:mb-6 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-center gap-3 sm:gap-4">
                     <Avatar name={selectedMember.customer_name || ""} size="lg" />
                     <div>
                       <h3 className="text-lg font-semibold text-surface-900">{selectedMember.customer_name || selectedMember.customer_code}</h3>
@@ -729,21 +776,36 @@ export default function ChittiDetailPage() {
                   <button onClick={() => setSelectedMember(null)} className="btn-ghost text-sm"><ArrowLeft size={16} /> Back</button>
                 </div>
 
-                <div className="flex items-center gap-3 mb-6">
+                <div className="mb-4 flex flex-wrap items-center gap-2 sm:mb-6 sm:gap-3">
                   <span className={cn("badge", getStatusColor(selectedMember.status))}>{selectedMember.status.replace(/_/g, " ")}</span>
-                  {canAddMembers && selectedMember.status === "PENDING_AGREEMENT" && (
-                    <button onClick={() => handleGenerateAgreement(selectedMember.id)} className="btn-primary btn-sm"><FileText size={14} /> Generate Agreement</button>
-                  )}
                   {canAddMembers && ["PENDING_AGREEMENT", "AGREEMENT_GENERATED", "AGREEMENT_PRINTED"].includes(selectedMember.status) && (
                     <button onClick={() => handleCancelMember(selectedMember.id)} className="btn-danger btn-sm">Cancel</button>
                   )}
+                  {chitti.status === "RUNNING" && selectedMember.status === "ACTIVE" && (
+                    <button onClick={() => setShowCollect(true)} className="btn-secondary btn-sm"><IndianRupee size={14} /> Collect Contribution</button>
+                  )}
                 </div>
 
-                <div className="grid grid-cols-2 gap-4 mb-6">
-                  <div className="rounded-xl bg-success-50 p-4"><p className="text-xs text-success-600 font-medium">Paid</p><p className="text-2xl font-bold text-success-700">{formatCurrency(selectedMember.total_paid || 0)}</p></div>
-                  <div className="rounded-xl bg-warning-50 p-4"><p className="text-xs text-warning-600 font-medium">Outstanding</p><p className="text-2xl font-bold text-warning-700">{formatCurrency(selectedMember.outstanding || 0)}</p></div>
-                  <div className="rounded-xl bg-brand-50 p-4"><p className="text-xs text-brand-600 font-medium">Expected</p><p className="text-2xl font-bold text-brand-700">{formatCurrency(selectedMember.total_expected || 0)}</p></div>
-                  <div className="rounded-xl bg-surface-50 p-4"><p className="text-xs text-surface-500 font-medium">Lifted</p><p className="text-2xl font-bold text-surface-700">{selectedMember.lifted ? "Yes" : "No"}</p></div>
+                {selectedMember.status !== "ACTIVE" && (
+                  <div className="mb-6 flex flex-wrap items-center gap-2 rounded-xl bg-surface-50 p-3 text-xs">
+                    <span className="font-semibold text-surface-600">Agreement steps:</span>
+                    {[
+                      { key: "generate", label: "1. Generate", done: selectedMember.status !== "PENDING_AGREEMENT" },
+                      { key: "print", label: "2. Print", done: ["AGREEMENT_PRINTED", "ACTIVE"].includes(selectedMember.status) || Boolean(selectedMember.agreement?.printed_at) },
+                      { key: "sign", label: "3. Mark signed", done: false },
+                    ].map((s) => (
+                      <span key={s.key} className={cn("badge", s.done ? "bg-success-50 text-success-700" : "border border-surface-200 bg-white text-surface-500")}>
+                        {s.done ? "✓ " : ""}{s.label}
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <div className="mb-4 grid grid-cols-2 gap-2.5 sm:mb-6 sm:gap-4">
+                  <div className="rounded-xl bg-success-50 p-3 sm:p-4"><p className="text-[11px] font-medium text-success-600 sm:text-xs">Paid</p><p className="text-lg font-bold text-success-700 sm:text-2xl">{formatCurrency(selectedMember.total_paid || 0)}</p></div>
+                  <div className="rounded-xl bg-warning-50 p-3 sm:p-4"><p className="text-[11px] font-medium text-warning-600 sm:text-xs">Outstanding</p><p className="text-lg font-bold text-warning-700 sm:text-2xl">{formatCurrency(selectedMember.outstanding || 0)}</p></div>
+                  <div className="rounded-xl bg-brand-50 p-3 sm:p-4"><p className="text-[11px] font-medium text-brand-600 sm:text-xs">Expected</p><p className="text-lg font-bold text-brand-700 sm:text-2xl">{formatCurrency(selectedMember.total_expected || 0)}</p></div>
+                  <div className="rounded-xl bg-surface-50 p-3 sm:p-4"><p className="text-[11px] font-medium text-surface-500 sm:text-xs">Lifted</p><p className="text-lg font-bold text-surface-700 sm:text-2xl">{selectedMember.lifted ? "Yes" : "No"}</p></div>
                 </div>
 
                 {/* Agreement Section */}
@@ -751,13 +813,13 @@ export default function ChittiDetailPage() {
                   <div className="border-t border-surface-100 pt-6">
                     <h4 className="font-semibold text-surface-900 mb-3">Agreement</h4>
                     <div className="rounded-xl bg-surface-50 p-4">
-                      <div className="grid grid-cols-2 gap-3 text-sm mb-4">
+                      <div className="mb-4 grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
                         <div><p className="text-surface-500">Number</p><p className="font-medium">{selectedMember.agreement.agreement_number}</p></div>
                         <div><p className="text-surface-500">Status</p><span className={cn("badge", getStatusColor(selectedMember.agreement.agreement_status))}>{selectedMember.agreement.agreement_status}</span></div>
                         <div><p className="text-surface-500">Generated</p><p className="font-medium">{selectedMember.agreement.generated_at ? formatDate(selectedMember.agreement.generated_at) : "—"}</p></div>
                         <div><p className="text-surface-500">Printed</p><p className="font-medium">{selectedMember.agreement.printed_at ? formatDate(selectedMember.agreement.printed_at) : "—"} {selectedMember.agreement.print_count > 0 ? `(${selectedMember.agreement.print_count}×)` : ""}</p></div>
                       </div>
-                      <div className="flex gap-2">
+                      <div className="flex flex-wrap gap-2">
                         <button onClick={() => setShowAgreement(selectedMember.agreement ?? null)} className="btn-secondary btn-sm"><FileText size={14} /> View</button>
                         {(selectedMember.agreement.agreement_status === "GENERATED" || selectedMember.agreement.agreement_status === "PRINTED") && (
                           <button onClick={() => handlePrintAgreement(selectedMember.id)} className="btn-primary btn-sm"><Printer size={14} /> Print</button>
@@ -781,7 +843,7 @@ export default function ChittiDetailPage() {
             ) : (
               <div className="card">
                 {canAddMembers && (
-                  <div className="flex items-center justify-between mb-6">
+                  <div className="mb-4 flex flex-wrap items-center justify-between gap-2 sm:mb-6">
                     <p className="text-sm text-surface-500">Members: <span className="font-semibold text-surface-900">{currentMemberCount} / {memberCapacity}</span> • <span className="text-surface-400">{Math.max(memberCapacity - currentMemberCount, 0)} slot(s) available</span></p>
                     <button onClick={() => setShowAddMember(true)} className="btn-primary btn-sm" disabled={currentMemberCount >= memberCapacity}><Plus size={14} /> Add Member</button>
                   </div>
@@ -792,18 +854,42 @@ export default function ChittiDetailPage() {
                 ) : (
                   <div className="space-y-3">
                     {members.map((m) => (
-                      <div key={m.id} className="flex items-center gap-4 p-4 rounded-xl border border-surface-100 hover:border-surface-200 hover:shadow-sm transition-all cursor-pointer group" onClick={() => handleViewMember(m)}>
-                        <Avatar name={m.customer_name || ""} size="md" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-semibold text-surface-900 group-hover:text-brand-700 transition-colors">{m.customer_name || m.customer_code}</p>
-                          <p className="text-xs text-surface-500">#{m.member_number} • {m.mobile_number || "—"}</p>
+                      <div key={m.id} className="rounded-xl border border-surface-100 p-3 transition-all hover:border-surface-200 hover:shadow-sm sm:p-4">
+                        <div className="group flex cursor-pointer items-center gap-3" onClick={() => handleViewMember(m)}>
+                          <Avatar name={m.customer_name || ""} size="md" />
+                          <div className="min-w-0 flex-1">
+                            <p className="truncate text-sm font-semibold text-surface-900 transition-colors group-hover:text-brand-700">{m.customer_name || m.customer_code}</p>
+                            <p className="text-xs text-surface-500">#{m.member_number} • {m.mobile_number || "—"}</p>
+                            <div className="mt-1 flex flex-wrap items-center gap-2 sm:hidden">
+                              <span className={cn("badge text-[10px]", getStatusColor(m.status))}>{m.status.replace(/_/g, " ")}</span>
+                              <span className="text-[11px] text-surface-500">{formatCurrency(m.total_paid)} of {formatCurrency(m.total_expected)}</span>
+                            </div>
+                          </div>
+                          <div className="hidden text-right sm:block">
+                            <p className="text-sm font-medium text-success-600">{formatCurrency(m.total_paid)}</p>
+                            <p className="text-xs text-surface-500">of {formatCurrency(m.total_expected)}</p>
+                          </div>
+                          <span className={cn("badge hidden sm:inline-flex", getStatusColor(m.status))}>{m.status.replace(/_/g, " ")}</span>
+                          {chitti.status === "RUNNING" && m.status === "ACTIVE" && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setCollectMember(m); }}
+                              className="btn-primary btn-sm hidden sm:inline-flex"
+                              title="Record a contribution from this member"
+                            >
+                              <IndianRupee size={14} /> Collect
+                            </button>
+                          )}
+                          <ChevronRight size={16} className="hidden shrink-0 text-surface-300 transition-colors group-hover:text-brand-500 sm:block" />
                         </div>
-                        <div className="text-right hidden sm:block">
-                          <p className="text-sm font-medium text-success-600">{formatCurrency(m.total_paid)}</p>
-                          <p className="text-xs text-surface-500">of {formatCurrency(m.total_expected)}</p>
-                        </div>
-                        <span className={cn("badge", getStatusColor(m.status))}>{m.status.replace(/_/g, " ")}</span>
-                        <ChevronRight size={16} className="text-surface-300 group-hover:text-brand-500 transition-colors" />
+                        {chitti.status === "RUNNING" && m.status === "ACTIVE" && (
+                          <button
+                            onClick={(e) => { e.stopPropagation(); setCollectMember(m); }}
+                            className="btn-primary btn-sm mt-2 w-full sm:hidden"
+                            title="Record a contribution from this member"
+                          >
+                            <IndianRupee size={14} /> Collect
+                          </button>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -815,7 +901,46 @@ export default function ChittiDetailPage() {
 
         {/* ============ SCHEDULE TAB ============ */}
         {activeTab === "schedule" && (
-          <div className="table-container">
+          <div className="space-y-2 md:space-y-0">
+            {/* Phones: one card per period, no sideways scrolling. */}
+            <div className="space-y-2 md:hidden">
+              {schedule.map((s) => (
+                <div
+                  key={s.id}
+                  className={cn(
+                    "rounded-xl border border-surface-100 p-3",
+                    s.period_number === summary.current_period && "border-brand-200 bg-brand-50/50"
+                  )}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-sm font-semibold text-surface-900">
+                      Period {s.period_number}
+                      {s.period_number === summary.current_period && (
+                        <span className="ml-1 text-[10px] font-medium text-brand-600">current</span>
+                      )}
+                    </p>
+                    <span className={cn("badge text-[10px]", getStatusColor(s.status))}>{s.status}</span>
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-surface-500">Due {formatDate(s.due_date)}</p>
+                  <div className="mt-2 grid grid-cols-3 gap-1 rounded-lg bg-white/70 p-2 text-center">
+                    <div>
+                      <p className="text-[9px] uppercase text-surface-400">Expected</p>
+                      <p className="truncate text-[11px] font-semibold text-surface-900">{formatCurrency(s.expected_collection)}</p>
+                    </div>
+                    <div>
+                      <p className="text-[9px] uppercase text-surface-400">Collected</p>
+                      <p className="truncate text-[11px] font-semibold text-success-600">{formatCurrency(s.actual_collection)}</p>
+                    </div>
+                    <div>
+                      <p className="text-[9px] uppercase text-surface-400">Pending</p>
+                      <p className="truncate text-[11px] font-semibold text-warning-600">{formatCurrency(s.pending_collection)}</p>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="table-container hidden md:block">
             <table className="table">
               <thead>
                 <tr>
@@ -836,6 +961,7 @@ export default function ChittiDetailPage() {
                 ))}
               </tbody>
             </table>
+            </div>
           </div>
         )}
 
@@ -845,7 +971,39 @@ export default function ChittiDetailPage() {
             {payouts.length === 0 ? (
               <EmptyState icon="💰" title="No payouts recorded" description="Payouts are recorded as the chitti progresses." />
             ) : (
-              <div className="table-container">
+              <>
+              <div className="space-y-2 md:hidden">
+                {payouts.map((p) => (
+                  <div key={p.id} className="rounded-xl border border-surface-100 p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex min-w-0 items-center gap-2">
+                        <Avatar name={p.customer_name || ""} size="sm" />
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-surface-900">{p.customer_name || "—"}</p>
+                          <p className="text-[11px] text-surface-500">Period {p.period_number}</p>
+                        </div>
+                      </div>
+                      <span className={cn("badge text-[10px]", getStatusColor(p.status))}>{p.status}</span>
+                    </div>
+                    <div className="mt-2 grid grid-cols-3 gap-1 rounded-lg bg-surface-50 p-2 text-center">
+                      <div>
+                        <p className="text-[9px] uppercase text-surface-400">Gross</p>
+                        <p className="truncate text-[11px] font-semibold text-surface-900">{formatCurrency(p.gross_payout)}</p>
+                      </div>
+                      <div>
+                        <p className="text-[9px] uppercase text-surface-400">Fees</p>
+                        <p className="truncate text-[11px] font-semibold text-surface-700">{formatCurrency(p.fee_amount)}</p>
+                      </div>
+                      <div>
+                        <p className="text-[9px] uppercase text-surface-400">Net</p>
+                        <p className="truncate text-[11px] font-semibold text-success-600">{formatCurrency(p.net_payout)}</p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="table-container hidden md:block">
                 <table className="table">
                   <thead><tr><th>Period</th><th>Customer</th><th>Gross</th><th>Discount</th><th>Fees</th><th>Net</th><th>Status</th></tr></thead>
                   <tbody>
@@ -863,12 +1021,49 @@ export default function ChittiDetailPage() {
                   </tbody>
                 </table>
               </div>
+              </>
             )}
           </div>
         )}
       </div>
 
       {/* Modals */}
+      {showCollect && selectedMember && (
+        <CollectContributionModal
+          chittiId={chittiId}
+          member={{
+            id: selectedMember.id,
+            name: selectedMember.customer_name || selectedMember.customer_code || "Member",
+            number: selectedMember.member_number,
+          }}
+          onClose={() => setShowCollect(false)}
+          onSaved={async (message) => {
+            setShowCollect(false);
+            await loadData();
+            try {
+              const detail = await chittiApi.getMemberDetail(chittiId, selectedMember.id);
+              setSelectedMember(detail as ChittiMember & { agreement: Agreement | null });
+            } catch (e) { console.error(e); }
+            setFeedback({ type: "success", message });
+          }}
+        />
+      )}
+      {collectMember && (
+        <CollectContributionModal
+          chittiId={chittiId}
+          member={{
+            id: collectMember.id,
+            name: collectMember.customer_name || collectMember.customer_code || "Member",
+            number: collectMember.member_number,
+          }}
+          onClose={() => setCollectMember(null)}
+          onSaved={async (message) => {
+            setCollectMember(null);
+            await loadData();
+            setFeedback({ type: "success", message });
+          }}
+        />
+      )}
       {showAddMember && <AddMemberModal chittiId={chittiId} currentCount={currentMemberCount} maxCount={memberCapacity} enrolledCustomerIds={enrolledCustomerIds} onClose={() => setShowAddMember(false)} onAdded={async () => { setShowAddMember(false); await loadData(); setFeedback({ type: "success", message: "Member enrolled successfully." }); }} />}
       {showAgreement && selectedMember && <AgreementPreviewModal agreement={showAgreement} chittiName={chitti.name} memberName={selectedMember.customer_name || ""} onClose={() => setShowAgreement(null)} onPrint={() => handlePrintAgreement(selectedMember.id)} onConfirm={() => handleConfirmAgreement(selectedMember.id)} />}
     </DashboardLayout>

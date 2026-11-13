@@ -338,6 +338,11 @@ class ChittiService:
             # Members enrolled through the agreement flow may predate contribution
             # generation; materialise their schedules so payments work from day one.
             await self._ensure_member_contributions(chitti)
+            # Period aggregates are projected from the plan capacity when a
+            # chitti is created, but only the members who actually signed
+            # contribute. Rebuild them from the authoritative per-member ledger
+            # so schedules, analytics and the dashboard cannot disagree.
+            await self._sync_period_schedules_from_contributions(chitti)
 
         chitti = await self.chitti_repo.update(chitti, status=new_status)
 
@@ -666,6 +671,18 @@ class ChittiService:
         # Idempotency — a retried request must never double-count a collection.
         existing_txn = await self.txn_repo.get_by_idempotency_key(idempotency_key)
         if existing_txn:
+            # A key belongs to exactly one contribution. Reusing it for a
+            # different member/period/amount is a client bug, not a retry, and
+            # must not silently return someone else's balance.
+            if (
+                str(existing_txn.member_id) != str(member.id)
+                or existing_txn.period_number != period_number
+                or existing_txn.amount != amount
+            ):
+                raise BadRequestException(
+                    "This idempotency key was already used for a different contribution.",
+                    error_code="IDEMPOTENCY_KEY_REUSED",
+                )
             prior = await self.contribution_repo.get_by_chitti_member_period(
                 chitti.id, member.id, period_number
             )
@@ -1077,6 +1094,40 @@ class ChittiService:
                 total_expected_amount=total_expected,
                 total_paid_amount=total_paid,
                 outstanding_amount=max(total_expected - total_paid, Decimal("0")),
+            )
+
+    async def _sync_period_schedules_from_contributions(self, chitti) -> None:
+        """Rebuild period expected/paid/pending from member contributions.
+
+        A chitti is created with a schedule projected from the plan capacity
+        (e.g. 25 seats), but only enrolled members contribute. Leaving that
+        projection in place inflated expected, pending and overdue on every
+        schedule-based screen.
+        """
+        contributions = await self.contribution_repo.get_by_chitti_id(chitti.id)
+        if not contributions:
+            return
+
+        aggregates: dict[int, dict] = {}
+        for con in contributions:
+            entry = aggregates.setdefault(
+                con.period_number,
+                {"expected": Decimal("0"), "paid": Decimal("0")},
+            )
+            entry["expected"] += con.expected_amount
+            entry["paid"] += con.paid_amount
+
+        for schedule in await self.schedule_repo.get_by_chitti_id(chitti.id):
+            entry = aggregates.get(schedule.period_number)
+            if entry is None:
+                continue
+            expected = entry["expected"]
+            paid = entry["paid"]
+            await self.schedule_repo.update(
+                schedule,
+                expected_collection=expected,
+                actual_collection=paid,
+                pending_collection=max(expected - paid, Decimal("0")),
             )
 
     def _build_plan_snapshot(self, plan: "ChittiPlan") -> dict:
