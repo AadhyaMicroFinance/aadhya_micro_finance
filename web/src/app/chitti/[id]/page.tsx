@@ -22,6 +22,7 @@ import ProgressBar from "@/components/ui/ProgressBar";
 import Avatar from "@/components/ui/Avatar";
 import EmptyState from "@/components/ui/EmptyState";
 import CollectContributionModal from "@/components/chitti/CollectContributionModal";
+import ChittiMembersPanel from "@/components/chitti/ChittiMembersPanel";
 import { PageSkeleton } from "@/components/ui/Skeleton";
 import {
   ArrowLeft,
@@ -379,7 +380,6 @@ export default function ChittiDetailPage() {
 
   const [showAddMember, setShowAddMember] = useState(false);
   const [showAgreement, setShowAgreement] = useState<Agreement | null>(null);
-  const [showCollect, setShowCollect] = useState(false);
   const [collectMember, setCollectMember] = useState<ChittiMember | null>(null);
 
   const loadData = useCallback(async () => {
@@ -480,23 +480,29 @@ export default function ChittiDetailPage() {
     await handleStatusChange("start");
   };
 
-  const handleViewMember = async (member: ChittiMember) => {
+  // "View" on a member: load the same agreement record the detail view used, then
+  // open the existing preview/print dialog. No extra page navigation.
+  const openAgreementFor = async (member: ChittiMember) => {
     try {
       const detail = await chittiApi.getMemberDetail(chittiId, member.id);
       setSelectedMember(detail as ChittiMember & { agreement: Agreement | null });
-    } catch { setSelectedMember(member); }
-  };
-
-  const handleGenerateAgreement = async (memberId: string) => {
-    try {
-      await chittiApi.generateAgreement(chittiId, memberId);
-      const detail = await chittiApi.getMemberDetail(chittiId, memberId);
-      setSelectedMember(detail as ChittiMember & { agreement: Agreement | null });
-    } catch (e) { console.error(e); }
+      if (detail.agreement) setShowAgreement(detail.agreement);
+    } catch (e) {
+      setFeedback({
+        type: "error",
+        message: getApiErrorMessage(e, "Could not load this member's agreement."),
+      });
+    }
   };
 
   const handlePrintAgreement = async (memberId: string) => {
-    try { await chittiApi.printAgreement(chittiId, memberId); } catch (e) { console.error(e); }
+    try {
+      await chittiApi.printAgreement(chittiId, memberId);
+      // Agreement state changed — refresh the member rows that show it.
+      await loadMembers();
+    } catch (e) {
+      setFeedback({ type: "error", message: getApiErrorMessage(e, "Could not record the print.") });
+    }
   };
 
   const handleConfirmAgreement = async (memberId: string) => {
@@ -507,16 +513,6 @@ export default function ChittiDetailPage() {
       setSelectedMember(detail as ChittiMember & { agreement: Agreement | null });
       await loadMembers();
       setShowAgreement(null);
-    } catch (e) { console.error(e); }
-  };
-
-  const handleCancelMember = async (memberId: string) => {
-    const reason = prompt("Reason for cancellation (optional):");
-    if (reason === null) return;
-    try {
-      await chittiApi.cancelMember(chittiId, memberId, reason);
-      await loadMembers();
-      setSelectedMember(null);
     } catch (e) { console.error(e); }
   };
 
@@ -762,141 +758,21 @@ export default function ChittiDetailPage() {
 
         {/* ============ MEMBERS TAB ============ */}
         {activeTab === "members" && (
-          <div className="space-y-4">
-            {selectedMember ? (
-              <div className="card animate-fade-in">
-                <div className="mb-4 flex flex-col gap-3 sm:mb-6 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="flex min-w-0 items-center gap-3 sm:gap-4">
-                    <Avatar name={selectedMember.customer_name || ""} size="lg" />
-                    <div>
-                      <h3 className="text-lg font-semibold text-surface-900">{selectedMember.customer_name || selectedMember.customer_code}</h3>
-                      <p className="text-sm text-surface-500">Member #{selectedMember.member_number} • {selectedMember.mobile_number || "—"}</p>
-                    </div>
-                  </div>
-                  <button onClick={() => setSelectedMember(null)} className="btn-ghost text-sm"><ArrowLeft size={16} /> Back</button>
-                </div>
-
-                <div className="mb-4 flex flex-wrap items-center gap-2 sm:mb-6 sm:gap-3">
-                  <span className={cn("badge", getStatusColor(selectedMember.status))}>{selectedMember.status.replace(/_/g, " ")}</span>
-                  {canAddMembers && ["PENDING_AGREEMENT", "AGREEMENT_GENERATED", "AGREEMENT_PRINTED"].includes(selectedMember.status) && (
-                    <button onClick={() => handleCancelMember(selectedMember.id)} className="btn-danger btn-sm">Cancel</button>
-                  )}
-                  {chitti.status === "RUNNING" && selectedMember.status === "ACTIVE" && (
-                    <button onClick={() => setShowCollect(true)} className="btn-secondary btn-sm"><IndianRupee size={14} /> Collect Contribution</button>
-                  )}
-                </div>
-
-                {selectedMember.status !== "ACTIVE" && (
-                  <div className="mb-6 flex flex-wrap items-center gap-2 rounded-xl bg-surface-50 p-3 text-xs">
-                    <span className="font-semibold text-surface-600">Agreement steps:</span>
-                    {[
-                      { key: "generate", label: "1. Generate", done: selectedMember.status !== "PENDING_AGREEMENT" },
-                      { key: "print", label: "2. Print", done: ["AGREEMENT_PRINTED", "ACTIVE"].includes(selectedMember.status) || Boolean(selectedMember.agreement?.printed_at) },
-                      { key: "sign", label: "3. Mark signed", done: false },
-                    ].map((s) => (
-                      <span key={s.key} className={cn("badge", s.done ? "bg-success-50 text-success-700" : "border border-surface-200 bg-white text-surface-500")}>
-                        {s.done ? "✓ " : ""}{s.label}
-                      </span>
-                    ))}
-                  </div>
-                )}
-
-                <div className="mb-4 grid grid-cols-2 gap-2.5 sm:mb-6 sm:gap-4">
-                  <div className="rounded-xl bg-success-50 p-3 sm:p-4"><p className="text-[11px] font-medium text-success-600 sm:text-xs">Paid</p><p className="text-lg font-bold text-success-700 sm:text-2xl">{formatCurrency(selectedMember.total_paid || 0)}</p></div>
-                  <div className="rounded-xl bg-warning-50 p-3 sm:p-4"><p className="text-[11px] font-medium text-warning-600 sm:text-xs">Outstanding</p><p className="text-lg font-bold text-warning-700 sm:text-2xl">{formatCurrency(selectedMember.outstanding || 0)}</p></div>
-                  <div className="rounded-xl bg-brand-50 p-3 sm:p-4"><p className="text-[11px] font-medium text-brand-600 sm:text-xs">Expected</p><p className="text-lg font-bold text-brand-700 sm:text-2xl">{formatCurrency(selectedMember.total_expected || 0)}</p></div>
-                  <div className="rounded-xl bg-surface-50 p-3 sm:p-4"><p className="text-[11px] font-medium text-surface-500 sm:text-xs">Lifted</p><p className="text-lg font-bold text-surface-700 sm:text-2xl">{selectedMember.lifted ? "Yes" : "No"}</p></div>
-                </div>
-
-                {/* Agreement Section */}
-                {"agreement" in selectedMember && selectedMember.agreement && (
-                  <div className="border-t border-surface-100 pt-6">
-                    <h4 className="font-semibold text-surface-900 mb-3">Agreement</h4>
-                    <div className="rounded-xl bg-surface-50 p-4">
-                      <div className="mb-4 grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
-                        <div><p className="text-surface-500">Number</p><p className="font-medium">{selectedMember.agreement.agreement_number}</p></div>
-                        <div><p className="text-surface-500">Status</p><span className={cn("badge", getStatusColor(selectedMember.agreement.agreement_status))}>{selectedMember.agreement.agreement_status}</span></div>
-                        <div><p className="text-surface-500">Generated</p><p className="font-medium">{selectedMember.agreement.generated_at ? formatDate(selectedMember.agreement.generated_at) : "—"}</p></div>
-                        <div><p className="text-surface-500">Printed</p><p className="font-medium">{selectedMember.agreement.printed_at ? formatDate(selectedMember.agreement.printed_at) : "—"} {selectedMember.agreement.print_count > 0 ? `(${selectedMember.agreement.print_count}×)` : ""}</p></div>
-                      </div>
-                      <div className="flex flex-wrap gap-2">
-                        <button onClick={() => setShowAgreement(selectedMember.agreement ?? null)} className="btn-secondary btn-sm"><FileText size={14} /> View</button>
-                        {(selectedMember.agreement.agreement_status === "GENERATED" || selectedMember.agreement.agreement_status === "PRINTED") && (
-                          <button onClick={() => handlePrintAgreement(selectedMember.id)} className="btn-primary btn-sm"><Printer size={14} /> Print</button>
-                        )}
-                        {selectedMember.agreement.agreement_status === "PRINTED" && (
-                          <button onClick={() => handleConfirmAgreement(selectedMember.id)} className="inline-flex items-center gap-1.5 rounded-lg bg-success-600 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-success-700 transition-colors">
-                            <CheckCircle2 size={14} /> Confirm
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {"agreement" in selectedMember && !selectedMember.agreement && canAddMembers && (
-                  <div className="border-t border-surface-100 pt-6 text-center">
-                    <button onClick={() => handleGenerateAgreement(selectedMember.id)} className="btn-primary"><FileText size={16} /> Generate Agreement</button>
-                  </div>
-                )}
-              </div>
-            ) : (
-              <div className="card">
-                {canAddMembers && (
-                  <div className="mb-4 flex flex-wrap items-center justify-between gap-2 sm:mb-6">
-                    <p className="text-sm text-surface-500">Members: <span className="font-semibold text-surface-900">{currentMemberCount} / {memberCapacity}</span> • <span className="text-surface-400">{Math.max(memberCapacity - currentMemberCount, 0)} slot(s) available</span></p>
-                    <button onClick={() => setShowAddMember(true)} className="btn-primary btn-sm" disabled={currentMemberCount >= memberCapacity}><Plus size={14} /> Add Member</button>
-                  </div>
-                )}
-
-                {members.length === 0 ? (
-                  <EmptyState icon="👥" title="No members yet" description="Add members when the chitti is in DRAFT status." action={canAddMembers ? <button onClick={() => setShowAddMember(true)} className="btn-primary"><Plus size={16} /> Add First Member</button> : undefined} />
-                ) : (
-                  <div className="space-y-3">
-                    {members.map((m) => (
-                      <div key={m.id} className="rounded-xl border border-surface-100 p-3 transition-all hover:border-surface-200 hover:shadow-sm sm:p-4">
-                        <div className="group flex cursor-pointer items-center gap-3" onClick={() => handleViewMember(m)}>
-                          <Avatar name={m.customer_name || ""} size="md" />
-                          <div className="min-w-0 flex-1">
-                            <p className="truncate text-sm font-semibold text-surface-900 transition-colors group-hover:text-brand-700">{m.customer_name || m.customer_code}</p>
-                            <p className="text-xs text-surface-500">#{m.member_number} • {m.mobile_number || "—"}</p>
-                            <div className="mt-1 flex flex-wrap items-center gap-2 sm:hidden">
-                              <span className={cn("badge text-[10px]", getStatusColor(m.status))}>{m.status.replace(/_/g, " ")}</span>
-                              <span className="text-[11px] text-surface-500">{formatCurrency(m.total_paid)} of {formatCurrency(m.total_expected)}</span>
-                            </div>
-                          </div>
-                          <div className="hidden text-right sm:block">
-                            <p className="text-sm font-medium text-success-600">{formatCurrency(m.total_paid)}</p>
-                            <p className="text-xs text-surface-500">of {formatCurrency(m.total_expected)}</p>
-                          </div>
-                          <span className={cn("badge hidden sm:inline-flex", getStatusColor(m.status))}>{m.status.replace(/_/g, " ")}</span>
-                          {chitti.status === "RUNNING" && m.status === "ACTIVE" && (
-                            <button
-                              onClick={(e) => { e.stopPropagation(); setCollectMember(m); }}
-                              className="btn-primary btn-sm hidden sm:inline-flex"
-                              title="Record a contribution from this member"
-                            >
-                              <IndianRupee size={14} /> Collect
-                            </button>
-                          )}
-                          <ChevronRight size={16} className="hidden shrink-0 text-surface-300 transition-colors group-hover:text-brand-500 sm:block" />
-                        </div>
-                        {chitti.status === "RUNNING" && m.status === "ACTIVE" && (
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setCollectMember(m); }}
-                            className="btn-primary btn-sm mt-2 w-full sm:hidden"
-                            title="Record a contribution from this member"
-                          >
-                            <IndianRupee size={14} /> Collect
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
+          <ChittiMembersPanel
+            chittiId={chittiId}
+            chittiStatus={chitti.status}
+            members={members}
+            capacity={memberCapacity}
+            enrolledCount={currentMemberCount}
+            canAddMembers={canAddMembers}
+            onAddMember={() => setShowAddMember(true)}
+            onRefresh={async () => {
+              await loadData();
+            }}
+            onCollect={(member) => setCollectMember(member)}
+            onOpenAgreement={openAgreementFor}
+            onNotify={(type, message) => setFeedback({ type, message })}
+          />
         )}
 
         {/* ============ SCHEDULE TAB ============ */}
@@ -1028,26 +904,6 @@ export default function ChittiDetailPage() {
       </div>
 
       {/* Modals */}
-      {showCollect && selectedMember && (
-        <CollectContributionModal
-          chittiId={chittiId}
-          member={{
-            id: selectedMember.id,
-            name: selectedMember.customer_name || selectedMember.customer_code || "Member",
-            number: selectedMember.member_number,
-          }}
-          onClose={() => setShowCollect(false)}
-          onSaved={async (message) => {
-            setShowCollect(false);
-            await loadData();
-            try {
-              const detail = await chittiApi.getMemberDetail(chittiId, selectedMember.id);
-              setSelectedMember(detail as ChittiMember & { agreement: Agreement | null });
-            } catch (e) { console.error(e); }
-            setFeedback({ type: "success", message });
-          }}
-        />
-      )}
       {collectMember && (
         <CollectContributionModal
           chittiId={chittiId}

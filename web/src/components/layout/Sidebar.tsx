@@ -127,8 +127,11 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
           <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-600">
             <span className="text-sm font-bold text-white">₹</span>
           </div>
-          <div>
-            <span className="text-base font-bold text-surface-900 tracking-tight">FinChitti</span>
+          <div className="min-w-0">
+            <span className="block truncate text-sm font-bold tracking-tight text-surface-900">
+              Aadhya Micro Finance
+            </span>
+            <span className="block text-[10px] text-surface-400">Powered by Vayu</span>
           </div>
           <button
             type="button"
@@ -222,7 +225,9 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
 
         {/* Footer */}
         <div className="border-t border-surface-100 px-5 py-4 flex-shrink-0 pb-[max(1rem,env(safe-area-inset-bottom))]">
-          <p className="text-[10px] text-surface-400 text-center">FinChitti v1.0</p>
+          <p className="text-[10px] text-surface-400 text-center">
+            Aadhya Micro Finance · v1.0
+          </p>
         </div>
       </aside>
     </>

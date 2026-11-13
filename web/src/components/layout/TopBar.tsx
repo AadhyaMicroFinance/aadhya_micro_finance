@@ -19,8 +19,12 @@ export default function TopBar({ onMenu }: { onMenu?: () => void }) {
           <Menu size={22} />
         </button>
         <div className="min-w-0">
-          <h1 className="truncate text-sm font-semibold text-surface-900">Finance & Chitti</h1>
-          <p className="hidden text-[11px] text-surface-400 sm:block">Management Dashboard</p>
+          <h1 className="truncate text-[11px] font-bold uppercase leading-tight tracking-wide text-surface-900 sm:text-sm">
+            Aadhya Micro Finance
+          </h1>
+          <p className="truncate text-[10px] leading-tight text-surface-400 sm:text-[11px]">
+            Powered by Vayu
+          </p>
         </div>
       </div>
 

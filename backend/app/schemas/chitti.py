@@ -155,6 +155,16 @@ class ChittiMemberAdd(BaseModel):
     payout_order: Optional[int] = Field(None, ge=0)
 
 
+class MemberAgreementSummary(BaseModel):
+    """Agreement state for the member list — same records as the detail view."""
+
+    agreement_number: str
+    agreement_status: str
+    generated_at: Optional[str] = None
+    printed_at: Optional[str] = None
+    confirmed_at: Optional[str] = None
+
+
 class ChittiMemberResponse(BaseModel):
     id: str
     chitti_id: str
@@ -169,6 +179,11 @@ class ChittiMemberResponse(BaseModel):
     total_expected: Decimal = Decimal("0")
     total_paid: Decimal = Decimal("0")
     outstanding: Decimal = Decimal("0")
+    lifted: bool = False
+    lifted_at: Optional[str] = None
+    lift_period: Optional[int] = None
+    lifted_amount: Decimal = Decimal("0")
+    agreement: Optional[MemberAgreementSummary] = None
 
     model_config = {"from_attributes": True}
 
@@ -193,15 +208,28 @@ class ChittiPeriodScheduleResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ChittiMemberPayment(BaseModel):
+    """One recorded money receipt against an installment (from the ledger)."""
+
+    id: str
+    amount: Decimal
+    payment_date: Optional[str] = None
+    payment_method: Optional[str] = None
+    reference_number: Optional[str] = None
+    notes: Optional[str] = None
+
+
 class ChittiMemberContributionResponse(BaseModel):
     id: str
     member_id: str
     customer_name: Optional[str] = None
     period_number: int
+    due_date: Optional[str] = None
     expected_amount: Decimal
     paid_amount: Decimal
     remaining_amount: Decimal
     status: str
+    payments: list[ChittiMemberPayment] = []
 
     model_config = {"from_attributes": True}
 

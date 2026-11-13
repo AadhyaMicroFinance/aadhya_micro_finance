@@ -719,3 +719,82 @@ multi-column grids then forced horizontal scrolling.
 Not verified: real devices and iOS Safari specifically, landscape tablet, and
 visual review of every screen (checks were DOM measurements; no screenshots were
 taken). Analytics detail tables still scroll horizontally by design.
+
+
+---
+
+## 17. Chitti Members one-view + company branding
+
+### Backend (additive only — no new endpoints, tables or columns)
+
+- `GET /chitti/{id}/members` now also returns, per member: `lifted`, `lifted_at`,
+  `lift_period`, `lifted_amount` (sum of existing `chitti_payouts.net_payout`)
+  and `agreement` (`agreement_number`, `agreement_status`, `generated_at`,
+  `printed_at`, `confirmed_at`). Agreements and payouts are fetched once per
+  chitti instead of per member. All values come from the same records the member
+  detail endpoint and reports already used.
+- `GET /chitti/{id}/members/{member_id}/contributions` now also returns each
+  installment's `due_date` (period schedule) and `payments` (the existing
+  contribution rows of `chitti_transactions`: amount, payment date, mode,
+  reference, notes). The collect dialog ignores the new fields.
+- New repository method `ChittiTransactionRepository.get_by_member_id`; no money
+  calculation was duplicated — totals still come from contribution rows.
+
+### Members tab
+
+Rebuilt `ChittiMembersPanel`:
+
+- Compact rows (table from `md`, cards on phones) with member name, number,
+  customer code, phone, membership status and payment state.
+- Paid / Outstanding / Expected / Lifted columns from the API; Expected and
+  Lifted appear from `xl`, all four are in the expanded panel.
+- Agreement cell: status badge (Not generated / Draft / Generated / Pending
+  confirmation / Confirmed / Cancelled), agreement number, generated and
+  printed dates.
+- Contextual actions: Generate when no agreement exists (draft chittis only),
+  View + Print when generated/printed/confirmed, Confirm only when printed;
+  View opens the existing agreement preview modal. Per-action spinners and
+  success/error banners; each action refreshes the rows from the API.
+- Expandable row with financial summary, agreement dates, "Collect
+  contribution", "Cancel enrollment", and installment history (period, due
+  date, expected/paid/remaining, status, plus each receipt's date, amount,
+  mode, reference and note) with an "Only unpaid" toggle.
+- Search (name, member ID, customer code, phone), membership-status filter,
+  agreement-status filter, five sort orders and pagination (10 per page).
+- No member detail navigation is required any more; the old detail pane was
+  removed, while the preview/print modal and collect modal are unchanged.
+
+### Branding
+
+- Browser title: **Aadhya Micro Finance | Management System** (`app/layout.tsx`).
+- Login: full legal name **AADHYA MICRO FINANCE PRIVATE LIMITED**, application
+  name beneath it, and **Powered by Vayu** directly below.
+- Authenticated header (shared `TopBar`): **AADHYA MICRO FINANCE** with
+  **Powered by Vayu** beneath, next to notifications and profile.
+- `Sidebar` brand and footer updated to the same identity.
+
+### Verification
+
+- Backend suite: **32 passed, 1 failed** — the same pre-existing
+  `test_calculation_engine.py::TestBalanceCalculation::test_with_reversal`.
+- `npx tsc --noEmit` → 0 errors.
+- Browser, DEMO-0001 members (375px): 4 cards, values 6,000 / 44,000 / 50,000 /
+  — matching `GET /members`; expanding Arun shows periods with due dates,
+  receipts (cash/UPI/bank with references) and unpaid periods; no horizontal
+  overflow.
+- Search "Naveen" → 1 member; sort by outstanding high→low → 44k, 41k, 40k,
+  40k; sort by name → Arun, Naveen, Rajesh Kumar, Sravan Kumar.
+- CHIT-000001 (all agreements CONFIRMED): badges show Confirmed, View and Print
+  present, Confirm absent; View opens the agreement preview with the agreement
+  number and signature block. Agreement filter Confirmed → 3, Not generated → 0
+  with the empty state; membership filter Active → 3.
+- Desktop 1440: eight-column table (Member, Status, Paid, Outstanding,
+  Expected, Lifted, Agreement, Actions), no overflow. Tablet 768: five columns,
+  no overflow, remaining columns available in the expanded panel.
+- Header shows AADHYA MICRO FINANCE / Powered by Vayu on Dashboard and Chitti;
+  browser title consistent; no console errors.
+
+Not performed: Generate / Print / Confirm were not clicked against the demo
+data (they would create or alter agreement records); their wiring reuses the
+unchanged endpoints and the buttons are rendered per status. No screenshots were
+taken.

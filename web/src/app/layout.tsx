@@ -9,8 +9,9 @@ const inter = Inter({
 });
 
 export const metadata: Metadata = {
-  title: "FinChitti — Finance & Chitti Management",
-  description: "Premium finance and chitti management system",
+  title: "Aadhya Micro Finance | Management System",
+  description:
+    "Chitti and finance management system for Aadhya Micro Finance Private Limited — powered by Vayu",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

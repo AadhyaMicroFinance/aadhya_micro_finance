@@ -94,6 +94,14 @@ export interface ActivationStatus {
   schedule_periods: number;
 }
 
+export interface MemberAgreementSummary {
+  agreement_number: string;
+  agreement_status: string;
+  generated_at: string | null;
+  printed_at: string | null;
+  confirmed_at: string | null;
+}
+
 export interface ChittiMember {
   id: string;
   chitti_id: string;
@@ -110,6 +118,11 @@ export interface ChittiMember {
   outstanding: number;
   lifted?: boolean;
   lifted_at?: string | null;
+  lift_period?: number | null;
+  /** Net amount already received by the member, from the payout records. */
+  lifted_amount?: number;
+  /** Agreement state, from the same agreement record the detail view reads. */
+  agreement?: MemberAgreementSummary | null;
 }
 
 export interface ChittiPeriodSchedule {
@@ -188,15 +201,26 @@ export interface ChittiPreview {
   total_value: number;
 }
 
+export interface ChittiMemberPayment {
+  id: string;
+  amount: number;
+  payment_date: string | null;
+  payment_method: string | null;
+  reference_number: string | null;
+  notes: string | null;
+}
+
 export interface ChittiContribution {
   id: string;
   member_id: string;
   customer_name: string | null;
   period_number: number;
+  due_date?: string | null;
   expected_amount: number;
   paid_amount: number;
   remaining_amount: number;
   status: string;
+  payments?: ChittiMemberPayment[];
 }
 
 export interface Agreement {

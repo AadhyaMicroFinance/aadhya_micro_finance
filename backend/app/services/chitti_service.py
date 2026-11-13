@@ -519,6 +519,23 @@ class ChittiService:
             raise NotFoundException("Chitti", chitti_id)
 
         members = await self.member_repo.get_by_chitti_id(chitti.id)
+
+        # One query each for agreements and payouts, instead of per-member lookups,
+        # so the Members tab can show agreement state and lifted amount in one call.
+        from app.repositories.agreement_repo import ChittiAgreementRepository
+
+        agreement_repo = ChittiAgreementRepository(self.session)
+        agreements = {
+            a.chitti_member_id: a
+            for a in await agreement_repo.get_by_chitti_id(chitti.id)
+        }
+        lifted_by_member: dict = {}
+        for payout in await self.payout_repo.get_by_chitti_id(chitti.id):
+            lifted_by_member[payout.member_id] = (
+                lifted_by_member.get(payout.member_id, Decimal("0"))
+                + self._decimal(payout.net_payout)
+            )
+
         result = []
         for m in members:
             customer = await self.customer_repo.get_by_id(m.customer_id)
@@ -526,10 +543,22 @@ class ChittiService:
             contributions = await self.contribution_repo.get_by_member_id(m.id)
             total_expected = sum(c.expected_amount for c in contributions)
             total_paid = sum(c.paid_amount for c in contributions)
+            agreement = agreements.get(m.id)
+            agreement_summary = None
+            if agreement:
+                agreement_summary = {
+                    "agreement_number": agreement.agreement_number,
+                    "agreement_status": agreement.agreement_status,
+                    "generated_at": str(agreement.generated_at) if agreement.generated_at else None,
+                    "printed_at": str(agreement.printed_at) if agreement.printed_at else None,
+                    "confirmed_at": str(agreement.confirmed_at) if agreement.confirmed_at else None,
+                }
             result.append(self._member_to_dict(
                 m, customer,
                 total_expected=total_expected,
                 total_paid=total_paid,
+                agreement=agreement_summary,
+                lifted_amount=lifted_by_member.get(m.id, Decimal("0")),
             ))
         return result
 
@@ -630,15 +659,39 @@ class ChittiService:
         self, chitti_id: UUID, member_id: UUID
     ) -> list[dict]:
         contributions = await self.contribution_repo.get_by_member_id(member_id)
+
+        # Due dates come from the period schedule and the actual receipts from the
+        # transaction ledger — the same records the reports and detail view use.
+        due_by_period = {}
+        chitti = await self.chitti_repo.get_by_id(chitti_id)
+        if chitti:
+            for s in await self.schedule_repo.get_by_chitti_id(chitti.id):
+                due_by_period[s.period_number] = str(s.due_date)
+
+        payments_by_period: dict = {}
+        for txn in await self.txn_repo.get_by_member_id(member_id):
+            if txn.transaction_type != "CONTRIBUTION" or txn.member_id != member_id:
+                continue
+            payments_by_period.setdefault(txn.period_number, []).append({
+                "id": str(txn.id),
+                "amount": self._money(txn.amount),
+                "payment_date": str(txn.payment_date) if txn.payment_date else None,
+                "payment_method": txn.payment_method,
+                "reference_number": txn.reference_number,
+                "notes": txn.notes,
+            })
+
         return [
             {
                 "id": str(c.id),
                 "member_id": str(c.member_id),
                 "period_number": c.period_number,
+                "due_date": due_by_period.get(c.period_number),
                 "expected_amount": c.expected_amount,
                 "paid_amount": c.paid_amount,
                 "remaining_amount": c.remaining_amount,
                 "status": c.status,
+                "payments": payments_by_period.get(c.period_number, []),
             }
             for c in contributions
         ]
@@ -1199,8 +1252,21 @@ class ChittiService:
             "updated_at": str(chitti.updated_at),
         }
 
-    def _member_to_dict(self, member, customer=None, total_expected=Decimal("0"), total_paid=Decimal("0")) -> dict:
+    def _member_to_dict(
+        self,
+        member,
+        customer=None,
+        total_expected=Decimal("0"),
+        total_paid=Decimal("0"),
+        agreement=None,
+        lifted_amount=Decimal("0"),
+    ) -> dict:
         return {
+            "lifted": bool(member.lifted),
+            "lifted_at": str(member.lifted_at) if member.lifted_at else None,
+            "lift_period": member.lift_period,
+            "lifted_amount": self._money(lifted_amount),
+            "agreement": agreement,
             "id": str(member.id),
             "chitti_id": str(member.chitti_id),
             "customer_id": str(member.customer_id),

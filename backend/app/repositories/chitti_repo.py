@@ -340,6 +340,14 @@ class ChittiTransactionRepository(BaseRepository[ChittiTransaction]):
         )
         return list(result.scalars().all())
 
+    async def get_by_member_id(self, member_id: UUID) -> list[ChittiTransaction]:
+        result = await self.session.execute(
+            select(ChittiTransaction)
+            .where(ChittiTransaction.member_id == member_id)
+            .order_by(ChittiTransaction.payment_date, ChittiTransaction.created_at)
+        )
+        return list(result.scalars().all())
+
     async def get_by_idempotency_key(self, key: str) -> Optional[ChittiTransaction]:
         result = await self.session.execute(
             select(ChittiTransaction).where(
