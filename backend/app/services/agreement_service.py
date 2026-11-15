@@ -9,7 +9,7 @@ Workflow:
 """
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 from uuid import UUID
 
@@ -261,6 +261,8 @@ class AgreementService:
     async def confirm_agreement(
         self,
         agreement_id: UUID,
+        *,
+        created_by: Optional[UUID] = None,
     ) -> dict:
         """Confirm the agreement after physical signature. Activates the member."""
         agreement = await self.agreement_repo.get_by_id(agreement_id)
@@ -295,7 +297,9 @@ class AgreementService:
                     member.id,
                     member.member_number,
                     chitti.start_date,
-                    member_lift_period=member.payout_order or member.member_number,
+                    member_lift_period=engine.lift_period_for_member(
+                        member.member_number, member.payout_order
+                    ),
                 )
                 for entry in entries:
                     entry["chitti_id"] = chitti.id
@@ -319,9 +323,19 @@ class AgreementService:
                 total_paid_amount=total_paid,
                 outstanding_amount=max(total_expected - total_paid, Decimal("0")),
             )
+        # Agreement confirmation activates this member only. Starting the
+        # Chitti is a separate, explicit operation through the canonical
+        # /start transition after the operator reviews activation readiness.
+        chitti = await self.chitti_repo.get_by_id(member.chitti_id) if member else None
+        chitti_status = chitti.status if chitti else None
+        chitti_auto_started = False
+
         await self.session.commit()
 
-        return self._agreement_to_dict(agreement)
+        result = self._agreement_to_dict(agreement)
+        result["chitti_status"] = chitti_status
+        result["chitti_auto_started"] = chitti_auto_started
+        return result
 
     # ===========================================================================
     # Get Agreement
@@ -449,10 +463,28 @@ class AgreementService:
             installment = Decimal(str(contrib_rules.get("installment_amount", 0)))
             return installment * Decimal(str(duration))
         elif rule_type == "LIFT_BASED":
-            # For lift-based, use post-lift amount as the standard
+            if contrib_rules.get("regular_amount") is not None:
+                regular = Decimal(str(contrib_rules["regular_amount"]))
+                surcharge = (total_value / Decimal("100")).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
+                member_number = int(snapshot.get("member_number") or member_count)
+                payout_rules = plan.get("payout_rules", {})
+                lift_period = member_number
+                if payout_rules.get("type") == "CUSTOM":
+                    lift_period = next(
+                        (
+                            int(entry["period"])
+                            for entry in payout_rules.get("payout_schedule", [])
+                            if int(entry.get("member_number", 0)) == member_number
+                        ),
+                        member_number,
+                    )
+                surcharge_periods = max(0, duration - lift_period)
+                return regular * Decimal(str(duration)) + surcharge * Decimal(str(surcharge_periods))
+            # Old agreements keep their captured legacy pre/post terms.
             post = Decimal(str(contrib_rules.get("post_lift_amount", 0)))
             pre = Decimal(str(contrib_rules.get("pre_lift_amount", 0)))
-            # Approximate: (duration-1) * post + 1 * pre (for last member)
             return (post * Decimal(str(duration - 1))) + pre
         elif rule_type == "CUSTOM":
             schedule = contrib_rules.get("schedule", [])

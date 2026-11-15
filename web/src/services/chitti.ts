@@ -134,6 +134,9 @@ export interface ChittiPeriodSchedule {
   actual_collection: number;
   pending_collection: number;
   expected_payout: number;
+  expected_payout_fee?: number;
+  scheduled_member_number?: number | null;
+  payout_schedule_available?: boolean;
   actual_payout: number;
   status: string;
 }
@@ -151,6 +154,19 @@ export interface ChittiPayout {
   payout_method: string | null;
   paid_at: string | null;
   status: string;
+}
+
+export interface ChittiLiftEvent {
+  id: string;
+  chitti_id: string;
+  member_id: string;
+  member_number: number;
+  member_name: string | null;
+  period_number: number;
+  lift_date: string;
+  recorded_by: string | null;
+  reversed_at: string | null;
+  reversal_reason: string | null;
 }
 
 export interface ChittiSummary {
@@ -204,6 +220,7 @@ export interface ChittiPreview {
 export interface ChittiMemberPayment {
   id: string;
   amount: number;
+  transaction_type?: "CONTRIBUTION" | "REVERSAL" | string;
   payment_date: string | null;
   payment_method: string | null;
   reference_number: string | null;
@@ -240,6 +257,8 @@ export interface Agreement {
   cancellation_reason: string | null;
   created_at: string;
   updated_at: string;
+  chitti_status?: string | null;
+  chitti_auto_started?: boolean;
 }
 
 // ==========================================
@@ -247,6 +266,10 @@ export interface Agreement {
 // ==========================================
 
 export const chittiApi = {
+  previewDirect: async (data: Record<string, unknown>): Promise<ChittiPreview> => {
+    const res = await apiClient.post<ApiResponse<ChittiPreview>>("/chitti/preview", data);
+    return res.data.data;
+  },
   // ---- Plans ----
   listPlans: async (params: {
     page?: number;
@@ -305,7 +328,14 @@ export const chittiApi = {
 
   previewPlan: async (
     planId: string,
-    data: { start_date: string; member_count?: number }
+    data: {
+      start_date: string;
+      member_count?: number;
+      frequency?: string;
+      duration?: number;
+      total_value?: number;
+      contribution_rules?: Record<string, unknown>;
+    }
   ): Promise<ChittiPreview> => {
     const res = await apiClient.post<ApiResponse<ChittiPreview>>(
       `/chitti/plans/${planId}/preview`,
@@ -334,14 +364,7 @@ export const chittiApi = {
     return res.data.data;
   },
 
-  createChitti: async (data: {
-    plan_id: string;
-    name: string;
-    branch?: string;
-    start_date: string;
-    member_count?: number;
-    notes?: string;
-  }) => {
+  createChitti: async (data: Record<string, unknown>) => {
     const res = await apiClient.post<ApiResponse<ChittiInstance>>(
       "/chitti",
       data
@@ -483,6 +506,26 @@ export const chittiApi = {
   ): Promise<ChittiContribution[]> => {
     const res = await apiClient.get<ApiResponse<ChittiContribution[]>>(
       `/chitti/${chittiId}/members/${memberId}/contributions`
+    );
+    return res.data.data;
+  },
+
+  listLiftEvents: async (chittiId: string): Promise<ChittiLiftEvent[]> => {
+    const res = await apiClient.get<ApiResponse<ChittiLiftEvent[]>>(`/chitti/${chittiId}/lifts`);
+    return res.data.data;
+  },
+
+  recordLift: async (
+    chittiId: string,
+    data: { member_id: string; period_number: number; lift_date: string }
+  ): Promise<ChittiLiftEvent> => {
+    const res = await apiClient.post<ApiResponse<ChittiLiftEvent>>(`/chitti/${chittiId}/lifts`, data);
+    return res.data.data;
+  },
+
+  reverseLift: async (chittiId: string, liftId: string, reversal_reason: string) => {
+    const res = await apiClient.post<ApiResponse<Record<string, unknown>>>(
+      `/chitti/${chittiId}/lifts/${liftId}/reverse`, { reversal_reason }
     );
     return res.data.data;
   },

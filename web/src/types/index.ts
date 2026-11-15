@@ -95,11 +95,23 @@ export interface CustomerLedger {
   payment_history: {
     id: string;
     transaction_id: string;
+    source: "FINANCE" | "CHITTI";
+    customer_name: string;
+    account_name: string | null;
+    period_number: number | null;
     amount: number;
-    payment_method: string;
-    payment_date: string;
+    payment_method: string | null;
+    payment_date: string | null;
     status: string;
+    is_reversal: boolean;
+    reversal_of_transaction_id: string | null;
+    reversed_by_transaction_id: string | null;
   }[];
+  payment_summary: {
+    transaction_count: number;
+    successful_transaction_count: number;
+    successful_paid_total: number;
+  };
 }
 
 // ==========================================
@@ -166,8 +178,15 @@ export interface Payment {
   id: string;
   transaction_id: string;
   customer_id: string;
+  customer_name?: string | null;
   finance_account_id: string | null;
   chitti_account_id: string | null;
+  member_id?: string | null;
+  member_name?: string | null;
+  chitti_name?: string | null;
+  period_number?: number | null;
+  account_type?: "FINANCE" | "CHITTI";
+  transaction_type?: string;
   amount: number;
   payment_method: string;
   payment_date: string;

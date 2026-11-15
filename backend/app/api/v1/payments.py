@@ -16,6 +16,74 @@ from app.services.payment_service import PaymentService
 router = APIRouter()
 
 
+@router.get("/pending", response_model=ApiResponse)
+async def list_pending_payments(
+    db: DBSession,
+    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+):
+    """List due unpaid Finance installments and Chitti contributions."""
+    service = PaymentService(db)
+    return ApiResponse(data=await service.list_pending_collections())
+
+
+@router.get("/customer/{customer_id}/eligible-accounts", response_model=ApiResponse)
+async def eligible_collection_accounts(
+    customer_id: UUID,
+    db: DBSession,
+    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+):
+    """Return finance accounts and running Chitti memberships as separate ledgers."""
+    from app.repositories.finance_repo import FinanceAccountRepository
+    from app.repositories.chitti_repo import (
+        ChittiMemberRepository, ChittiRepository, ChittiContributionRepository,
+        ChittiPeriodScheduleRepository,
+    )
+    from app.models.customer import Customer
+    customer = await db.get(Customer, customer_id)
+    if not customer:
+        from app.core.exceptions import NotFoundException
+        raise NotFoundException("Customer", customer_id)
+    finance_repo = FinanceAccountRepository(db)
+    member_repo = ChittiMemberRepository(db)
+    chitti_repo = ChittiRepository(db)
+    contribution_repo = ChittiContributionRepository(db)
+    schedule_repo = ChittiPeriodScheduleRepository(db)
+    finance = await finance_repo.get_by_customer_id(customer_id)
+    finance_items = [{
+        "id": str(a.id), "account_number": a.account_number,
+        "installment_amount": float(a.installment_amount), "frequency": a.frequency,
+        "status": a.status,
+    } for a in finance if a.status == "ACTIVE"]
+    memberships = await member_repo.get_by_customer_id(customer_id)
+    chitti_items = []
+    for member in memberships:
+        if member.status != "ACTIVE":
+            continue
+        chitti = await chitti_repo.get_by_id(member.chitti_id)
+        if not chitti or chitti.status != "RUNNING":
+            continue
+        contributions = await contribution_repo.get_by_member_id(member.id)
+        schedules = {s.period_number: s for s in await schedule_repo.get_by_chitti_id(chitti.id)}
+        outstanding = [c for c in contributions if c.remaining_amount > 0]
+        if not outstanding:
+            continue
+        contribution = min(outstanding, key=lambda c: c.period_number)
+        period = schedules.get(contribution.period_number)
+        chitti_items.append({
+            "chitti_id": str(chitti.id), "chitti_code": chitti.chitti_code,
+            "chitti_name": chitti.name, "member_id": str(member.id),
+            "member_number": member.member_number,
+            "total_value": float(chitti.total_value),
+            "frequency": (chitti.plan_snapshot or {}).get("frequency", "MONTHLY"),
+            "current_period": contribution.period_number,
+            "due_date": str(period.due_date) if period else None,
+            "amount_due": float(contribution.remaining_amount),
+            "outstanding": float(sum((c.remaining_amount for c in outstanding), 0)),
+            "status": contribution.status,
+        })
+    return ApiResponse(data={"finance_accounts": finance_items, "chitti_memberships": chitti_items})
+
+
 @router.post("/", response_model=ApiResponse)
 async def record_payment(
     body: PaymentCreate,
@@ -50,31 +118,13 @@ async def list_payments(
     customer_id: Optional[str] = None,
     current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
 ):
-    """List payment transactions with pagination."""
-    from app.repositories.payment_repo import PaymentRepository
-
-    repo = PaymentRepository(db)
-    filters = {}
-    if customer_id:
-        filters["customer_id"] = UUID(customer_id)
-
-    skip = (page - 1) * per_page
-    payments, total = await repo.get_all(skip=skip, limit=per_page, filters=filters)
-
-    items = [
-        {
-            "id": str(p.id),
-            "transaction_id": p.transaction_id,
-            "customer_id": str(p.customer_id),
-            "amount": float(p.amount),
-            "payment_method": p.payment_method,
-            "payment_date": str(p.payment_date),
-            "status": p.status,
-            "is_reversal": p.is_reversal,
-            "created_at": str(p.created_at),
-        }
-        for p in payments
-    ]
+    """List Finance receipts and Chitti contribution ledger entries together."""
+    service = PaymentService(db)
+    items, total = await service.list_payment_history(
+        page=page,
+        per_page=per_page,
+        customer_id=UUID(customer_id) if customer_id else None,
+    )
     return PaginatedResponse(
         data=items,
         meta={

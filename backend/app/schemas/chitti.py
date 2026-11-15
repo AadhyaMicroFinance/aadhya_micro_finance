@@ -71,13 +71,35 @@ class ChittiPlanResponse(BaseModel):
 
 
 class ChittiCreate(BaseModel):
-    """Create a chitti instance from an existing plan."""
-    plan_id: str
+    """Create from a reusable plan or directly from validated existing rules."""
+    plan_id: Optional[str] = None
     name: str = Field(..., min_length=1, max_length=255)
     branch: Optional[str] = Field(None, max_length=100)
     start_date: date
     member_count: Optional[int] = Field(None, gt=0, description="Override plan member_count if allowed")
     notes: Optional[str] = None
+    chitti_type: Optional[str] = Field(None, pattern=r"^(FIXED|VARIABLE|AUCTION|CUSTOM|LIFT_BASED)$")
+    total_value: Optional[Decimal] = Field(None, gt=0)
+    frequency: Optional[str] = Field(None, pattern=r"^(DAILY|WEEKLY|BIWEEKLY|MONTHLY|CUSTOM)$")
+    duration: Optional[int] = Field(None, gt=0)
+    contribution_rules: Optional[dict] = None
+    payout_rules: Optional[dict] = None
+    fee_rules: Optional[dict] = None
+    penalty_rules: Optional[dict] = None
+
+
+class ChittiDirectPreviewRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    total_value: Decimal = Field(..., gt=0)
+    member_count: int = Field(..., gt=0)
+    frequency: str = Field(..., pattern=r"^(DAILY|WEEKLY|BIWEEKLY|MONTHLY)$")
+    duration: int = Field(..., gt=0)
+    start_date: date
+    chitti_type: str = Field(..., pattern=r"^(FIXED|VARIABLE|CUSTOM|LIFT_BASED)$")
+    contribution_rules: dict
+    payout_rules: dict
+    fee_rules: Optional[dict] = Field(default_factory=dict)
+    penalty_rules: Optional[dict] = Field(default_factory=dict)
 
 
 class ChittiUpdate(BaseModel):
@@ -209,10 +231,11 @@ class ChittiPeriodScheduleResponse(BaseModel):
 
 
 class ChittiMemberPayment(BaseModel):
-    """One recorded money receipt against an installment (from the ledger)."""
+    """One contribution or reversal against an installment (from the ledger)."""
 
     id: str
     amount: Decimal
+    transaction_type: Optional[str] = None
     payment_date: Optional[str] = None
     payment_method: Optional[str] = None
     reference_number: Optional[str] = None
@@ -248,6 +271,29 @@ class ChittiPayoutRecord(BaseModel):
     fee_amount: Decimal = Field(default=Decimal("0"), ge=0)
     net_payout: Decimal = Field(..., ge=0)
     payout_method: str = Field(..., pattern=r"^(CASH|UPI|BANK_TRANSFER|OTHER)$")
+
+
+class ChittiLiftRecord(BaseModel):
+    member_id: str
+    period_number: int = Field(..., ge=1)
+    lift_date: date
+
+
+class ChittiLiftReversal(BaseModel):
+    reversal_reason: str = Field(..., min_length=3, max_length=500)
+
+
+class ChittiLiftEventResponse(BaseModel):
+    id: str
+    chitti_id: str
+    member_id: str
+    member_number: int
+    member_name: Optional[str] = None
+    period_number: int
+    lift_date: str
+    recorded_by: Optional[str] = None
+    reversed_at: Optional[str] = None
+    reversal_reason: Optional[str] = None
 
 
 class ChittiPayoutResponse(BaseModel):
@@ -294,6 +340,10 @@ class ChittiPreviewRequest(BaseModel):
     plan_id: str
     start_date: date
     member_count: Optional[int] = Field(None, gt=0)
+    frequency: Optional[str] = Field(None, pattern=r"^(DAILY|WEEKLY|BIWEEKLY|MONTHLY)$")
+    duration: Optional[int] = Field(None, gt=0)
+    total_value: Optional[Decimal] = Field(None, gt=0)
+    contribution_rules: Optional[dict] = None
 
 
 class ChittiPeriodPreview(BaseModel):

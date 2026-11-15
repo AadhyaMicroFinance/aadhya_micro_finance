@@ -61,6 +61,74 @@ class ReportService:
     def __init__(self, session: AsyncSession):
         self.session = session
 
+    async def get_range_report(self, start_date: date, end_date: date, report_type: str) -> dict:
+        """Aggregate existing authoritative daily ledgers over a bounded date range."""
+        if end_date < start_date:
+            from app.core.exceptions import BadRequestException
+            raise BadRequestException("End date must be on or after start date.")
+        if (end_date - start_date).days > 366:
+            from app.core.exceptions import BadRequestException
+            raise BadRequestException("Report date range cannot exceed 367 days.")
+        allowed = {"daily", "weekly", "monthly", "outstanding", "overdue", "finance", "chitti", "collector", "payment-method"}
+        if report_type not in allowed:
+            from app.core.exceptions import BadRequestException
+            raise BadRequestException("Unsupported report type.")
+        rows = await self.get_payments_in_range(start_date, end_date)
+        pending = await self.get_pending_details(start_date, end_date)
+        finance_rows = [r for r in rows if r["source"] == "FINANCE"]
+        chitti_rows = [r for r in rows if r["source"] == "CHITTI"]
+        finance_due = [r for r in pending if r["source"] == "FINANCE"]
+        chitti_due = [r for r in pending if r["source"] == "CHITTI"]
+        if report_type == "finance":
+            rows, pending = finance_rows, finance_due
+        elif report_type == "chitti":
+            rows, pending = chitti_rows, chitti_due
+        elif report_type == "collector":
+            rows.sort(key=lambda r: (r.get("collector_name") or "", r.get("transaction_id") or ""))
+        elif report_type == "payment-method":
+            rows.sort(key=lambda r: (r.get("payment_method") or "", r.get("transaction_id") or ""))
+        elif report_type == "outstanding":
+            rows = []
+            pending = [r for r in pending if r.get("pending", 0) > 0]
+        elif report_type == "overdue":
+            rows = []
+            pending = [r for r in pending if r.get("pending", 0) > 0 and r.get("status") == "OVERDUE"]
+        summary_finance_rows = finance_rows if report_type != "chitti" else []
+        summary_chitti_rows = chitti_rows if report_type != "finance" else []
+        if report_type in ("outstanding", "overdue"):
+            summary_finance_rows, summary_chitti_rows = [], []
+        summary_finance_due = [r for r in pending if r["source"] == "FINANCE"]
+        summary_chitti_due = [r for r in pending if r["source"] == "CHITTI"]
+        breakdown = []
+        if report_type in ("collector", "payment-method"):
+            group_key = "collector_name" if report_type == "collector" else "payment_method"
+            groups: dict[str, dict] = {}
+            for row in rows:
+                label = str(row.get(group_key) or ("Unassigned" if report_type == "collector" else "Other"))
+                group = groups.setdefault(label, {
+                    "name": label, "finance_collected": Decimal("0"),
+                    "chitti_collected": Decimal("0"), "collected_total": Decimal("0"),
+                    "transaction_count": 0,
+                })
+                amount = Decimal(str(row["amount"])) * (-1 if row.get("is_reversal") else 1)
+                group["collected_total"] += amount
+                group["transaction_count"] += 1
+                if row["source"] == "FINANCE":
+                    group["finance_collected"] += amount
+                elif row["source"] == "CHITTI":
+                    group["chitti_collected"] += amount
+            breakdown = sorted(groups.values(), key=lambda group: group["name"])
+        return present({
+            "report_type": report_type, "start_date": str(start_date), "end_date": str(end_date),
+            "collected_total": sum((Decimal(str(r["amount"])) * (-1 if r.get("is_reversal") else 1) for r in rows), Decimal("0")),
+            "finance_collected": sum((Decimal(str(r["amount"])) * (-1 if r.get("is_reversal") else 1) for r in summary_finance_rows), Decimal("0")),
+            "chitti_collected": sum((Decimal(str(r["amount"])) * (-1 if r.get("is_reversal") else 1) for r in summary_chitti_rows), Decimal("0")),
+            "finance_pending": sum((Decimal(str(r["pending"])) for r in summary_finance_due), Decimal("0")),
+            "chitti_pending": sum((Decimal(str(r["pending"])) for r in summary_chitti_due), Decimal("0")),
+            "transactions": rows, "pending_details": pending,
+            "breakdown": breakdown,
+        })
+
     # ===========================================================================
     # Daily summary (headline metrics for the dashboard)
     # ===========================================================================
@@ -177,7 +245,7 @@ class ReportService:
             .outerjoin(User, User.id == PaymentTransaction.collected_by)
             .where(
                 PaymentTransaction.payment_date == d,
-                PaymentTransaction.status == "COMPLETED",
+                PaymentTransaction.status.in_(("COMPLETED", "REVERSED")),
                 PaymentTransaction.is_reversal == False,  # noqa: E712
             )
             .group_by(PaymentTransaction.collected_by, User.full_name, User.username, User.role)
@@ -209,7 +277,10 @@ class ReportService:
                 User.role,
             )
             .outerjoin(User, User.id == ChittiTransaction.created_by)
-            .where(self._chitti_business_date() == d)
+            .where(
+                self._chitti_business_date() == d,
+                ChittiTransaction.transaction_type.in_(("CONTRIBUTION", "REVERSAL")),
+            )
             .group_by(ChittiTransaction.created_by, User.full_name, User.username, User.role)
         )
         for r in chit.all():
@@ -251,7 +322,7 @@ class ReportService:
             )
             .where(
                 PaymentTransaction.payment_date == d,
-                PaymentTransaction.status == "COMPLETED",
+                PaymentTransaction.status.in_(("COMPLETED", "REVERSED")),
                 PaymentTransaction.is_reversal == False,  # noqa: E712
             )
             .group_by(PaymentTransaction.payment_method)
@@ -279,7 +350,10 @@ class ReportService:
                 ).label("total"),
                 func.count(ChittiTransaction.id).label("count"),
             )
-            .where(self._chitti_business_date() == d)
+            .where(
+                self._chitti_business_date() == d,
+                ChittiTransaction.transaction_type.in_(("CONTRIBUTION", "REVERSAL")),
+            )
             .group_by(ChittiTransaction.payment_method)
         )
         for r in chit.all():
@@ -296,7 +370,9 @@ class ReportService:
     # Pending details (due that day, not fully collected)
     # ===========================================================================
 
-    async def get_pending_details(self, report_date: Optional[date] = None) -> list[dict]:
+    async def get_pending_details(
+        self, report_date: Optional[date] = None, end_date: Optional[date] = None
+    ) -> list[dict]:
         """Every finance installment + chitti period due on the day that is not
         fully paid, with the owning customer attached. This powers the
         'pending when clicked' drill-down."""
@@ -314,6 +390,7 @@ class ReportService:
                 FinanceSchedule.paid_amount,
                 FinanceSchedule.remaining_amount,
                 FinanceSchedule.status,
+                FinanceSchedule.due_date,
                 FinanceAccount.account_number,
                 Customer.id.label("customer_id"),
                 Customer.full_name,
@@ -323,7 +400,7 @@ class ReportService:
             .join(FinanceAccount, FinanceAccount.id == FinanceSchedule.finance_account_id)
             .join(Customer, Customer.id == FinanceAccount.customer_id)
             .where(
-                FinanceSchedule.due_date == d,
+                FinanceSchedule.due_date.between(d, end_date) if end_date else FinanceSchedule.due_date == d,
                 FinanceSchedule.remaining_amount > 0,
             )
         )
@@ -339,6 +416,7 @@ class ReportService:
                 "customer_code": r.customer_code,
                 "mobile_number": r.mobile_number,
                 "period_label": f"Installment {r.installment_number}",
+                "due_date": str(r.due_date),
                 "expected": r.expected_amount,
                 "paid": r.paid_amount,
                 "pending": r.remaining_amount if r.remaining_amount > 0 else Decimal("0"),
@@ -351,6 +429,7 @@ class ReportService:
         chitti_rows = await self.session.execute(
             select(
                 ChittiMemberContribution,
+                ChittiPeriodSchedule.due_date.label("due_date"),
                 Chitti.chitti_code,
                 Chitti.name.label("chitti_name"),
                 ChittiMember.member_number,
@@ -371,7 +450,7 @@ class ReportService:
             .join(ChittiMember, ChittiMember.id == ChittiMemberContribution.member_id)
             .join(Customer, Customer.id == ChittiMember.customer_id)
             .where(
-                ChittiPeriodSchedule.due_date == d,
+                ChittiPeriodSchedule.due_date.between(d, end_date) if end_date else ChittiPeriodSchedule.due_date == d,
                 ChittiMemberContribution.remaining_amount > 0,
                 Chitti.status.in_(FINANCIAL_CHITTI_STATUSES),
             )
@@ -387,6 +466,7 @@ class ReportService:
                 "customer_code": r.customer_code,
                 "mobile_number": r.mobile_number,
                 "period_label": f"Period {con.period_number}",
+                "due_date": str(r.due_date),
                 "chitti_name": r.chitti_name,
                 "member_number": r.member_number,
                 "expected": con.expected_amount,
@@ -396,6 +476,59 @@ class ReportService:
             })
 
         return items
+
+    async def get_payments_in_range(self, start_date: date, end_date: date) -> list[dict]:
+        """Return transaction-level collections in a date range from both ledgers."""
+        merged: list[tuple] = []
+        fin = await self.session.execute(
+            select(
+                PaymentTransaction, Customer.full_name.label("customer_name"),
+                Customer.customer_code, User.full_name.label("collector_name"),
+            )
+            .outerjoin(Customer, Customer.id == PaymentTransaction.customer_id)
+            .outerjoin(User, User.id == PaymentTransaction.collected_by)
+            .where(
+                PaymentTransaction.payment_date.between(start_date, end_date),
+                PaymentTransaction.status.in_(("COMPLETED", "REVERSED")),
+            )
+        )
+        for row in fin.all():
+            txn = row.PaymentTransaction
+            merged.append((txn.created_at, {
+                "id": str(txn.id), "transaction_id": txn.transaction_id,
+                "customer_name": row.customer_name or "—", "customer_code": row.customer_code,
+                "collector_name": row.collector_name or "—", "amount": txn.amount,
+                "payment_method": txn.payment_method, "status": txn.status,
+                "is_reversal": txn.is_reversal,
+                "source": "CHITTI" if txn.chitti_account_id else "FINANCE" if txn.finance_account_id else "OTHER",
+                "payment_date": str(txn.payment_date),
+            }))
+        chit = await self.session.execute(
+            select(
+                ChittiTransaction, Customer.full_name.label("customer_name"),
+                Customer.customer_code, User.full_name.label("collector_name"),
+            )
+            .outerjoin(ChittiMember, ChittiMember.id == ChittiTransaction.member_id)
+            .outerjoin(Customer, Customer.id == ChittiMember.customer_id)
+            .outerjoin(User, User.id == ChittiTransaction.created_by)
+            .where(
+                self._chitti_business_date().between(start_date, end_date),
+                ChittiTransaction.transaction_type.in_(("CONTRIBUTION", "REVERSAL")),
+            )
+        )
+        for row in chit.all():
+            txn = row.ChittiTransaction
+            merged.append((txn.created_at, {
+                "id": str(txn.id), "transaction_id": f"CTX-{str(txn.id).split('-')[0].upper()}",
+                "customer_name": row.customer_name or "—", "customer_code": row.customer_code,
+                "collector_name": row.collector_name or "—", "amount": txn.amount,
+                "payment_method": txn.payment_method or "OTHER",
+                "status": "REVERSED" if txn.transaction_type == "REVERSAL" else "COMPLETED",
+                "is_reversal": txn.transaction_type == "REVERSAL", "source": "CHITTI",
+                "payment_date": str(txn.payment_date) if txn.payment_date else str(txn.created_at.date()),
+            }))
+        merged.sort(key=lambda item: (item[1]["payment_date"], item[0]), reverse=True)
+        return [item[1] for item in merged]
 
     # ===========================================================================
     # Payments recorded on the day (with collector + customer names)
@@ -449,7 +582,10 @@ class ReportService:
             .outerjoin(ChittiMember, ChittiMember.id == ChittiTransaction.member_id)
             .outerjoin(Customer, Customer.id == ChittiMember.customer_id)
             .outerjoin(User, User.id == ChittiTransaction.created_by)
-            .where(self._chitti_business_date() == d)
+            .where(
+                self._chitti_business_date() == d,
+                ChittiTransaction.transaction_type.in_(("CONTRIBUTION", "REVERSAL")),
+            )
         )
         for row in chit.all():
             txn = row.ChittiTransaction
@@ -667,7 +803,10 @@ class ReportService:
                     ),
                     Decimal("0"),
                 ),
-            ).where(self._chitti_business_date() == d)
+            ).where(
+                self._chitti_business_date() == d,
+                ChittiTransaction.transaction_type.in_(("CONTRIBUTION", "REVERSAL")),
+            )
         )
         chitti_collected, chitti_reversals = chit.one()
 

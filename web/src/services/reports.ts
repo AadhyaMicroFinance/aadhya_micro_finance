@@ -82,6 +82,15 @@ export interface DailyReport extends DailySummary {
   payments: DayPayment[];
 }
 
+export interface RangeReport {
+  report_type: string; start_date: string; end_date: string;
+  collected_total: number; finance_collected: number; chitti_collected: number;
+  finance_pending: number; chitti_pending: number;
+  breakdown?: Array<Record<string, string | number | boolean | null>>;
+  transactions: Array<Record<string, string | number | boolean | null>>;
+  pending_details: Array<Record<string, string | number | boolean | null>>;
+}
+
 export interface ChittiPlanMetrics {
   plan_id: string;
   total_chittis: number;
@@ -101,6 +110,14 @@ export interface ChittiPlanMetrics {
 // ==========================================
 
 export const reportApi = {
+  getRangeReport: async (startDate: string, endDate: string, type: string): Promise<RangeReport> => {
+    const res = await apiClient.get<ApiResponse<RangeReport>>("/reports/range", { params: { start_date: startDate, end_date: endDate, report_type: type } });
+    return res.data.data;
+  },
+  exportRangeReport: async (startDate: string, endDate: string, type: string, format: "csv" | "xlsx") => {
+    const res = await apiClient.get("/reports/range/export", { params: { start_date: startDate, end_date: endDate, report_type: type, file_format: format }, responseType: "blob" });
+    return res.data as Blob;
+  },
   getDailyReport: async (date?: string): Promise<DailyReport> => {
     const res = await apiClient.get<ApiResponse<DailyReport>>("/reports/daily", {
       params: date ? { date } : {},

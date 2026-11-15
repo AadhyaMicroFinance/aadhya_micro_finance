@@ -20,6 +20,8 @@ coverage.xml
 node_modules/
 .next/
 out/
+web/.next-stabilization/
+web/.next-chitti-payout-fixes/
 
 # React Native
 .mobile/
@@ -45,6 +47,8 @@ Thumbs.db
 # Build
 dist/
 build/
+web/.next-master-audit/
+web/.next-local-test/
 *.egg-info/
 
 # Deployment secrets/state
@@ -53,3 +57,7 @@ deploy/aws/terraform/.terraform/
 deploy/aws/terraform/*.tfstate
 deploy/aws/terraform/*.tfstate.*
 deploy/aws/terraform/crash.log
+# Local verification artifacts
+backend/.venv-verification/
+web/.next-browser-verification/
+web/tsconfig.tsbuildinfo

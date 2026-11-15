@@ -21,12 +21,14 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -243,6 +245,37 @@ class ChittiMember(BaseModel):
     payouts: Mapped[list["ChittiPayout"]] = relationship(
         "ChittiPayout", back_populates="member"
     )
+
+
+# ---------------------------------------------------------------------------
+# Lift Event (separate from payout transactions)
+# ---------------------------------------------------------------------------
+
+class ChittiLiftEvent(BaseModel):
+    """Confirmed member lift for a contribution period; not proof of payout."""
+
+    __tablename__ = "chitti_lift_events"
+    __table_args__ = (
+        Index("uq_chitti_lift_period_active", "chitti_id", "period_number",
+              unique=True, postgresql_where=text("reversed_at IS NULL")),
+    )
+
+    chitti_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chittis.id", ondelete="CASCADE"), nullable=False
+    )
+    member_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("chitti_members.id", ondelete="RESTRICT"), nullable=False
+    )
+    period_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    lift_date: Mapped[date] = mapped_column(Date, nullable=False)
+    recorded_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reversed_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    reversal_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 # ---------------------------------------------------------------------------

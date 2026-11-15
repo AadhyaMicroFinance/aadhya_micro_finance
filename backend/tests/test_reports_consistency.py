@@ -10,9 +10,15 @@ any finance account, and that a retried save cannot double-count money.
 """
 
 import math
+import csv
+from io import BytesIO, StringIO
 from datetime import date
 
 import pytest
+from openpyxl import load_workbook
+from sqlalchemy import select
+from app.models.audit import AuditLog
+from app.models.payment import PaymentTransaction
 
 PLAN = {
     "name": "Report Consistency Plan",
@@ -21,7 +27,11 @@ PLAN = {
     "member_count": 4,
     "frequency": "WEEKLY",
     "duration": 10,
-    "contribution_rules": {"type": "FIXED", "installment_amount": "1000.00"},
+    "contribution_rules": {
+        "type": "FIXED",
+        "installment_amount": "1000.00",
+        "partial_payments_allowed": True,
+    },
     "payout_rules": {"type": "SCHEDULED"},
 }
 
@@ -45,7 +55,7 @@ async def _customer(client, headers, index):
 
 
 async def _running_chitti(client, headers, members=2):
-    """Create a chitti, sign every agreement and start it."""
+    """Create a Chitti and start it explicitly after confirming agreements."""
     plan = (
         await client.post("/api/v1/chitti/plans", json=PLAN, headers=headers)
     ).json()["data"]
@@ -72,21 +82,29 @@ async def _running_chitti(client, headers, members=2):
                 headers=headers,
             )
         ).json()["data"]
+        enrolled.append(member)
+
+    confirmation = None
+    for member in enrolled:
+        confirmation = None
         for action in ("generate", "print", "confirm"):
             resp = await client.post(
                 f"/api/v1/chitti/{chitti['id']}/members/{member['id']}/agreement/{action}",
                 headers=headers,
             )
             assert resp.status_code == 200, resp.text
-        enrolled.append(member)
-
+            if action == "confirm":
+                confirmation = resp.json()["data"]
+    assert confirmation["chitti_auto_started"] is False
+    assert confirmation["chitti_status"] == "DRAFT"
     started = await client.post(f"/api/v1/chitti/{chitti['id']}/start", headers=headers)
     assert started.status_code == 200, started.text
+    assert started.json()["data"]["status"] == "RUNNING"
     return chitti, enrolled
 
 
 @pytest.mark.asyncio
-async def test_reversal_restores_schedule_and_report(client, test_user):
+async def test_reversal_restores_schedule_and_report(client, test_user, db_session):
     """A reversed payment must free the installment again and net out."""
     headers = _auth(test_user)
     today = date.today().isoformat()
@@ -131,10 +149,7 @@ async def test_reversal_restores_schedule_and_report(client, test_user):
     assert blocked.status_code == 400, blocked.text
     assert blocked.json()["error"]["code"] == "USE_CHITTI_CONTRIBUTION_ENDPOINT"
 
-    payment = (
-        await client.post(
-            "/api/v1/payments/",
-            json={
+    payment_body = {
                 "customer_id": customer["id"],
                 "finance_account_id": account["id"],
                 "finance_schedule_id": installment["id"],
@@ -142,10 +157,14 @@ async def test_reversal_restores_schedule_and_report(client, test_user):
                 "payment_method": "CASH",
                 "payment_date": today,
                 "idempotency_key": "reversal-test-1",
-            },
-            headers=headers,
-        )
-    ).json()["data"]
+    }
+    payment_response = await client.post("/api/v1/payments/", json=payment_body, headers=headers)
+    assert payment_response.status_code == 200, payment_response.text
+    payment = payment_response.json()["data"]
+
+    duplicate = await client.post("/api/v1/payments/", json=payment_body, headers=headers)
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"]["code"] == "DUPLICATE_PAYMENT"
 
     paid_row = next(
         s
@@ -183,6 +202,65 @@ async def test_reversal_restores_schedule_and_report(client, test_user):
     assert report["finance_reversals"] == 1000.0
     assert report["net_collections"] == -1000.0
     assert report["finance_pending"] == 1000.0
+
+    ledger = list((await db_session.execute(select(PaymentTransaction))).scalars().all())
+    assert len(ledger) == 2, "reversal must append a ledger row and retain the original"
+    assert sum(1 for row in ledger if row.is_reversal) == 1
+    audit = list((await db_session.execute(
+        select(AuditLog).where(AuditLog.action == "FINANCE_PAYMENT_REVERSED")
+    )).scalars().all())
+    assert len(audit) == 1
+
+
+@pytest.mark.asyncio
+async def test_chitti_partial_reversal_restores_ledger_and_audit(client, test_user, db_session):
+    headers = _auth(test_user)
+    today = date.today().isoformat()
+    chitti, members = await _running_chitti(client, headers, members=1)
+    eligible = (await client.get(
+        f"/api/v1/payments/customer/{members[0]['customer_id']}/eligible-accounts",
+        headers=headers,
+    )).json()["data"]
+    assert eligible["finance_accounts"] == []
+    assert [item["chitti_id"] for item in eligible["chitti_memberships"]] == [chitti["id"]]
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"], "period_number": 1,
+            "amount": "400.00", "payment_method": "CASH",
+            "payment_date": today, "idempotency_key": "chitti-reversal-origin",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    original_id = contribution.json()["data"]["transaction_id"]
+
+    reversal = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/transactions/{original_id}/reverse",
+        json={"reversal_reason": "regression reversal"}, headers=headers,
+    )
+    assert reversal.status_code == 200, reversal.text
+    assert reversal.json()["data"]["duplicate"] is False
+    repeated = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/transactions/{original_id}/reverse",
+        json={"reversal_reason": "retry"}, headers=headers,
+    )
+    assert repeated.status_code == 200
+    assert repeated.json()["data"]["duplicate"] is True
+
+    rows = (await client.get(
+        f"/api/v1/chitti/{chitti['id']}/members/{members[0]['id']}/contributions",
+        headers=headers,
+    )).json()["data"]
+    first_period = next(row for row in rows if row["period_number"] == 1)
+    assert float(first_period["paid_amount"]) == 0.0
+    assert float(first_period["remaining_amount"]) == 1000.0
+    assert first_period["status"] in ("UPCOMING", "OVERDUE")
+
+    audit = list((await db_session.execute(
+        select(AuditLog).where(AuditLog.action == "CHITTI_CONTRIBUTION_REVERSED")
+    )).scalars().all())
+    assert len(audit) == 1
 
 
 @pytest.mark.asyncio
@@ -326,3 +404,70 @@ async def test_daily_report_separates_and_totals_both_ledgers(client, test_user)
     assert after["expected_total"] == before["expected_total"]
     assert after["pending_total"] == before["pending_total"]
     assert after["chitti_expected"] == before["chitti_expected"]
+
+
+@pytest.mark.asyncio
+async def test_range_csv_and_xlsx_match_json_report(client, test_user):
+    """Download formats contain the same ledger rows and totals as the UI API."""
+    headers = _auth(test_user)
+    today = date.today().isoformat()
+    chitti, members = await _running_chitti(client, headers, members=1)
+    payment = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "1000.00",
+            "payment_method": "UPI",
+            "payment_date": today,
+            "idempotency_key": "range-export-chitti-payment",
+        },
+        headers=headers,
+    )
+    assert payment.status_code == 200, payment.text
+
+    params = {"start_date": today, "end_date": today, "report_type": "chitti"}
+    report = (await client.get("/api/v1/reports/range", params=params, headers=headers)).json()["data"]
+    assert report["chitti_collected"] == 1000.0
+    assert len(report["transactions"]) == 1
+
+    csv_response = await client.get(
+        "/api/v1/reports/range/export",
+        params={**params, "file_format": "csv"},
+        headers=headers,
+    )
+    assert csv_response.status_code == 200, csv_response.text
+    csv_rows = list(csv.DictReader(StringIO(csv_response.content.decode("utf-8-sig"))))
+    summary = next(row for row in csv_rows if row["record_type"] == "SUMMARY")
+    transaction_rows = [row for row in csv_rows if row["record_type"] == "TRANSACTION"]
+    assert float(summary["chitti_collected"]) == report["chitti_collected"]
+    assert len(transaction_rows) == len(report["transactions"])
+    assert transaction_rows[0]["source"] == report["transactions"][0]["source"] == "CHITTI"
+
+    xlsx_response = await client.get(
+        "/api/v1/reports/range/export",
+        params={**params, "file_format": "xlsx"},
+        headers=headers,
+    )
+    assert xlsx_response.status_code == 200, xlsx_response.text
+    workbook = load_workbook(BytesIO(xlsx_response.content), read_only=True, data_only=True)
+    summary_values = {row[0]: row[1] for row in workbook["Summary"].iter_rows(values_only=True)}
+    assert float(summary_values["chitti_collected"]) == report["chitti_collected"]
+    xlsx_transactions = list(workbook["Transactions"].iter_rows(values_only=True))
+    assert len(xlsx_transactions) == len(report["transactions"]) + 1
+    assert workbook["Pending dues"].max_row >= 1
+
+    collector_params = {**params, "report_type": "collector"}
+    collector_report = (await client.get(
+        "/api/v1/reports/range", params=collector_params, headers=headers
+    )).json()["data"]
+    assert len(collector_report["breakdown"]) == 1
+    assert collector_report["breakdown"][0]["transaction_count"] == 1
+    assert collector_report["breakdown"][0]["chitti_collected"] == 1000.0
+    collector_csv = await client.get(
+        "/api/v1/reports/range/export",
+        params={**collector_params, "file_format": "csv"}, headers=headers,
+    )
+    csv_breakdown = list(csv.DictReader(StringIO(collector_csv.content.decode("utf-8-sig"))))
+    breakdown_row = next(row for row in csv_breakdown if row["record_type"] == "BREAKDOWN")
+    assert float(breakdown_row["chitti_collected"]) == collector_report["breakdown"][0]["chitti_collected"]

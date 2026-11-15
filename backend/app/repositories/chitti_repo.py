@@ -16,6 +16,7 @@ from app.models.chitti import (
     ChittiPeriodSchedule,
     ChittiPlan,
     ChittiTransaction,
+    ChittiLiftEvent,
 )
 from app.repositories.base import BaseRepository
 
@@ -58,6 +59,12 @@ class ChittiRepository(BaseRepository[Chitti]):
     async def get_by_chitti_code(self, chitti_code: str) -> Optional[Chitti]:
         result = await self.session.execute(
             select(Chitti).where(Chitti.chitti_code == chitti_code)
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_id_for_update(self, chitti_id: UUID) -> Optional[Chitti]:
+        result = await self.session.execute(
+            select(Chitti).where(Chitti.id == chitti_id).with_for_update()
         )
         return result.scalar_one_or_none()
 
@@ -291,6 +298,53 @@ class ChittiContributionRepository(BaseRepository[ChittiMemberContribution]):
             )
         )
         return result.scalar_one_or_none()
+
+    async def get_by_chitti_member_period_for_update(
+        self, chitti_id: UUID, member_id: UUID, period_number: int
+    ) -> Optional[ChittiMemberContribution]:
+        result = await self.session.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == chitti_id,
+                ChittiMemberContribution.member_id == member_id,
+                ChittiMemberContribution.period_number == period_number,
+            ).with_for_update().execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
+
+class ChittiLiftEventRepository(BaseRepository[ChittiLiftEvent]):
+    def __init__(self, session: AsyncSession):
+        super().__init__(ChittiLiftEvent, session)
+
+    async def get_by_chitti_id(self, chitti_id: UUID) -> list[ChittiLiftEvent]:
+        result = await self.session.execute(
+            select(ChittiLiftEvent)
+            .where(ChittiLiftEvent.chitti_id == chitti_id)
+            .order_by(ChittiLiftEvent.period_number)
+        )
+        return list(result.scalars().all())
+
+    async def get_by_period(self, chitti_id: UUID, period_number: int) -> Optional[ChittiLiftEvent]:
+        result = await self.session.execute(
+            select(ChittiLiftEvent).where(
+                ChittiLiftEvent.chitti_id == chitti_id,
+                ChittiLiftEvent.period_number == period_number,
+                ChittiLiftEvent.reversed_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_active_for_member(self, chitti_id: UUID, member_id: UUID) -> list[ChittiLiftEvent]:
+        result = await self.session.execute(
+            select(ChittiLiftEvent)
+            .where(
+                ChittiLiftEvent.chitti_id == chitti_id,
+                ChittiLiftEvent.member_id == member_id,
+                ChittiLiftEvent.reversed_at.is_(None),
+            )
+            .order_by(ChittiLiftEvent.period_number)
+        )
+        return list(result.scalars().all())
 
 
 # ---------------------------------------------------------------------------

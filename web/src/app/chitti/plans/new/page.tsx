@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import DashboardLayout from "@/components/layout/DashboardLayout";
+import NumericInput from "@/components/ui/NumericInput";
 import { chittiApi } from "@/services/chitti";
 
 interface PlanField {
@@ -28,10 +29,9 @@ const CALC_METHODS = [
   {
     id: "LIFT_BASED",
     label: "Lift Based",
-    description: "Different amounts before and after lifting",
+    description: "Add 1% of original Chitti value from the period after lifting",
     fields: [
-      { label: "Before Lifting Amount", key: "pre_lift_amount", type: "currency" as const },
-      { label: "After Lifting Amount", key: "post_lift_amount", type: "currency" as const },
+      { label: "Regular Contribution per Period", key: "regular_amount", type: "currency" as const },
     ],
   },
   {
@@ -132,8 +132,7 @@ export default function NewPlanPage() {
       case "LIFT_BASED":
         contributionRules = {
           type: "LIFT_BASED",
-          pre_lift_amount: parseFloat(fields.pre_lift_amount || "0"),
-          post_lift_amount: parseFloat(fields.post_lift_amount || "0"),
+          regular_amount: parseFloat(fields.regular_amount || "0"),
         };
         break;
       case "CUSTOM":
@@ -264,12 +263,12 @@ export default function NewPlanPage() {
                 </div>
                 <div>
                   <label className="mb-1 block text-sm font-medium">Duration (periods) *</label>
-                  <input
-                    type="number"
+                  <NumericInput
+                    integer
                     value={duration}
-                    onChange={(e) => {
-                      setDuration(e.target.value);
-                      if (calcMethod === "CUSTOM") initCustomSchedule(parseInt(e.target.value));
+                    onValueChange={(value) => {
+                      setDuration(value);
+                      if (calcMethod === "CUSTOM" && value) initCustomSchedule(parseInt(value, 10));
                     }}
                     className="input-field"
                     placeholder="25"
@@ -281,10 +280,9 @@ export default function NewPlanPage() {
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                 <div>
                   <label className="mb-1 block text-sm font-medium">Total Value (₹) *</label>
-                  <input
-                    type="number"
+                  <NumericInput
                     value={totalValue}
-                    onChange={(e) => setTotalValue(e.target.value)}
+                    onValueChange={setTotalValue}
                     className="input-field"
                     placeholder="500000"
                     required
@@ -292,10 +290,10 @@ export default function NewPlanPage() {
                 </div>
                 <div>
                   <label className="mb-1 block text-sm font-medium">Members *</label>
-                  <input
-                    type="number"
+                  <NumericInput
+                    integer
                     value={memberCount}
-                    onChange={(e) => setMemberCount(e.target.value)}
+                    onValueChange={setMemberCount}
                     className="input-field"
                     placeholder="25"
                     required
@@ -340,10 +338,9 @@ export default function NewPlanPage() {
                   {selectedMethod.fields.map((fieldDef) => (
                     <div key={fieldDef.key}>
                       <label className="mb-1 block text-sm font-medium">{fieldDef.label} *</label>
-                      <input
-                        type="number"
+                      <NumericInput
                         value={fields[fieldDef.key] || ""}
-                        onChange={(e) => setFields({ ...fields, [fieldDef.key]: e.target.value })}
+                        onValueChange={(value) => setFields({ ...fields, [fieldDef.key]: value })}
                         className="input-field"
                         placeholder={`Enter ${fieldDef.label.toLowerCase()}`}
                         required
@@ -367,12 +364,11 @@ export default function NewPlanPage() {
                         <span className="w-24 text-sm font-medium text-gray-700">
                           Period {row.period}
                         </span>
-                        <input
-                          type="number"
+                        <NumericInput
                           value={row.amount}
-                          onChange={(e) => {
+                          onValueChange={(value) => {
                             const newSchedule = [...customSchedule];
-                            newSchedule[idx] = { ...newSchedule[idx], amount: e.target.value };
+                            newSchedule[idx] = { ...newSchedule[idx], amount: value };
                             setCustomSchedule(newSchedule);
                           }}
                           className="input-field flex-1"
@@ -452,7 +448,7 @@ export default function NewPlanPage() {
 
               {extraFields.length === 0 && (
                 <div className="rounded-lg border border-dashed border-gray-300 p-4 text-center text-sm text-gray-500">
-                  No extra fields added. Click "+ Add Field" to add custom fields for your plan.
+                  No extra fields added. Click <span className="font-semibold">+ Add Field</span> to add custom fields for your plan.
                 </div>
               )}
             </div>

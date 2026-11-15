@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import Image from "next/image";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import {
   chittiApi,
@@ -11,6 +12,7 @@ import {
   type ChittiMember,
   type ChittiPeriodSchedule,
   type ChittiPayout,
+  type ChittiLiftEvent,
   type Agreement,
   type ActivationStatus,
 } from "@/services/chitti";
@@ -44,7 +46,12 @@ import {
   ChevronRight,
 } from "lucide-react";
 
-type Tab = "overview" | "members" | "schedule" | "payouts";
+type Tab = "overview" | "members" | "schedule" | "payouts" | "lifts";
+
+function todayIsoDate(): string {
+  const now = new Date();
+  return new Date(now.getTime() - now.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+}
 
 // Display-only lifecycle labels mapped onto the existing backend statuses.
 const DISPLAY_STATE_LABELS: Record<string, string> = {
@@ -87,6 +94,7 @@ function AgreementPreviewModal({
   const chittiSnap = snapshot?.chitti as Record<string, unknown> | undefined;
   const plan = snapshot?.plan as Record<string, unknown> | undefined;
   const contribRules = plan?.contribution_rules as Record<string, unknown> | undefined;
+  const payoutRules = plan?.payout_rules as Record<string, unknown> | undefined;
 
   const handlePrint = () => {
     window.print();
@@ -100,6 +108,10 @@ function AgreementPreviewModal({
         <div id="agreement-content" className="p-4 print:p-4 sm:p-8">
           {/* Header */}
           <div className="text-center border-b-2 border-surface-900 pb-4 mb-6">
+            <Image src="/amf-logo.png" alt="Aadhya Micro Finance logo" width={88} height={56} className="mx-auto mb-2 h-12 w-20 object-contain" />
+            <h2 className="text-sm font-bold uppercase tracking-wide text-surface-900">AADHYA MICRO FINANCE PRIVATE LIMITED</h2>
+            <p className="text-xs text-surface-600">H.No: 10-2-41/1, Sainagar, Sircilla · CIN: U64990TS2025PTC199452</p>
+            <p className="text-xs text-surface-600">Cell: 9182838496, 9886232471 · Powered by Vayu Integration Services</p>
             <h1 className="text-2xl font-bold tracking-wide text-surface-900">CHITTI AGREEMENT</h1>
             <p className="text-sm text-surface-600 mt-1">Agreement No: {agreement.agreement_number}</p>
             <p className="text-sm text-surface-600">Date: {formatDate(agreement.agreement_date)}</p>
@@ -113,6 +125,13 @@ function AgreementPreviewModal({
             <DetailRow label="Duration" value={`${String(plan?.duration || "")} periods`} />
             <DetailRow label="Members" value={String(plan?.member_count || "")} />
             <DetailRow label="Type" value={String(plan?.chitti_type || "")} />
+          </Section>
+
+          <Section title="Winner and payout configuration">
+            <DetailRow label="Selection method" value={String(payoutRules?.type || "Not specified in agreement snapshot")} />
+            {Boolean(payoutRules?.payout_order) && <DetailRow label="Payout order" value={String(payoutRules?.payout_order)} />}
+            {payoutRules?.commission_percentage !== undefined && <DetailRow label="Commission percentage" value={`${String(payoutRules.commission_percentage)}%`} />}
+            {payoutRules?.commission_fixed !== undefined && <DetailRow label="Fixed commission" value={formatCurrency(Number(payoutRules.commission_fixed))} />}
           </Section>
 
           {/* Member Details */}
@@ -132,8 +151,13 @@ function AgreementPreviewModal({
             )}
             {contribRules?.type === "LIFT_BASED" && (
               <div className="text-sm space-y-1">
-                <p>Before lifting: <span className="font-bold">{formatCurrency(Number(contribRules.pre_lift_amount || 0))}</span> per period</p>
-                <p>After lifting: <span className="font-bold">{formatCurrency(Number(contribRules.post_lift_amount || 0))}</span> per period</p>
+                {contribRules.regular_amount ? <>
+                  <p>Regular contribution: <span className="font-bold">{formatCurrency(Number(contribRules.regular_amount))}</span> per period</p>
+                  <p>From the period after lifting: add <span className="font-bold">{formatCurrency(Number(chittiSnap?.total_value || 0) / 100)}</span> (1% of original Chitti value) per period through period {String(plan?.duration)}.</p>
+                </> : <>
+                  <p>Before lifting: <span className="font-bold">{formatCurrency(Number(contribRules.pre_lift_amount || 0))}</span> per period</p>
+                  <p>After lifting: <span className="font-bold">{formatCurrency(Number(contribRules.post_lift_amount || 0))}</span> per period (legacy plan)</p>
+                </>}
               </div>
             )}
             {contribRules?.type === "CUSTOM" && (
@@ -365,6 +389,11 @@ export default function ChittiDetailPage() {
   const [members, setMembers] = useState<ChittiMember[]>([]);
   const [schedule, setSchedule] = useState<ChittiPeriodSchedule[]>([]);
   const [payouts, setPayouts] = useState<ChittiPayout[]>([]);
+  const [liftEvents, setLiftEvents] = useState<ChittiLiftEvent[]>([]);
+  const [liftPeriod, setLiftPeriod] = useState("");
+  const [liftMemberId, setLiftMemberId] = useState("");
+  const [liftDate, setLiftDate] = useState(todayIsoDate());
+  const [liftSaving, setLiftSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab>("overview");
   const [activation, setActivation] = useState<ActivationStatus | null>(null);
@@ -423,8 +452,73 @@ export default function ChittiDetailPage() {
     if (tab === "schedule" && schedule.length === 0) {
       try { setSchedule(await chittiApi.getSchedule(chittiId)); } catch (e) { console.error(e); }
     }
-    if (tab === "payouts" && payouts.length === 0) {
-      try { setPayouts(await chittiApi.listPayouts(chittiId)); } catch (e) { console.error(e); }
+    if (tab === "payouts") {
+      try {
+        const [periods, actualPayouts] = await Promise.all([
+          chittiApi.getSchedule(chittiId),
+          chittiApi.listPayouts(chittiId),
+        ]);
+        setSchedule(periods);
+        setPayouts(actualPayouts);
+      } catch (e) { console.error(e); }
+    }
+    if (tab === "lifts") {
+      try {
+        const [periods, events] = await Promise.all([
+          chittiApi.getSchedule(chittiId),
+          chittiApi.listLiftEvents(chittiId),
+        ]);
+        setSchedule(periods);
+        setLiftEvents(events);
+        const occupied = new Set(events.filter((event) => !event.reversed_at).map((event) => event.period_number));
+        const eligible = periods.find((period) => period.due_date <= liftDate && !occupied.has(period.period_number));
+        if (eligible) setLiftPeriod(String(eligible.period_number));
+      } catch (e) {
+        setFeedback({ type: "error", message: getApiErrorMessage(e, "Could not load lift history.") });
+      }
+    }
+  };
+
+  const handleRecordLift = async () => {
+    if (!liftMemberId || !liftPeriod || liftSaving) return;
+    setLiftSaving(true);
+    setFeedback(null);
+    try {
+      await chittiApi.recordLift(chittiId, {
+        member_id: liftMemberId,
+        period_number: Number(liftPeriod),
+        lift_date: liftDate,
+      });
+      const [events, periods] = await Promise.all([
+        chittiApi.listLiftEvents(chittiId),
+        chittiApi.getSchedule(chittiId),
+      ]);
+      setLiftEvents(events);
+      setSchedule(periods);
+      await loadData();
+      setFeedback({ type: "success", message: "Lift recorded. This did not create a payout." });
+    } catch (e) {
+      setFeedback({ type: "error", message: getApiErrorMessage(e, "Could not record this lift.") });
+    } finally {
+      setLiftSaving(false);
+    }
+  };
+
+  const handleReverseLift = async (event: ChittiLiftEvent) => {
+    const reason = window.prompt(`Reason for reversing the Period ${event.period_number} lift:`)?.trim();
+    if (!reason) return;
+    try {
+      await chittiApi.reverseLift(chittiId, event.id, reason);
+      const [events, periods] = await Promise.all([
+        chittiApi.listLiftEvents(chittiId),
+        chittiApi.getSchedule(chittiId),
+      ]);
+      setLiftEvents(events);
+      setSchedule(periods);
+      await loadData();
+      setFeedback({ type: "success", message: "Lift reversed. Its history is retained and the member schedule was recalculated." });
+    } catch (e) {
+      setFeedback({ type: "error", message: getApiErrorMessage(e, "Could not reverse this lift.") });
     }
   };
 
@@ -511,8 +605,12 @@ export default function ChittiDetailPage() {
       await chittiApi.confirmAgreement(chittiId, memberId);
       const detail = await chittiApi.getMemberDetail(chittiId, memberId);
       setSelectedMember(detail as ChittiMember & { agreement: Agreement | null });
-      await loadMembers();
+      await loadData();
       setShowAgreement(null);
+      setFeedback({
+        type: "success",
+        message: "Agreement confirmed. Chitti starts only when you select Start and activation requirements are met.",
+      });
     } catch (e) { console.error(e); }
   };
 
@@ -523,6 +621,8 @@ export default function ChittiDetailPage() {
   const contribRules = snapshot?.contribution_rules as Record<string, unknown> | undefined;
   const payoutRules = snapshot?.payout_rules as Record<string, unknown> | undefined;
   const progressPct = summary.total_periods > 0 ? Math.round((summary.current_period / summary.total_periods) * 100) : 0;
+  const activeLiftPeriods = new Set(liftEvents.filter((event) => !event.reversed_at).map((event) => event.period_number));
+  const liftEligiblePeriods = schedule.filter((period) => period.due_date <= liftDate && !activeLiftPeriods.has(period.period_number));
   const canAddMembers = chitti.status === "DRAFT" || chitti.status === "UPCOMING";
   // Enrolled members, not ACTIVE-only: pending-agreement members already hold
   // a seat and must be counted the same way the Members tab counts them.
@@ -555,7 +655,7 @@ export default function ChittiDetailPage() {
                 <Plus size={16} /> Add Member
               </button>
             )}
-            {chitti.status === "DRAFT" && (
+            {(chitti.status === "DRAFT" || chitti.status === "UPCOMING") && (
               <button
                 onClick={handleStart}
                 disabled={actionLoading !== null}
@@ -682,7 +782,7 @@ export default function ChittiDetailPage() {
             <p className="font-medium text-surface-900">
               {String(contribRules?.type || "FIXED")}
               {contribRules?.installment_amount ? ` — ${formatCurrency(Number(contribRules.installment_amount))}` : ""}
-              {contribRules?.pre_lift_amount ? ` — ${formatCurrency(Number(contribRules.pre_lift_amount))} / ${formatCurrency(Number(contribRules.post_lift_amount))}` : ""}
+              {contribRules?.regular_amount ? ` — ${formatCurrency(Number(contribRules.regular_amount))} regular + 1% after lift` : contribRules?.pre_lift_amount ? ` — ${formatCurrency(Number(contribRules.pre_lift_amount))} / ${formatCurrency(Number(contribRules.post_lift_amount))}` : ""}
             </p>
           </div>
           <div className="card text-sm">
@@ -696,7 +796,7 @@ export default function ChittiDetailPage() {
 
         {/* Tabs */}
         <div className="tabs w-full sm:w-auto">
-          {(["overview", "members", "schedule", "payouts"] as const).map((tab) => (
+          {(["overview", "members", "schedule", "payouts", ...(contribRules?.type === "LIFT_BASED" ? ["lifts" as const] : [])] as const).map((tab) => (
             <button
               key={tab}
               onClick={() => loadTab(tab)}
@@ -843,10 +943,67 @@ export default function ChittiDetailPage() {
 
         {/* ============ PAYOUTS TAB ============ */}
         {activeTab === "payouts" && (
-          <div className="card">
-            {payouts.length === 0 ? (
-              <EmptyState icon="💰" title="No payouts recorded" description="Payouts are recorded as the chitti progresses." />
-            ) : (
+          <div className="space-y-5">
+            <section className="card space-y-4">
+              <div>
+                <h2 className="text-base font-semibold text-surface-900">Scheduled / expected payouts</h2>
+                <p className="mt-1 text-sm text-surface-500">Projected from this Chitti&apos;s saved payout rule. These rows are not payout transactions.</p>
+              </div>
+              {schedule.some((period) => period.payout_schedule_available) ? (
+                <>
+                  <div className="space-y-2 md:hidden">
+                    {schedule.filter((period) => period.payout_schedule_available).map((period) => {
+                      const member = members.find((row) => row.member_number === period.scheduled_member_number);
+                      const actual = payouts.find((row) => row.period_number === period.period_number);
+                      return (
+                        <div key={`scheduled-${period.id}`} className="rounded-xl border border-surface-100 p-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold">Period {period.period_number}</span>
+                            <span className={cn("badge", actual ? getStatusColor(actual.status) : "badge-warning")}>{actual ? actual.status : "SCHEDULED"}</span>
+                          </div>
+                          <p className="mt-1 text-sm text-surface-600">{member?.customer_name || (period.scheduled_member_number ? `Member #${period.scheduled_member_number}` : "Recipient not assigned")}</p>
+                          <p className="mt-1 text-xs text-surface-500">Period due: {formatDate(period.due_date)}</p>
+                          <div className="mt-2 flex justify-between gap-2 text-sm"><span className="text-surface-500">Expected net</span><span className="font-semibold">{formatCurrency(period.expected_payout)}</span></div>
+                          {Number(period.expected_payout_fee || 0) > 0 && <div className="flex justify-between gap-2 text-xs text-surface-500"><span>Expected fee</span><span>{formatCurrency(period.expected_payout_fee || 0)}</span></div>}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="table-container hidden md:block">
+                    <table className="table">
+                      <thead><tr><th>Period</th><th>Period due</th><th>Scheduled member</th><th>Expected net payout</th><th>Expected fee</th><th>Status</th></tr></thead>
+                      <tbody>
+                        {schedule.filter((period) => period.payout_schedule_available).map((period) => {
+                          const member = members.find((row) => row.member_number === period.scheduled_member_number);
+                          const actual = payouts.find((row) => row.period_number === period.period_number);
+                          return (
+                            <tr key={`scheduled-${period.id}`}>
+                              <td>{period.period_number}</td>
+                              <td>{formatDate(period.due_date)}</td>
+                              <td>{member?.customer_name || (period.scheduled_member_number ? `Member #${period.scheduled_member_number}` : "Not assigned")}</td>
+                              <td className="font-medium">{formatCurrency(period.expected_payout)}</td>
+                              <td>{formatCurrency(period.expected_payout_fee || 0)}</td>
+                              <td><span className={cn("badge", actual ? getStatusColor(actual.status) : "badge-warning")}>{actual ? actual.status : "SCHEDULED"}</span></td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              ) : (
+                <p className="rounded-xl border border-surface-100 p-5 text-sm text-surface-500">This payout rule does not define a scheduled recipient or expected payout amount. No estimate has been added.</p>
+              )}
+            </section>
+
+            <section className="card space-y-4">
+              <div>
+                <h2 className="text-base font-semibold text-surface-900">Actual payouts</h2>
+                <p className="mt-1 text-sm text-surface-500">Only posted payout records appear here.</p>
+              </div>
+              {payouts.length === 0 ? (
+                <p className="rounded-xl border border-surface-100 p-5 text-sm text-surface-500">No actual payout transactions have been recorded.</p>
+              ) : (
               <>
               <div className="space-y-2 md:hidden">
                 {payouts.map((p) => (
@@ -899,6 +1056,81 @@ export default function ChittiDetailPage() {
               </div>
               </>
             )}
+            </section>
+          </div>
+        )}
+
+        {/* ============ LIFT MANAGEMENT TAB ============ */}
+        {activeTab === "lifts" && contribRules?.type === "LIFT_BASED" && (
+          <div className="space-y-4">
+            <section className="card space-y-4">
+              <div>
+                <h2 className="text-base font-semibold text-surface-900">Record a member lift</h2>
+                <p className="mt-1 text-sm text-surface-500">
+                  A lift identifies who received the Chitti for a period. It is separate from a payout transaction.
+                  For the selected member, 1% of the original value is added from the next period through the original final period.
+                </p>
+              </div>
+              {chitti.status !== "RUNNING" && <p className="rounded-lg bg-warning-50 p-3 text-sm text-warning-800">Start the Chitti before recording a lift.</p>}
+              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                <label className="text-sm">Contribution period
+                  <select className="input-field mt-1" value={liftPeriod} onChange={(event) => setLiftPeriod(event.target.value)}>
+                    <option value="">Select a due period</option>
+                    {schedule.filter((period) => period.due_date <= liftDate).map((period) => (
+                      <option key={period.id} value={period.period_number} disabled={activeLiftPeriods.has(period.period_number)}>
+                        Period {period.period_number} · {formatDate(period.due_date)}{activeLiftPeriods.has(period.period_number) ? " · Lift recorded" : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-sm">Member who lifted
+                  <select className="input-field mt-1" value={liftMemberId} onChange={(event) => setLiftMemberId(event.target.value)}>
+                    <option value="">Select an active member</option>
+                    {members.filter((member) => member.status === "ACTIVE").map((member) => (
+                      <option key={member.id} value={member.id}>#{member.member_number} · {member.customer_name || member.customer_code}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-sm">Lift date
+                  <input type="date" className="input-field mt-1" value={liftDate} max={todayIsoDate()} onChange={(event) => {
+                    const nextDate = event.target.value;
+                    setLiftDate(nextDate);
+                    const nextPeriod = schedule.find((period) => period.due_date <= nextDate && !activeLiftPeriods.has(period.period_number));
+                    setLiftPeriod(nextPeriod ? String(nextPeriod.period_number) : "");
+                  }} />
+                </label>
+                <div className="flex items-end">
+                  <button className="btn-primary w-full" disabled={chitti.status !== "RUNNING" || liftSaving || !liftMemberId || !liftPeriod || liftEligiblePeriods.length === 0} onClick={handleRecordLift}>
+                    {liftSaving ? "Recording…" : "Confirm lift"}
+                  </button>
+                </div>
+              </div>
+              {liftEligiblePeriods.length === 0 && <p className="text-xs text-surface-500">No unassigned contribution period is eligible for this lift date.</p>}
+            </section>
+
+            <section className="card space-y-3">
+              <div>
+                <h2 className="text-base font-semibold text-surface-900">Lift history</h2>
+                <p className="mt-1 text-sm text-surface-500">Reversals remain in the audit history. Actual disbursements appear separately under Payouts.</p>
+              </div>
+              {liftEvents.length === 0 ? <EmptyState title="No lift events recorded" description="A member lift will appear here after confirmation." /> : (
+                <div className="table-container">
+                  <table className="table">
+                    <thead><tr><th>Period</th><th>Member</th><th>Lift date</th><th>Event status</th><th>Reversal reason</th><th>Action</th></tr></thead>
+                    <tbody>{liftEvents.map((event) => (
+                      <tr key={event.id}>
+                        <td>{event.period_number}</td>
+                        <td>#{event.member_number} · {event.member_name || "Member"}</td>
+                        <td>{formatDate(event.lift_date)}</td>
+                        <td><span className={cn("badge", event.reversed_at ? "badge-danger" : "badge-success")}>{event.reversed_at ? "REVERSED" : "RECORDED"}</span></td>
+                        <td>{event.reversal_reason || "—"}</td>
+                        <td>{!event.reversed_at && <button className="btn-secondary btn-sm" onClick={() => handleReverseLift(event)}>Reverse lift</button>}</td>
+                      </tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+              )}
+            </section>
           </div>
         )}
       </div>

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
+import BrandLockup from "@/components/branding/BrandLockup";
 import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
@@ -18,7 +19,6 @@ import {
   ChevronRight,
   PlusCircle,
   List,
-  FileText,
   Copy,
   CircleDollarSign,
   MessageCircle,
@@ -50,14 +50,12 @@ const navItems: NavItem[] = [
     children: [
       { label: "Dashboard", href: "/chitti", icon: <LayoutDashboard size={16} /> },
       { label: "Analytics", href: "/chitti/analytics", icon: <BarChart3 size={16} /> },
-      { label: "Plans", href: "/chitti/plans", icon: <FileText size={16} /> },
       { label: "All Chittis", href: "/chitti/all", icon: <List size={16} /> },
       { label: "Create Chitti", href: "/chitti/new", icon: <PlusCircle size={16} /> },
     ],
   },
   { label: "Payments", href: "/payments", icon: <CreditCard size={20} />, group: "TRANSACTIONS" },
   { label: "Collect Payment", href: "/payments/collect", icon: <CircleDollarSign size={20} />, group: "TRANSACTIONS" },
-  { label: "Collections", href: "/collections/today", icon: <ArrowDownLeft size={20} />, group: "TRANSACTIONS" },
   { label: "Reports", href: "/reports", icon: <BarChart3 size={20} />, group: "ANALYTICS" },
   { label: "WhatsApp", href: "/whatsapp", icon: <MessageCircle size={20} />, group: "COMMUNICATION" },
   { label: "Users", href: "/users", icon: <Shield size={20} />, group: "ADMIN" },
@@ -123,16 +121,8 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
         )}
       >
         {/* Logo */}
-        <div className="flex h-14 flex-shrink-0 items-center gap-3 border-b border-surface-100 px-4 sm:h-16 sm:px-5">
-          <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-600">
-            <span className="text-sm font-bold text-white">₹</span>
-          </div>
-          <div className="min-w-0">
-            <span className="block truncate text-sm font-bold tracking-tight text-surface-900">
-              Aadhya Micro Finance
-            </span>
-            <span className="block text-[10px] text-surface-400">Powered by Vayu</span>
-          </div>
+        <div className="flex h-14 flex-shrink-0 items-center border-b border-surface-100 px-4 sm:h-16 sm:px-5">
+          <BrandLockup variant="sidebar" />
           <button
             type="button"
             onClick={onClose}

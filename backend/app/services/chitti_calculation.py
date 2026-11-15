@@ -115,12 +115,7 @@ class CustomContributionStrategy(ContributionStrategy):
 
 
 class LiftBasedContributionStrategy(ContributionStrategy):
-    """Lift-based installment — different amounts before/after lifting.
-    
-    Each member has a lift period (their payout_order).
-    - Before their lift period: pay pre_lift_amount
-    - At and after their lift period: pay post_lift_amount
-    """
+    """Lift surcharge calculation with a compatibility path for old snapshots."""
 
     def __init__(self, rule: "LiftBasedContributionRule"):
         self.rule = rule
@@ -128,12 +123,12 @@ class LiftBasedContributionStrategy(ContributionStrategy):
     def calculate_installment(
         self, period: int, total_periods: int, total_value: Decimal, member_count: int
     ) -> Decimal:
-        # Default (no member context): return pre-lift amount
-        return self.rule.pre_lift_amount
+        # No member has lifted in this context; return the regular amount.
+        return self.rule.regular_amount or self.rule.pre_lift_amount
 
     def calculate_installment_for_member(
         self, period: int, total_periods: int, total_value: Decimal,
-        member_count: int, member_lift_period: int
+        member_count: int, member_lift_period: int | None
     ) -> Decimal:
         """Calculate installment for a specific member based on their lift period.
         
@@ -141,12 +136,20 @@ class LiftBasedContributionStrategy(ContributionStrategy):
             member_lift_period: The period number when this member lifts (receives pot).
                                Period numbers are 1-indexed.
         """
-        if period >= member_lift_period:
-            return self.rule.post_lift_amount
-        return self.rule.pre_lift_amount
+        regular_amount = self.rule.regular_amount or self.rule.pre_lift_amount
+        # The approved lift rule applies consistently to current and legacy
+        # lift snapshots: base contribution plus 1% of original Chitti value,
+        # beginning the period after an explicit lift. Stored legacy post-lift
+        # amounts are superseded by this approved rule.
+        if member_lift_period is not None and member_lift_period < period <= total_periods:
+            surcharge = (total_value / Decimal("100")).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            return regular_amount + surcharge
+        return regular_amount
 
     def calculate_total_contribution(self, total_value: Decimal, member_count: int) -> Decimal:
-        return self.rule.pre_lift_amount
+        return self.rule.regular_amount or self.rule.pre_lift_amount
 
 
 class PercentageContributionStrategy(ContributionStrategy):
@@ -400,6 +403,19 @@ class ChittiCalculationEngine:
             period, duration, total_value, member_count
         )
 
+    def calculate_fixed_total_value(self, member_count: Optional[int] = None) -> Decimal:
+        """Total fixed contributions across seats and configured periods."""
+        rules = self.plan.get("contribution_rules", {}) or {}
+        if rules.get("type") != "FIXED":
+            raise ValueError("Fixed total is available only for FIXED contribution rules.")
+        members = int(member_count or self.plan.get("member_count", 1))
+        duration = int(self.plan.get("duration", 1))
+        total = sum(
+            (self.get_contribution_for_period(period) for period in range(1, duration + 1)),
+            Decimal("0"),
+        ) * Decimal(members)
+        return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
     def generate_period_schedule(
         self, start_date: date, member_count: int
     ) -> list[dict]:
@@ -414,10 +430,25 @@ class ChittiCalculationEngine:
 
         schedule = []
         for i, due_date in enumerate(due_dates, start=1):
-            installment = self.contribution_strategy.calculate_installment(
-                i, duration, total_value, member_count
-            )
-            expected_collection = installment * Decimal(str(member_count))
+            if isinstance(self.contribution_strategy, LiftBasedContributionStrategy):
+                expected_collection = sum(
+                    (
+                        self.contribution_strategy.calculate_installment_for_member(
+                            i,
+                            duration,
+                            total_value,
+                            member_count,
+                            None,
+                        )
+                        for member_number in range(1, member_count + 1)
+                    ),
+                    Decimal("0"),
+                )
+            else:
+                installment = self.contribution_strategy.calculate_installment(
+                    i, duration, total_value, member_count
+                )
+                expected_collection = installment * Decimal(str(member_count))
 
             schedule.append({
                 "period_number": i,
@@ -430,14 +461,23 @@ class ChittiCalculationEngine:
             })
         return schedule
 
+    def lift_period_for_member(
+        self, member_number: int, requested_lift_period: int | None = None
+    ) -> int | None:
+        """Return only an explicitly recorded lift period.
+
+        Payout order is not proof that a member has actually lifted the Chitti.
+        """
+        return requested_lift_period
+
     def generate_member_contributions(
         self, member_id, member_number: int, start_date: date,
         member_lift_period: int | None = None,
     ) -> list[dict]:
         """Generate per-member contribution schedule for all periods.
         
-        For LIFT_BASED rules, member_lift_period determines pre/post amounts.
-        If not provided, defaults to member_number (members lift in order).
+        For LIFT_BASED rules, surcharge timing only comes from an explicit
+        recorded lift period. With no lift event, each period remains regular.
         """
         duration = self.plan.get("duration", 1)
         frequency = self.plan.get("frequency", "MONTHLY")
@@ -445,8 +485,7 @@ class ChittiCalculationEngine:
         member_count = self.plan.get("member_count", 1)
         due_dates = get_due_dates(start_date, frequency, duration)
 
-        # Determine lift period for this member
-        lift_period = member_lift_period or member_number
+        lift_period = member_lift_period
 
         contributions = []
         for i, due_date in enumerate(due_dates, start=1):
@@ -503,13 +542,15 @@ class ChittiCalculationEngine:
         tv = Decimal(str(self.plan.get("total_value", 0)))
         member_installments = []
         if hasattr(self.contribution_strategy, "calculate_installment_for_member"):
-            # Lift-based: show sample for member #1 (lifts first) and last member
+            # Lift-based: show first and last member schedules using the
+            # configured payout order (including custom winner schedules).
             sample_members = [1, member_count] if member_count > 1 else [1]
             for member_num in sample_members:
                 member_schedule = []
                 for period in range(1, duration + 1):
                     amount = self.contribution_strategy.calculate_installment_for_member(
-                        period, duration, tv, member_count, member_num
+                        period, duration, tv, member_count,
+                        self.lift_period_for_member(member_num),
                     )
                     due_date = schedule[period - 1]["due_date"] if period <= len(schedule) else None
                     member_schedule.append({
@@ -519,7 +560,7 @@ class ChittiCalculationEngine:
                     })
                 member_installments.append({
                     "member_number": member_num,
-                    "lift_period": member_num,
+                    "lift_period": self.lift_period_for_member(member_num),
                     "schedule": member_schedule,
                     "total": sum(e["amount"] for e in member_schedule),
                 })

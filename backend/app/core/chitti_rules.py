@@ -81,16 +81,27 @@ class CustomContributionRule(BaseModel):
 
 
 class LiftBasedContributionRule(BaseModel):
-    """Lift-based installment — different amounts before/after lifting.
-    
-    Each member 'lifts' (receives the pot) in a specific period.
-    Before their lift: pay pre_lift_amount
-    After their lift: pay post_lift_amount
+    """Lift-based installments.
+
+    New rules use ``regular_amount`` and the approved non-compounding 1% of
+    original Chitti value surcharge from the period after a member lifts.
+    The optional pre/post pair remains readable for already stored plan
+    snapshots; those historical snapshots keep their original calculation.
     """
 
     type: str = "LIFT_BASED"
-    pre_lift_amount: Decimal = Field(..., gt=0, description="Amount paid before lifting")
-    post_lift_amount: Decimal = Field(..., gt=0, description="Amount paid after lifting")
+    regular_amount: Optional[Decimal] = Field(None, gt=0, description="Regular contribution per period")
+    pre_lift_amount: Optional[Decimal] = Field(None, gt=0, description="Legacy amount paid before lifting")
+    post_lift_amount: Optional[Decimal] = Field(None, gt=0, description="Legacy amount paid after lifting")
+
+    @model_validator(mode="after")
+    def validate_lift_amounts(self):
+        if self.regular_amount is not None:
+            if self.pre_lift_amount is not None or self.post_lift_amount is not None:
+                raise ValueError("Use regular_amount for the approved 1% lift rule; do not combine it with legacy pre/post amounts")
+        elif self.pre_lift_amount is None or self.post_lift_amount is None:
+            raise ValueError("Lift-based rules require regular_amount or both legacy pre_lift_amount and post_lift_amount")
+        return self
 
 
 # Union type for contribution rules

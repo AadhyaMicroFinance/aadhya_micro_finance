@@ -22,7 +22,6 @@ from app.core.security import hash_password, create_access_token
 # the postgres service name instead of localhost).
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",
-    "postgresql+asyncpg://postgres:postgres@localhost:5432/finance_chitti_test",
 )
 
 
@@ -34,12 +33,24 @@ TEST_DATABASE_URL = os.getenv(
 
 def _assert_scratch_database() -> None:
     """Refuse to touch anything but a dedicated *_test database."""
+    if not TEST_DATABASE_URL:
+        raise RuntimeError(
+            "TEST_DATABASE_URL must be explicitly configured to a dedicated disposable test database."
+        )
     database = TEST_DATABASE_URL.rsplit("/", 1)[-1]
-    if not database.endswith("_test"):
+    if not database.endswith("_test") or "?" in database:
         raise RuntimeError(
             f"Refusing to reset schema of non-test database '{database}'. "
             "TEST_DATABASE_URL must point at a *_test database."
         )
+    from urllib.parse import urlparse
+    target = urlparse(TEST_DATABASE_URL)
+    from app.config import get_settings
+    development = urlparse(get_settings().DATABASE_URL)
+    if (target.hostname, target.port, target.path) == (
+        development.hostname, development.port, development.path
+    ):
+        raise RuntimeError("TEST_DATABASE_URL resolves to the configured development database.")
 
 
 @pytest_asyncio.fixture

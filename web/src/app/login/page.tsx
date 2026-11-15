@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/hooks/useAuth";
+import BrandLockup from "@/components/branding/BrandLockup";
 import { Eye, EyeOff, ArrowRight } from "lucide-react";
 
 export default function LoginPage() {
@@ -39,21 +40,7 @@ export default function LoginPage() {
 
       <div className="relative w-full max-w-md px-6">
         {/* Company branding */}
-        <div className="mb-8 text-center">
-          <div className="mb-4 inline-flex h-14 w-14 items-center justify-center rounded-2xl bg-brand-600 shadow-lg shadow-brand-600/30">
-            <span className="text-2xl font-bold text-white">₹</span>
-          </div>
-          <h1 className="text-xl font-bold uppercase leading-tight tracking-wide text-white sm:text-2xl">
-            Aadhya Micro Finance
-            <span className="block text-sm font-semibold tracking-[0.18em] text-brand-200 sm:text-base">
-              Private Limited
-            </span>
-          </h1>
-          <p className="mt-3 text-xs font-semibold uppercase tracking-[0.22em] text-surface-300">
-            Aadhya Micro Finance
-          </p>
-          <p className="mt-1 text-sm text-surface-400">Powered by Vayu</p>
-        </div>
+        <BrandLockup variant="login" className="mb-8" />
 
         {/* Login Card */}
         <div className="rounded-2xl border border-white/10 bg-white/5 backdrop-blur-xl p-8 shadow-2xl">

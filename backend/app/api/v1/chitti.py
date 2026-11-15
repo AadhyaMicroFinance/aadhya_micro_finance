@@ -13,8 +13,11 @@ from app.schemas.chitti import (
     AgreementConfirm,
     ChittiContributionPayment,
     ChittiCreate,
+    ChittiDirectPreviewRequest,
     ChittiMemberAdd,
     ChittiPayoutRecord,
+    ChittiLiftRecord,
+    ChittiLiftReversal,
     ChittiPlanCreate,
     ChittiPlanUpdate,
     ChittiPreviewRequest,
@@ -22,6 +25,7 @@ from app.schemas.chitti import (
     MemberCancel,
 )
 from app.schemas.common import ApiResponse, PaginatedResponse
+from app.schemas.payment import PaymentReversalRequest
 from app.services.chitti_service import ChittiService
 
 router = APIRouter()
@@ -137,6 +141,10 @@ async def preview_plan(
         plan_id=plan_id,
         start_date=body.start_date,
         member_count=body.member_count,
+        frequency=body.frequency,
+        duration=body.duration,
+        total_value=body.total_value,
+        contribution_rules=body.contribution_rules,
     )
     return ApiResponse(data=preview)
 
@@ -157,6 +165,16 @@ async def create_chitti(
         data=body.model_dump(), created_by=current_user.id
     )
     return ApiResponse(data=chitti)
+
+
+@router.post("/preview", response_model=ApiResponse)
+async def preview_direct_chitti(
+    body: ChittiDirectPreviewRequest,
+    db: DBSession,
+    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+):
+    svc = ChittiService(db)
+    return ApiResponse(data=await svc.preview_direct_chitti(body.model_dump()))
 
 
 @router.get("/", response_model=PaginatedResponse)
@@ -420,7 +438,9 @@ async def confirm_agreement(
     if not agreement:
         raise NotFoundException("Agreement", member_id)
     from uuid import UUID as UUIDType
-    result = await svc.confirm_agreement(UUIDType(agreement["id"]))
+    result = await svc.confirm_agreement(
+        UUIDType(agreement["id"]), created_by=current_user.id
+    )
     return ApiResponse(data=result)
 
 
@@ -492,9 +512,65 @@ async def record_contribution(
     return ApiResponse(data=result)
 
 
+@router.post("/{chitti_id}/transactions/{transaction_id}/reverse", response_model=ApiResponse)
+async def reverse_chitti_contribution(
+    chitti_id: UUID,
+    transaction_id: UUID,
+    body: PaymentReversalRequest,
+    db: DBSession,
+    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_REVERSE),
+):
+    svc = ChittiService(db)
+    result = await svc.reverse_contribution(
+        chitti_id, transaction_id, reason=body.reversal_reason,
+        reversed_by=current_user.id,
+    )
+    return ApiResponse(data=result)
+
+
 # ===========================================================================
 # Payouts
 # ===========================================================================
+
+
+@router.get("/{chitti_id}/lifts", response_model=ApiResponse)
+async def list_lift_events(
+    chitti_id: UUID,
+    db: DBSession,
+    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+):
+    return ApiResponse(data=await ChittiService(db).list_lift_events(chitti_id))
+
+
+@router.post("/{chitti_id}/lifts", response_model=ApiResponse)
+async def record_lift_event(
+    chitti_id: UUID,
+    body: ChittiLiftRecord,
+    db: DBSession,
+    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+):
+    result = await ChittiService(db).record_lift(
+        chitti_id,
+        member_id=body.member_id,
+        period_number=body.period_number,
+        lift_date=body.lift_date,
+        recorded_by=current_user.id,
+    )
+    return ApiResponse(data=result)
+
+
+@router.post("/{chitti_id}/lifts/{lift_id}/reverse", response_model=ApiResponse)
+async def reverse_lift_event(
+    chitti_id: UUID,
+    lift_id: UUID,
+    body: ChittiLiftReversal,
+    db: DBSession,
+    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+):
+    result = await ChittiService(db).reverse_lift(
+        chitti_id, lift_id, reason=body.reversal_reason, reversed_by=current_user.id
+    )
+    return ApiResponse(data=result)
 
 
 @router.get("/{chitti_id}/payouts", response_model=ApiResponse)

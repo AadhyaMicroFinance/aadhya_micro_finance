@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import Link from "next/link";
 import DashboardLayout from "@/components/layout/DashboardLayout";
+import NumericInput from "@/components/ui/NumericInput";
 import { financeApi } from "@/services/finance";
 import { formatCurrency, formatDate, cn, getStatusColor } from "@/lib/utils";
 import Avatar from "@/components/ui/Avatar";
@@ -110,16 +111,16 @@ export default function FinancePage() {
             <form onSubmit={handleCreate} className="space-y-4">
               <div><label className="input-label">Customer ID *</label><input type="text" value={form.customer_id} onChange={(e) => setForm({ ...form, customer_id: e.target.value })} className="input-field" placeholder="UUID" required /></div>
               <div className="grid grid-cols-2 gap-4">
-                <div><label className="input-label">Principal Amount *</label><input type="number" value={form.principal_amount} onChange={(e) => setForm({ ...form, principal_amount: e.target.value })} className="input-field" required /></div>
-                <div><label className="input-label">Interest Rate %</label><input type="number" value={form.interest_rate} onChange={(e) => setForm({ ...form, interest_rate: e.target.value })} className="input-field" /></div>
+                <div><label className="input-label">Principal Amount *</label><NumericInput value={form.principal_amount} onValueChange={(value) => setForm({ ...form, principal_amount: value })} className="input-field" required /></div>
+                <div><label className="input-label">Interest Rate %</label><NumericInput value={form.interest_rate} onValueChange={(value) => setForm({ ...form, interest_rate: value })} className="input-field" /></div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div><label className="input-label">Interest Type</label><select value={form.interest_type} onChange={(e) => setForm({ ...form, interest_type: e.target.value })} className="input-field"><option value="FLAT">Flat</option><option value="REDUCING">Reducing Balance</option></select></div>
-                <div><label className="input-label">Fees</label><input type="number" value={form.fees} onChange={(e) => setForm({ ...form, fees: e.target.value })} className="input-field" /></div>
+                <div><label className="input-label">Fees</label><NumericInput value={form.fees} onValueChange={(value) => setForm({ ...form, fees: value })} className="input-field" /></div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div><label className="input-label">Frequency *</label><select value={form.frequency} onChange={(e) => setForm({ ...form, frequency: e.target.value })} className="input-field"><option value="DAILY">Daily</option><option value="WEEKLY">Weekly</option><option value="MONTHLY">Monthly</option></select></div>
-                <div><label className="input-label">Installments *</label><input type="number" value={form.number_of_installments} onChange={(e) => setForm({ ...form, number_of_installments: e.target.value })} className="input-field" required /></div>
+                <div><label className="input-label">Installments *</label><NumericInput integer value={form.number_of_installments} onValueChange={(value) => setForm({ ...form, number_of_installments: value })} className="input-field" required /></div>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div><label className="input-label">Start Date *</label><input type="date" value={form.start_date} onChange={(e) => setForm({ ...form, start_date: e.target.value })} className="input-field" required /></div>

@@ -30,8 +30,14 @@ def _metadata():
 
 
 def upgrade() -> None:
-    _metadata().create_all(bind=op.get_bind())
+    metadata = _metadata()
+    # This baseline predates the explicit lift-event feature. Keep that table
+    # in its own additive revision so a fresh upgrade does not create it twice.
+    tables = [table for table in metadata.sorted_tables if table.name != "chitti_lift_events"]
+    metadata.create_all(bind=op.get_bind(), tables=tables)
 
 
 def downgrade() -> None:
-    _metadata().drop_all(bind=op.get_bind())
+    metadata = _metadata()
+    tables = [table for table in metadata.sorted_tables if table.name != "chitti_lift_events"]
+    metadata.drop_all(bind=op.get_bind(), tables=tables)

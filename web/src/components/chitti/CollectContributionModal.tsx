@@ -5,6 +5,7 @@ import { CheckCircle2, IndianRupee, X } from "lucide-react";
 import { chittiApi, type ChittiContribution } from "@/services/chitti";
 import { getApiErrorMessage } from "@/services/api-client";
 import { formatCurrency } from "@/lib/utils";
+import NumericInput from "@/components/ui/NumericInput";
 
 /**
  * One collection flow for the whole Chitti module.
@@ -164,13 +165,12 @@ export default function CollectContributionModal({
                     size={16}
                     className="absolute left-3 top-1/2 -translate-y-1/2 text-surface-400"
                   />
-                  <input
+                  <NumericInput
                     className="input-field pl-9"
-                    type="number"
                     min="0"
                     step="0.01"
                     value={amount}
-                    onChange={(e) => setAmount(e.target.value)}
+                    onValueChange={setAmount}
                   />
                 </div>
                 {selected && (

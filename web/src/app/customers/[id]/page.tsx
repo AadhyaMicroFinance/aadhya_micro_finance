@@ -148,29 +148,52 @@ export default function CustomerDetailPage() {
         {/* Payment History */}
         <div className="card">
           <h3 className="mb-4 text-lg font-semibold text-gray-800">Payment History</h3>
+          {ledger?.payment_summary && (
+            <div className="mb-4 flex flex-wrap gap-4 text-sm text-gray-600">
+              <span>Transactions: <strong className="text-gray-900">{ledger.payment_summary.transaction_count}</strong></span>
+              <span>Successful payments: <strong className="text-gray-900">{ledger.payment_summary.successful_transaction_count}</strong></span>
+              <span>Paid total: <strong className="text-gray-900">{formatCurrency(ledger.payment_summary.successful_paid_total)}</strong></span>
+            </div>
+          )}
           {ledger?.payment_history && ledger.payment_history.length > 0 ? (
             <div className="overflow-x-auto">
               <table className="w-full text-left text-sm">
                 <thead className="border-b border-gray-200 text-xs font-medium uppercase text-gray-500">
                   <tr>
                     <th className="px-3 py-2">Transaction ID</th>
+                    <th className="px-3 py-2">Source</th>
+                    <th className="px-3 py-2">Customer / Member</th>
+                    <th className="px-3 py-2">Account / Chitti</th>
+                    <th className="px-3 py-2">Period</th>
                     <th className="px-3 py-2">Amount</th>
                     <th className="px-3 py-2">Method</th>
                     <th className="px-3 py-2">Date</th>
                     <th className="px-3 py-2">Status</th>
+                    <th className="px-3 py-2">Reversal</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {ledger.payment_history.map((p) => (
-                    <tr key={p.id}>
+                    <tr key={`${p.source}-${p.id}`}>
                       <td className="px-3 py-2 font-mono text-xs">{p.transaction_id}</td>
+                      <td className="px-3 py-2">{p.source}</td>
+                      <td className="px-3 py-2">{p.customer_name}</td>
+                      <td className="px-3 py-2">{p.account_name || '—'}</td>
+                      <td className="px-3 py-2">{p.period_number == null ? '—' : `${p.source === 'FINANCE' ? 'Installment' : 'Period'} ${p.period_number}`}</td>
                       <td className="px-3 py-2 font-medium">{formatCurrency(p.amount)}</td>
-                      <td className="px-3 py-2">{p.payment_method}</td>
-                      <td className="px-3 py-2">{formatDate(p.payment_date)}</td>
+                      <td className="px-3 py-2">{p.payment_method || '—'}</td>
+                      <td className="px-3 py-2">{p.payment_date ? formatDate(p.payment_date) : '—'}</td>
                       <td className="px-3 py-2">
                         <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getStatusColor(p.status)}`}>
                           {p.status}
                         </span>
+                      </td>
+                      <td className="px-3 py-2 text-xs">
+                        {p.is_reversal
+                          ? `Reversal${p.reversal_of_transaction_id ? ` of ${p.reversal_of_transaction_id}` : ''}`
+                          : p.reversed_by_transaction_id
+                            ? `Reversed by ${p.reversed_by_transaction_id}`
+                            : '—'}
                       </td>
                     </tr>
                   ))}

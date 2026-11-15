@@ -224,19 +224,24 @@ class TestBalanceCalculation:
 
         p2 = MagicMock()
         p2.amount = Decimal("2000")
-        p1.status = "COMPLETED"
+        p2.status = "COMPLETED"
         p2.is_reversal = False
+
+        # The original receipt is retained but marked reversed; the reversal
+        # row is separately retained and must not be counted as paid.
+        p1.status = "REVERSED"
 
         # Reversal of p1
         r1 = MagicMock()
         r1.amount = Decimal("2000")
         r1.status = "REVERSED"
+        r1.is_reversal = True
 
         balance = calc.calculate_balance(
             Decimal("50000"), [p1, p2, r1]
         )
-        assert balance["total_paid"] == Decimal("4000")
-        assert balance["outstanding"] == Decimal("46000")
+        assert balance["total_paid"] == Decimal("2000")
+        assert balance["outstanding"] == Decimal("48000")
 
     def test_zero_payments(self, calc):
         """No payments yet."""

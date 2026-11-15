@@ -34,6 +34,29 @@
   }
 }
 
+@media print {
+  body * {
+    visibility: hidden !important;
+  }
+
+  .payment-receipt-print,
+  .payment-receipt-print *,
+  .report-print,
+  .report-print * {
+    visibility: visible !important;
+  }
+
+  .payment-receipt-print,
+  .report-print {
+    display: block !important;
+    position: absolute;
+    inset: 0 auto auto 0;
+    width: 100%;
+    max-width: none !important;
+    border: 0 !important;
+  }
+}
+
 @layer components {
   /* ============ Buttons ============ */
   .btn-primary {

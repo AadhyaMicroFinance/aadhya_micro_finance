@@ -169,15 +169,13 @@ class CalculationEngine:
         Calculate balance from transaction ledger.
         Never rely on stored balance values.
         """
-        total_paid = sum(
+        # Reversals mark the original transaction REVERSED and add a separate
+        # reversal row. Count only completed original receipts here: counting a
+        # reversed original and subtracting its reversal would net it twice.
+        effective_paid = sum(
             p.amount for p in payments
             if p.status == "COMPLETED" and not p.is_reversal
         )
-        total_reversed = sum(
-            p.amount for p in payments
-            if p.status == "REVERSED"
-        )
-        effective_paid = total_paid - total_reversed
         outstanding = total_payable - effective_paid
 
         return {
