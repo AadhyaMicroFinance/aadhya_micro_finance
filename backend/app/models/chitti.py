@@ -17,6 +17,7 @@ from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     Enum,
@@ -292,6 +293,11 @@ class ChittiPeriodSchedule(BaseModel):
     __tablename__ = "chitti_period_schedule"
     __table_args__ = (
         UniqueConstraint("chitti_id", "period_number", name="uq_chitti_period"),
+        CheckConstraint("expected_collection >= 0", name="ck_chitti_period_expected_collection_nonnegative"),
+        CheckConstraint("actual_collection >= 0", name="ck_chitti_period_actual_collection_nonnegative"),
+        CheckConstraint("pending_collection >= 0", name="ck_chitti_period_pending_collection_nonnegative"),
+        CheckConstraint("expected_payout >= 0", name="ck_chitti_period_expected_payout_nonnegative"),
+        CheckConstraint("actual_payout >= 0", name="ck_chitti_period_actual_payout_nonnegative"),
     )
 
     chitti_id: Mapped[uuid.UUID] = mapped_column(
@@ -343,6 +349,9 @@ class ChittiMemberContribution(BaseModel):
             "chitti_id", "member_id", "period_number",
             name="uq_chitti_member_period",
         ),
+        CheckConstraint("expected_amount >= 0", name="ck_chitti_contribution_expected_amount_nonnegative"),
+        CheckConstraint("paid_amount >= 0", name="ck_chitti_contribution_paid_amount_nonnegative"),
+        CheckConstraint("remaining_amount >= 0", name="ck_chitti_contribution_remaining_amount_nonnegative"),
     )
 
     chitti_id: Mapped[uuid.UUID] = mapped_column(
@@ -393,6 +402,14 @@ class ChittiPayout(BaseModel):
         UniqueConstraint(
             "chitti_id", "member_id", "period_number",
             name="uq_chitti_payout_member_period",
+        ),
+        CheckConstraint("gross_payout >= 0", name="ck_chitti_payout_gross_nonnegative"),
+        CheckConstraint("discount_amount >= 0", name="ck_chitti_payout_discount_nonnegative"),
+        CheckConstraint("fee_amount >= 0", name="ck_chitti_payout_fee_nonnegative"),
+        CheckConstraint("net_payout >= 0", name="ck_chitti_payout_net_nonnegative"),
+        CheckConstraint(
+            "net_payout = gross_payout - discount_amount - fee_amount",
+            name="ck_chitti_payout_net_arithmetic",
         ),
     )
 
@@ -511,6 +528,9 @@ class ChittiTransaction(BaseModel):
     """Immutable financial ledger for all chitti money movement."""
 
     __tablename__ = "chitti_transactions"
+    __table_args__ = (
+        CheckConstraint("amount >= 0", name="ck_chitti_transaction_amount_nonnegative"),
+    )
 
     chitti_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
