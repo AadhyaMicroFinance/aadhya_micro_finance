@@ -100,6 +100,15 @@ class ChittiMemberRepository(BaseRepository[ChittiMember]):
     def __init__(self, session: AsyncSession):
         super().__init__(ChittiMember, session)
 
+    async def get_by_id_for_update(self, member_id: UUID) -> Optional[ChittiMember]:
+        result = await self.session.execute(
+            select(ChittiMember)
+            .where(ChittiMember.id == member_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_chitti_id(self, chitti_id: UUID) -> list[ChittiMember]:
         result = await self.session.execute(
             select(ChittiMember)
@@ -236,6 +245,20 @@ class ChittiPeriodScheduleRepository(BaseRepository[ChittiPeriodSchedule]):
         )
         return result.scalar_one_or_none()
 
+    async def get_by_period_for_update(
+        self, chitti_id: UUID, period_number: int
+    ) -> Optional[ChittiPeriodSchedule]:
+        result = await self.session.execute(
+            select(ChittiPeriodSchedule)
+            .where(
+                ChittiPeriodSchedule.chitti_id == chitti_id,
+                ChittiPeriodSchedule.period_number == period_number,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
     async def get_next_upcoming(self, chitti_id: UUID) -> Optional[ChittiPeriodSchedule]:
         result = await self.session.execute(
             select(ChittiPeriodSchedule)
@@ -316,6 +339,15 @@ class ChittiLiftEventRepository(BaseRepository[ChittiLiftEvent]):
     def __init__(self, session: AsyncSession):
         super().__init__(ChittiLiftEvent, session)
 
+    async def get_by_id_for_update(self, lift_id: UUID) -> Optional[ChittiLiftEvent]:
+        result = await self.session.execute(
+            select(ChittiLiftEvent)
+            .where(ChittiLiftEvent.id == lift_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
     async def get_by_chitti_id(self, chitti_id: UUID) -> list[ChittiLiftEvent]:
         result = await self.session.execute(
             select(ChittiLiftEvent)
@@ -376,6 +408,21 @@ class ChittiPayoutRepository(BaseRepository[ChittiPayout]):
         )
         return list(result.scalars().all())
 
+    async def get_by_chitti_member_period_for_update(
+        self, chitti_id: UUID, member_id: UUID, period_number: int
+    ) -> Optional[ChittiPayout]:
+        result = await self.session.execute(
+            select(ChittiPayout)
+            .where(
+                ChittiPayout.chitti_id == chitti_id,
+                ChittiPayout.member_id == member_id,
+                ChittiPayout.period_number == period_number,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
 
 # ---------------------------------------------------------------------------
 # Transaction Ledger
@@ -407,5 +454,14 @@ class ChittiTransactionRepository(BaseRepository[ChittiTransaction]):
             select(ChittiTransaction).where(
                 ChittiTransaction.idempotency_key == key
             )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_id_for_update(self, transaction_id: UUID) -> Optional[ChittiTransaction]:
+        result = await self.session.execute(
+            select(ChittiTransaction)
+            .where(ChittiTransaction.id == transaction_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()

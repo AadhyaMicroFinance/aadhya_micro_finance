@@ -271,6 +271,7 @@ class ChittiPayoutRecord(BaseModel):
     fee_amount: Decimal = Field(default=Decimal("0"), ge=0)
     net_payout: Decimal = Field(..., ge=0)
     payout_method: str = Field(..., pattern=r"^(CASH|UPI|BANK_TRANSFER|OTHER)$")
+    idempotency_key: Optional[str] = Field(None, min_length=1, max_length=100)
 
 
 class ChittiLiftRecord(BaseModel):

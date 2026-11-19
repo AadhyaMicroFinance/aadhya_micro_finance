@@ -297,9 +297,7 @@ class AgreementService:
                     member.id,
                     member.member_number,
                     chitti.start_date,
-                    member_lift_period=engine.lift_period_for_member(
-                        member.member_number, member.payout_order
-                    ),
+                    member_lift_period=None,
                 )
                 for entry in entries:
                     entry["chitti_id"] = chitti.id

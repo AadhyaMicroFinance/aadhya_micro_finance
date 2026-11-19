@@ -601,6 +601,7 @@ async def record_payout(
         fee_amount=body.fee_amount,
         net_payout=body.net_payout,
         payout_method=body.payout_method,
+        idempotency_key=body.idempotency_key,
         created_by=current_user.id,
     )
     return ApiResponse(data=result)
