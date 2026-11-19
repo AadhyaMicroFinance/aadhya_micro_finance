@@ -447,6 +447,8 @@ async def test_lift_management_is_separate_from_payout_and_reversible(client, te
     customer = (await _make_customers(client, headers, 1))[0]
     member = await _enroll(client, headers, chitti["id"], customer["id"], 1)
     await _activate_member(client, headers, chitti["id"], member["id"])
+    started = await client.post(f"/api/v1/chitti/{chitti['id']}/start", headers=headers)
+    assert started.status_code == 200, started.text
 
     before = (await client.get(
         f"/api/v1/chitti/{chitti['id']}/schedule", headers=headers
@@ -538,6 +540,11 @@ async def test_lift_management_is_separate_from_payout_and_reversible(client, te
     assert member_after_reversal["lifted"] is False
     assert member_after_reversal["total_paid"] == 5000
     assert member_after_reversal["outstanding"] == 15000
+    schedule_after_lift_reversal = (await client.get(
+        f"/api/v1/chitti/{chitti['id']}/schedule", headers=headers
+    )).json()["data"]
+    assert [float(row["expected_collection"]) for row in schedule_after_lift_reversal] == [5000] * 4
+    assert [float(row["pending_collection"]) for row in schedule_after_lift_reversal] == [0.0, 5000.0, 5000.0, 5000.0]
 
 
 @pytest.mark.asyncio
@@ -559,6 +566,8 @@ async def test_partial_contribution_settles_only_remaining_balance(client, test_
     customer = (await _make_customers(client, headers, 1))[0]
     member = await _enroll(client, headers, chitti_id, customer["id"], 1)
     await _activate_member(client, headers, chitti_id, member["id"])
+    started = await client.post(f"/api/v1/chitti/{chitti_id}/start", headers=headers)
+    assert started.status_code == 200, started.text
     base = {"member_id": member["id"], "period_number": 1, "payment_method": "UPI", "payment_date": date.today().isoformat()}
     first = await client.post(f"/api/v1/chitti/{chitti_id}/contributions", json={
         **base, "amount": "40.00", "idempotency_key": "partial-40",
@@ -602,6 +611,8 @@ async def test_concurrent_full_payments_cannot_overcollect(client, test_user, te
     customer = (await _make_customers(client, headers, 1))[0]
     member = await _enroll(client, headers, chitti_id, customer["id"], 1)
     await _activate_member(client, headers, chitti_id, member["id"])
+    started = await client.post(f"/api/v1/chitti/{chitti_id}/start", headers=headers)
+    assert started.status_code == 200, started.text
     await db_session.commit()
 
     sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
@@ -669,6 +680,8 @@ async def test_two_chitti_payments_sync_history_schedule_progress_and_reports(cl
         members.append(member)
     for member in members:
         await _activate_member(client, headers, chitti_id, member["id"])
+    started = await client.post(f"/api/v1/chitti/{chitti_id}/start", headers=headers)
+    assert started.status_code == 200, started.text
 
     for index, member in enumerate(members, start=1):
         response = await client.post(

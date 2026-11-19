@@ -11,14 +11,29 @@ any finance account, and that a retried save cannot double-count money.
 
 import math
 import csv
+import asyncio
 from io import BytesIO, StringIO
 from datetime import date
+from decimal import Decimal
+from uuid import UUID
 
 import pytest
 from openpyxl import load_workbook
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.models.audit import AuditLog
 from app.models.payment import PaymentTransaction
+from app.models.chitti import (
+    ChittiMember,
+    ChittiMemberContribution,
+    ChittiPeriodSchedule,
+    ChittiPayout,
+    ChittiTransaction,
+    ChittiLiftEvent,
+)
+from app.repositories.chitti_repo import ChittiTransactionRepository
+from app.repositories.audit_repo import AuditLogRepository
+from app.services.chitti_service import ChittiService
 
 PLAN = {
     "name": "Report Consistency Plan",
@@ -52,6 +67,15 @@ async def _customer(client, headers, index):
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["data"]
+
+
+async def _activate_member(client, headers, chitti_id, member_id):
+    for action in ("generate", "print", "confirm"):
+        resp = await client.post(
+            f"/api/v1/chitti/{chitti_id}/members/{member_id}/agreement/{action}",
+            headers=headers,
+        )
+        assert resp.status_code == 200, resp.text
 
 
 async def _running_chitti(client, headers, members=2):
@@ -97,6 +121,53 @@ async def _running_chitti(client, headers, members=2):
                 confirmation = resp.json()["data"]
     assert confirmation["chitti_auto_started"] is False
     assert confirmation["chitti_status"] == "DRAFT"
+    started = await client.post(f"/api/v1/chitti/{chitti['id']}/start", headers=headers)
+    assert started.status_code == 200, started.text
+    assert started.json()["data"]["status"] == "RUNNING"
+    return chitti, enrolled
+
+
+async def _running_lift_chitti(client, headers, member_count=2):
+    plan = (
+        await client.post("/api/v1/chitti/plans", json={
+            "name": "P0.3 Concurrent Lift Plan",
+            "chitti_type": "LIFT_BASED",
+            "total_value": "120000.00",
+            "member_count": member_count,
+            "frequency": "DAILY",
+            "duration": 4,
+            "contribution_rules": {
+                "type": "LIFT_BASED",
+                "regular_amount": "5000.00",
+            },
+            "payout_rules": {
+                "type": "SCHEDULED",
+                "payout_order": "MEMBER_NUMBER",
+            },
+        }, headers=headers)
+    ).json()["data"]
+    chitti = (
+        await client.post("/api/v1/chitti/", json={
+            "plan_id": plan["id"],
+            "name": "P0.3 Concurrent Lift Chitti",
+            "member_count": member_count,
+            "start_date": date.today().isoformat(),
+        }, headers=headers)
+    ).json()["data"]
+
+    enrolled = []
+    for index in range(1, member_count + 1):
+        customer = await _customer(client, headers, index + 20)
+        member = (
+            await client.post(
+                f"/api/v1/chitti/{chitti['id']}/members",
+                json={"customer_id": customer["id"], "payout_order": index},
+                headers=headers,
+            )
+        ).json()["data"]
+        enrolled.append(member)
+        await _activate_member(client, headers, chitti["id"], member["id"])
+
     started = await client.post(f"/api/v1/chitti/{chitti['id']}/start", headers=headers)
     assert started.status_code == 200, started.text
     assert started.json()["data"]["status"] == "RUNNING"
@@ -261,6 +332,1478 @@ async def test_chitti_partial_reversal_restores_ledger_and_audit(client, test_us
         select(AuditLog).where(AuditLog.action == "CHITTI_CONTRIBUTION_REVERSED")
     )).scalars().all())
     assert len(audit) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_chitti_reversals_create_one_reversal(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    today = date.today().isoformat()
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "400.00",
+            "payment_method": "CASH",
+            "payment_date": today,
+            "idempotency_key": "concurrent-reversal-origin",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    transaction_id = contribution.json()["data"]["transaction_id"]
+    await db_session.commit()
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def reverse(label: str):
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).reverse_contribution(
+                    UUID(chitti["id"]),
+                    UUID(transaction_id),
+                    reason=f"concurrent {label}",
+                    reversed_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    results = await asyncio.gather(reverse("a"), reverse("b"))
+    assert sum(isinstance(value, dict) for value in results) == 2
+    assert sum(value.get("duplicate") is False for value in results if isinstance(value, dict)) == 1
+    assert sum(value.get("duplicate") is True for value in results if isinstance(value, dict)) == 1
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+                ChittiTransaction.transaction_type == "REVERSAL",
+            )
+        )).scalars().all())
+        assert len(ledger) == 1
+
+        contribution_rows = list((await fresh.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                ChittiMemberContribution.period_number == 1,
+            )
+        )).scalars().all())
+        assert len(contribution_rows) == 1
+        assert contribution_rows[0].paid_amount == Decimal("0")
+        assert contribution_rows[0].remaining_amount == Decimal("1000")
+
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_CONTRIBUTION_REVERSED")
+        )).scalars().all())
+        assert len(audit) == 1
+
+
+@pytest.mark.asyncio
+async def test_reversal_concurrent_with_collection_preserves_totals(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    today = date.today().isoformat()
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "400.00",
+            "payment_method": "CASH",
+            "payment_date": today,
+            "idempotency_key": "reversal-vs-collection-origin",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    transaction_id = contribution.json()["data"]["transaction_id"]
+    await db_session.commit()
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def reverse():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).reverse_contribution(
+                    UUID(chitti["id"]),
+                    UUID(transaction_id),
+                    reason="reversal race",
+                    reversed_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    async def collect():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_contribution(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    amount=Decimal("600.00"),
+                    payment_method="UPI",
+                    payment_date=date.today(),
+                    idempotency_key="reversal-vs-collection-600",
+                    created_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    results = await asyncio.gather(reverse(), collect())
+    assert all(isinstance(value, dict) for value in results)
+    reverse_result, collection_result = results
+    assert reverse_result["duplicate"] is False
+    assert collection_result["duplicate"] is False
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        member_row = (
+            await fresh.execute(
+                select(ChittiMemberContribution).where(
+                    ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                    ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                )
+            )
+        ).scalars().all()
+        assert sum((row.paid_amount for row in member_row), Decimal("0")) == Decimal("600")
+        assert sum((row.remaining_amount for row in member_row), Decimal("0")) == Decimal("9400")
+
+        schedule = (
+            await fresh.execute(
+                select(ChittiPeriodSchedule).where(
+                    ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+                    ChittiPeriodSchedule.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert schedule.actual_collection == Decimal("600")
+        assert schedule.pending_collection == Decimal("400")
+
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+                ChittiTransaction.period_number == 1,
+            )
+        )).scalars().all())
+        assert len(ledger) == 3
+        assert sum(row.transaction_type == "CONTRIBUTION" for row in ledger) == 2
+        assert sum(row.transaction_type == "REVERSAL" for row in ledger) == 1
+
+
+@pytest.mark.asyncio
+async def test_reversal_rejects_insufficient_balance_and_invalid_type(
+    client, test_user, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+
+    genuine = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "400.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "genuine-insufficient-reversal-origin",
+        },
+        headers=headers,
+    )
+    assert genuine.status_code == 200, genuine.text
+    genuine_transaction_id = genuine.json()["data"]["transaction_id"]
+    contribution_row = (
+        await db_session.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                ChittiMemberContribution.period_number == 1,
+            )
+        )
+    ).scalar_one()
+    contribution_row.paid_amount = Decimal("100")
+    contribution_row.remaining_amount = Decimal("900")
+    await db_session.flush()
+
+    insufficient_response = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/transactions/{genuine_transaction_id}/reverse",
+        json={"reversal_reason": "balance does not support reversal"},
+        headers=headers,
+    )
+    assert insufficient_response.status_code == 400
+    assert insufficient_response.json()["error"]["code"] == "BAD_REQUEST"
+
+    invalid = ChittiTransaction(
+        chitti_id=UUID(chitti["id"]),
+        transaction_type="PAYOUT",
+        member_id=UUID(members[0]["id"]),
+        amount=Decimal("100"),
+        payment_method="CASH",
+        period_number=1,
+        idempotency_key="invalid-reversal-type",
+    )
+    db_session.add(invalid)
+    await db_session.flush()
+
+    response = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/transactions/{invalid.id}/reverse",
+        json={"reversal_reason": "invalid transaction type"},
+        headers=headers,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "BAD_REQUEST"
+
+
+@pytest.mark.asyncio
+async def test_repeated_reversal_uses_separate_sessions_without_second_mutation(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "400.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "separate-session-reversal-origin",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    transaction_id = contribution.json()["data"]["transaction_id"]
+    await db_session.commit()
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with sessions() as first:
+        first_result = await ChittiService(first).reverse_contribution(
+            UUID(chitti["id"]),
+            UUID(transaction_id),
+            reason="first reversal",
+            reversed_by=test_user["user"].id,
+        )
+        await first.commit()
+
+    async with sessions() as repeated:
+        repeated_result = await ChittiService(repeated).reverse_contribution(
+            UUID(chitti["id"]),
+            UUID(transaction_id),
+            reason="repeated reversal",
+            reversed_by=test_user["user"].id,
+        )
+        await repeated.commit()
+
+    assert first_result["duplicate"] is False
+    assert repeated_result["duplicate"] is True
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+            )
+        )).scalars().all())
+        assert sum(row.transaction_type == "CONTRIBUTION" for row in ledger) == 1
+        assert sum(row.transaction_type == "REVERSAL" for row in ledger) == 1
+
+        contribution_row = (
+            await fresh.execute(
+                select(ChittiMemberContribution).where(
+                    ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                    ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                    ChittiMemberContribution.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert contribution_row.paid_amount == Decimal("0")
+        assert contribution_row.remaining_amount == Decimal("1000")
+
+        member_row = (
+            await fresh.execute(
+                select(ChittiMember).where(
+                    ChittiMember.chitti_id == UUID(chitti["id"]),
+                    ChittiMember.id == UUID(members[0]["id"]),
+                )
+            )
+        ).scalar_one()
+        assert member_row.total_paid_amount == Decimal("0")
+        assert member_row.outstanding_amount == Decimal("10000")
+
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_CONTRIBUTION_REVERSED")
+        )).scalars().all())
+        assert len(audit) == 1
+
+
+@pytest.mark.asyncio
+async def test_reversal_rolls_back_after_controlled_post_lock_failure(
+    client, test_user, test_engine, db_session, monkeypatch
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "400.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "rollback-reversal-origin",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    transaction_id = contribution.json()["data"]["transaction_id"]
+    await db_session.commit()
+
+    async def fail_reversal_ledger_create(self, **kwargs):
+        raise RuntimeError("controlled failure after reversal locks and balance validation")
+
+    monkeypatch.setattr(
+        ChittiTransactionRepository,
+        "create",
+        fail_reversal_ledger_create,
+    )
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with sessions() as session:
+        with pytest.raises(RuntimeError, match="controlled failure"):
+            await ChittiService(session).reverse_contribution(
+                UUID(chitti["id"]),
+                UUID(transaction_id),
+                reason="test rollback",
+                reversed_by=test_user["user"].id,
+            )
+        await session.rollback()
+
+    monkeypatch.undo()
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        contribution_row = (
+            await fresh.execute(
+                select(ChittiMemberContribution).where(
+                    ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                    ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                    ChittiMemberContribution.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert contribution_row.paid_amount == Decimal("400")
+        assert contribution_row.remaining_amount == Decimal("600")
+        assert contribution_row.status == "PARTIALLY_PAID"
+
+        schedule = (
+            await fresh.execute(
+                select(ChittiPeriodSchedule).where(
+                    ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+                    ChittiPeriodSchedule.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert schedule.actual_collection == Decimal("400")
+        assert schedule.pending_collection == Decimal("600")
+
+        member_row = (
+            await fresh.execute(
+                select(ChittiMember).where(
+                    ChittiMember.chitti_id == UUID(chitti["id"]),
+                    ChittiMember.id == UUID(members[0]["id"]),
+                )
+            )
+        ).scalar_one()
+        assert member_row.total_paid_amount == Decimal("400")
+        assert member_row.outstanding_amount == Decimal("9600")
+
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+            )
+        )).scalars().all())
+        assert sum(row.transaction_type == "CONTRIBUTION" for row in ledger) == 1
+        assert sum(row.transaction_type == "REVERSAL" for row in ledger) == 0
+
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_CONTRIBUTION_REVERSED")
+        )).scalars().all())
+        assert len(audit) == 0
+
+
+@pytest.mark.asyncio
+async def test_normal_and_duplicate_payout_posting(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    payout_body = {
+        "member_id": members[0]["id"],
+        "period_number": 1,
+        "gross_payout": "1000.00",
+        "discount_amount": "100.00",
+        "fee_amount": "50.00",
+        "net_payout": "850.00",
+        "payout_method": "CASH",
+        "idempotency_key": "normal-payout-repeat",
+    }
+
+    first = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/payouts",
+        json=payout_body,
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["data"]["duplicate"] is False
+    await db_session.commit()
+
+    repeated = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/payouts",
+        json=payout_body,
+        headers=headers,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["data"]["duplicate"] is True
+    await db_session.commit()
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        payouts = list((await fresh.execute(
+            select(ChittiPayout).where(
+                ChittiPayout.chitti_id == UUID(chitti["id"]),
+                ChittiPayout.period_number == 1,
+            )
+        )).scalars().all())
+        assert len(payouts) == 1
+        assert payouts[0].gross_payout == Decimal("1000.00")
+        assert payouts[0].discount_amount == Decimal("100.00")
+        assert payouts[0].fee_amount == Decimal("50.00")
+        assert payouts[0].net_payout == Decimal("850.00")
+
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+                ChittiTransaction.transaction_type == "PAYOUT",
+                ChittiTransaction.period_number == 1,
+            )
+        )).scalars().all())
+        assert len(ledger) == 1
+        assert ledger[0].amount == Decimal("850.00")
+        assert ledger[0].idempotency_key == "normal-payout-repeat"
+
+        schedule = (
+            await fresh.execute(
+                select(ChittiPeriodSchedule).where(
+                    ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+                    ChittiPeriodSchedule.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert schedule.actual_payout == Decimal("850.00")
+
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_PAYOUT_RECORDED")
+        )).scalars().all())
+        assert len(audit) == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_payout_requests_create_one_payout(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    await db_session.commit()
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def payout(label: str):
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_payout(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    gross_payout=Decimal("1000"),
+                    discount_amount=Decimal("100"),
+                    fee_amount=Decimal("50"),
+                    net_payout=Decimal("850"),
+                    payout_method="CASH",
+                    idempotency_key=f"concurrent-payout-{label}",
+                    created_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    results = await asyncio.gather(payout("a"), payout("b"))
+    assert sum(isinstance(value, dict) for value in results) == 2
+    assert sum(value.get("duplicate") is False for value in results if isinstance(value, dict)) == 1
+    assert sum(value.get("duplicate") is True for value in results if isinstance(value, dict)) == 1
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        payouts = list((await fresh.execute(
+            select(ChittiPayout).where(
+                ChittiPayout.chitti_id == UUID(chitti["id"]),
+                ChittiPayout.period_number == 1,
+            )
+        )).scalars().all())
+        assert len(payouts) == 1
+
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+                ChittiTransaction.transaction_type == "PAYOUT",
+                ChittiTransaction.period_number == 1,
+            )
+        )).scalars().all())
+        assert len(ledger) == 1
+
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_PAYOUT_RECORDED")
+        )).scalars().all())
+        assert len(audit) == 1
+
+
+@pytest.mark.asyncio
+async def test_payout_invalid_amount_rejected_without_mutation(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+
+    response = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/payouts",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "gross_payout": "1000.00",
+            "discount_amount": "100.00",
+            "fee_amount": "50.00",
+            "net_payout": "849.99",
+            "payout_method": "CASH",
+            "idempotency_key": "invalid-payout-mismatch",
+        },
+        headers=headers,
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "PAYOUT_AMOUNT_MISMATCH"
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        payouts = list((await fresh.execute(
+            select(ChittiPayout).where(ChittiPayout.chitti_id == UUID(chitti["id"]))
+        )).scalars().all())
+        assert payouts == []
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+                ChittiTransaction.transaction_type == "PAYOUT",
+            )
+        )).scalars().all())
+        assert ledger == []
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_PAYOUT_RECORDED")
+        )).scalars().all())
+        assert audit == []
+
+
+@pytest.mark.asyncio
+async def test_payout_rolls_back_after_controlled_post_mutation_failure(
+    client, test_user, test_engine, db_session, monkeypatch
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    await db_session.commit()
+
+    async def fail_payout_ledger_create(self, **kwargs):
+        raise RuntimeError("controlled payout rollback failure")
+
+    from app.repositories.chitti_repo import ChittiTransactionRepository
+    monkeypatch.setattr(
+        ChittiTransactionRepository,
+        "create",
+        fail_payout_ledger_create,
+    )
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with sessions() as session:
+        with pytest.raises(RuntimeError, match="controlled payout rollback"):
+            await ChittiService(session).record_payout(
+                UUID(chitti["id"]),
+                member_id=members[0]["id"],
+                period_number=1,
+                gross_payout=Decimal("1000"),
+                discount_amount=Decimal("100"),
+                fee_amount=Decimal("50"),
+                net_payout=Decimal("850"),
+                payout_method="CASH",
+                idempotency_key="rollback-payout",
+                created_by=test_user["user"].id,
+            )
+        await session.rollback()
+
+    monkeypatch.undo()
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        payouts = list((await fresh.execute(
+            select(ChittiPayout).where(ChittiPayout.chitti_id == UUID(chitti["id"]))
+        )).scalars().all())
+        assert payouts == []
+
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+                ChittiTransaction.transaction_type == "PAYOUT",
+            )
+        )).scalars().all())
+        assert ledger == []
+
+        schedule = (
+            await fresh.execute(
+                select(ChittiPeriodSchedule).where(
+                    ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+                    ChittiPeriodSchedule.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert schedule.actual_payout == Decimal("0")
+
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_PAYOUT_RECORDED")
+        )).scalars().all())
+        assert audit == []
+
+
+@pytest.mark.asyncio
+async def test_payout_concurrent_with_contribution_preserves_totals(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    await db_session.commit()
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def payout():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_payout(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    gross_payout=Decimal("1000"),
+                    discount_amount=Decimal("100"),
+                    fee_amount=Decimal("50"),
+                    net_payout=Decimal("850"),
+                    payout_method="CASH",
+                    idempotency_key="payout-vs-contribution",
+                    created_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    async def contribution():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_contribution(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    amount=Decimal("400"),
+                    payment_method="UPI",
+                    payment_date=date.today(),
+                    idempotency_key="payout-vs-contribution-400",
+                    created_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    results = await asyncio.gather(payout(), contribution())
+    assert all(isinstance(value, dict) for value in results)
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        payout_rows = list((await fresh.execute(
+            select(ChittiPayout).where(ChittiPayout.chitti_id == UUID(chitti["id"]))
+        )).scalars().all())
+        assert len(payout_rows) == 1
+        assert payout_rows[0].net_payout == Decimal("850")
+
+        schedule = (
+            await fresh.execute(
+                select(ChittiPeriodSchedule).where(
+                    ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+                    ChittiPeriodSchedule.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert schedule.actual_collection == Decimal("400")
+        assert schedule.pending_collection == Decimal("600")
+        assert schedule.actual_payout == Decimal("850")
+
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+            )
+        )).scalars().all())
+        assert sum(row.transaction_type == "CONTRIBUTION" for row in ledger) == 1
+        assert sum(row.transaction_type == "PAYOUT" for row in ledger) == 1
+
+
+@pytest.mark.asyncio
+async def test_payout_concurrent_with_reversal_preserves_totals(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "400.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "payout-vs-reversal-origin",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    transaction_id = contribution.json()["data"]["transaction_id"]
+    await db_session.commit()
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def payout():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_payout(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    gross_payout=Decimal("1000"),
+                    discount_amount=Decimal("100"),
+                    fee_amount=Decimal("50"),
+                    net_payout=Decimal("850"),
+                    payout_method="CASH",
+                    idempotency_key="payout-vs-reversal-payout",
+                    created_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    async def reversal():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).reverse_contribution(
+                    UUID(chitti["id"]),
+                    UUID(transaction_id),
+                    reason="payout reversal race",
+                    reversed_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    results = await asyncio.gather(payout(), reversal())
+    assert all(isinstance(value, dict) for value in results)
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        contribution_row = (
+            await fresh.execute(
+                select(ChittiMemberContribution).where(
+                    ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                    ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                    ChittiMemberContribution.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert contribution_row.paid_amount == Decimal("0")
+        assert contribution_row.remaining_amount == Decimal("1000")
+
+        payout_rows = list((await fresh.execute(
+            select(ChittiPayout).where(ChittiPayout.chitti_id == UUID(chitti["id"]))
+        )).scalars().all())
+        assert len(payout_rows) == 1
+        assert payout_rows[0].net_payout == Decimal("850")
+
+        schedule = (
+            await fresh.execute(
+                select(ChittiPeriodSchedule).where(
+                    ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+                    ChittiPeriodSchedule.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert schedule.actual_payout == Decimal("850")
+        assert schedule.actual_collection == Decimal("0")
+        assert schedule.pending_collection == Decimal("1000")
+
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+            )
+        )).scalars().all())
+        assert sum(row.transaction_type == "CONTRIBUTION" for row in ledger) == 1
+        assert sum(row.transaction_type == "PAYOUT" for row in ledger) == 1
+        assert sum(row.transaction_type == "REVERSAL" for row in ledger) <= 1
+
+
+@pytest.mark.asyncio
+async def test_normal_and_repeated_lift_requests(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    plan = (
+        await client.post("/api/v1/chitti/plans", json={
+            "name": "P0.3 Lift Plan",
+            "chitti_type": "LIFT_BASED",
+            "total_value": "120000.00",
+            "member_count": 1,
+            "frequency": "DAILY",
+            "duration": 4,
+            "contribution_rules": {
+                "type": "LIFT_BASED",
+                "regular_amount": "5000.00",
+            },
+            "payout_rules": {
+                "type": "SCHEDULED",
+                "payout_order": "MEMBER_NUMBER",
+            },
+        }, headers=headers)
+    ).json()["data"]
+    chitti = (
+        await client.post("/api/v1/chitti/", json={
+            "plan_id": plan["id"],
+            "name": "P0.3 Lift Chitti",
+            "member_count": 1,
+            "start_date": date.today().isoformat(),
+        }, headers=headers)
+    ).json()["data"]
+    customer = await _customer(client, headers, 1)
+    member = (
+        await client.post(
+            f"/api/v1/chitti/{chitti['id']}/members",
+            json={"customer_id": customer["id"], "payout_order": 1},
+            headers=headers,
+        )
+    ).json()["data"]
+    await _activate_member(client, headers, chitti["id"], member["id"])
+    started = await client.post(f"/api/v1/chitti/{chitti['id']}/start", headers=headers)
+    assert started.status_code == 200, started.text
+
+    first = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/lifts",
+        json={
+            "member_id": member["id"],
+            "period_number": 1,
+            "lift_date": date.today().isoformat(),
+        },
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    lift_id = first.json()["data"]["id"]
+    await db_session.commit()
+
+    repeated = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/lifts",
+        json={
+            "member_id": member["id"],
+            "period_number": 1,
+            "lift_date": date.today().isoformat(),
+        },
+        headers=headers,
+    )
+    assert repeated.status_code == 409
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        lift_events = list((await fresh.execute(
+            select(ChittiLiftEvent).where(
+                ChittiLiftEvent.chitti_id == UUID(chitti["id"]),
+                ChittiLiftEvent.reversed_at.is_(None),
+            )
+        )).scalars().all())
+        assert len(lift_events) == 1
+        assert str(lift_events[0].id) == lift_id
+
+        member_row = (
+            await fresh.execute(
+                select(ChittiMember).where(
+                    ChittiMember.chitti_id == UUID(chitti["id"]),
+                    ChittiMember.id == UUID(member["id"]),
+                )
+            )
+        ).scalar_one()
+        assert member_row.lifted is True
+        assert member_row.lift_period == 1
+
+        contributions = list((await fresh.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                ChittiMemberContribution.member_id == UUID(member["id"]),
+            )
+        )).scalars().all())
+        assert [row.expected_amount for row in contributions] == [
+            Decimal("5000"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+        assert sum(row.expected_amount for row in contributions) == Decimal("23600")
+
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_LIFT_RECORDED")
+        )).scalars().all())
+        assert len(audit) == 1
+
+        schedules = list((await fresh.execute(
+            select(ChittiPeriodSchedule).where(
+                ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+            ).order_by(ChittiPeriodSchedule.period_number)
+        )).scalars().all())
+        assert [row.expected_collection for row in schedules] == [
+            Decimal("5000"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+        assert all(row.pending_collection == row.expected_collection for row in schedules)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_lift_requests(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_lift_chitti(client, headers, member_count=2)
+    await db_session.commit()
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def lift(member_id: str, period_number: int):
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_lift(
+                    UUID(chitti["id"]),
+                    member_id=member_id,
+                    period_number=period_number,
+                    lift_date=date.today(),
+                    recorded_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    same_member = await asyncio.gather(
+        lift(members[0]["id"], 1),
+        lift(members[0]["id"], 1),
+    )
+    assert sum(isinstance(value, dict) for value in same_member) == 1
+    assert sum(isinstance(value, Exception) for value in same_member) == 1
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        active = list((await fresh.execute(
+            select(ChittiLiftEvent).where(
+                ChittiLiftEvent.chitti_id == UUID(chitti["id"]),
+                ChittiLiftEvent.reversed_at.is_(None),
+            )
+        )).scalars().all())
+        assert len(active) == 1
+
+    different_members = await asyncio.gather(
+        lift(members[0]["id"], 2),
+        lift(members[1]["id"], 2),
+    )
+    assert sum(isinstance(value, Exception) for value in different_members) >= 1
+
+    async with fresh_sessions() as fresh:
+        active = list((await fresh.execute(
+            select(ChittiLiftEvent).where(
+                ChittiLiftEvent.chitti_id == UUID(chitti["id"]),
+                ChittiLiftEvent.reversed_at.is_(None),
+            )
+        )).scalars().all())
+        assert len(active) <= 2
+
+
+@pytest.mark.asyncio
+async def test_lift_rolls_back_after_controlled_post_mutation_failure(
+    client, test_user, test_engine, db_session, monkeypatch
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_lift_chitti(client, headers, member_count=1)
+    await db_session.commit()
+
+    async def fail_lift_audit(self, **kwargs):
+        raise RuntimeError("controlled lift rollback failure")
+
+    monkeypatch.setattr(
+        AuditLogRepository,
+        "log",
+        fail_lift_audit,
+    )
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with sessions() as session:
+        with pytest.raises(RuntimeError, match="controlled lift rollback"):
+            await ChittiService(session).record_lift(
+                UUID(chitti["id"]),
+                member_id=members[0]["id"],
+                period_number=1,
+                lift_date=date.today(),
+                recorded_by=test_user["user"].id,
+            )
+        await session.rollback()
+
+    monkeypatch.undo()
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        lift_events = list((await fresh.execute(
+            select(ChittiLiftEvent).where(
+                ChittiLiftEvent.chitti_id == UUID(chitti["id"]),
+            )
+        )).scalars().all())
+        assert lift_events == []
+
+        member_row = (
+            await fresh.execute(
+                select(ChittiMember).where(
+                    ChittiMember.chitti_id == UUID(chitti["id"]),
+                    ChittiMember.id == UUID(members[0]["id"]),
+                )
+            )
+        ).scalar_one()
+        assert member_row.lifted is False
+        assert member_row.lift_period is None
+
+        contributions = list((await fresh.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+            )
+        )).scalars().all())
+        assert len(contributions) == 4
+        assert [row.expected_amount for row in contributions] == [
+            Decimal("5000"),
+            Decimal("5000"),
+            Decimal("5000"),
+            Decimal("5000"),
+        ]
+
+        audit = list((await fresh.execute(
+            select(AuditLog).where(AuditLog.action == "CHITTI_LIFT_RECORDED")
+        )).scalars().all())
+        assert audit == []
+
+
+@pytest.mark.asyncio
+async def test_lift_concurrent_with_collection_preserves_totals(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_lift_chitti(client, headers, member_count=1)
+    await db_session.commit()
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def lift():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_lift(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    lift_date=date.today(),
+                    recorded_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    async def collect():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_contribution(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    amount=Decimal("5000"),
+                    payment_method="CASH",
+                    payment_date=date.today(),
+                    idempotency_key="lift-vs-contribution-5000",
+                    created_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    results = await asyncio.gather(lift(), collect())
+    assert all(isinstance(value, dict) for value in results)
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        member_row = (
+            await fresh.execute(
+                select(ChittiMember).where(
+                    ChittiMember.chitti_id == UUID(chitti["id"]),
+                    ChittiMember.id == UUID(members[0]["id"]),
+                )
+            )
+        ).scalar_one()
+
+        contribution = (
+            await fresh.execute(
+                select(ChittiMemberContribution).where(
+                    ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                    ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                    ChittiMemberContribution.period_number == 1,
+                )
+            )
+        ).scalar_one()
+
+        if member_row.lifted:
+            assert contribution.expected_amount == Decimal("5000")
+            assert contribution.paid_amount == Decimal("5000")
+            assert member_row.lift_period == 1
+        else:
+            assert member_row.lift_period is None
+            assert contribution.paid_amount == Decimal("5000")
+
+
+@pytest.mark.asyncio
+async def test_lift_paid_before_lift_recalculates_member_and_period_totals(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_lift_chitti(client, headers, member_count=1)
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "5000.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "paid-before-lift-period-one",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    assert contribution.json()["data"]["duplicate"] is False
+    await db_session.commit()
+
+    lift = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/lifts",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "lift_date": date.today().isoformat(),
+        },
+        headers=headers,
+    )
+    assert lift.status_code == 200, lift.text
+    await db_session.commit()
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        member_row = (
+            await fresh.execute(
+                select(ChittiMember).where(
+                    ChittiMember.chitti_id == UUID(chitti["id"]),
+                    ChittiMember.id == UUID(members[0]["id"]),
+                )
+            )
+        ).scalar_one()
+        assert member_row.lifted is True
+        assert member_row.lift_period == 1
+        assert member_row.total_paid_amount == Decimal("5000")
+
+        contributions = list((await fresh.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+            ).order_by(ChittiMemberContribution.period_number)
+        )).scalars().all())
+        assert [row.expected_amount for row in contributions] == [
+            Decimal("5000"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+        assert [row.paid_amount for row in contributions] == [
+            Decimal("5000"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+        ]
+        assert [row.remaining_amount for row in contributions] == [
+            Decimal("0"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+        assert sum(row.expected_amount for row in contributions) == Decimal("23600")
+        assert sum(row.paid_amount for row in contributions) == Decimal("5000")
+        assert sum(row.remaining_amount for row in contributions) == Decimal("18600")
+        assert member_row.total_expected_amount == Decimal("23600")
+        assert member_row.outstanding_amount == Decimal("18600")
+
+        schedules = list((await fresh.execute(
+            select(ChittiPeriodSchedule).where(
+                ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+            ).order_by(ChittiPeriodSchedule.period_number)
+        )).scalars().all())
+        assert [row.expected_collection for row in schedules] == [
+            Decimal("5000"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+        assert [row.actual_collection for row in schedules] == [
+            Decimal("5000"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+        ]
+        assert [row.pending_collection for row in schedules] == [
+            Decimal("0"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_lift_concurrent_with_contribution_reversal_preserves_totals(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_lift_chitti(client, headers, member_count=1)
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "5000.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "lift-vs-reversal-origin",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    transaction_id = contribution.json()["data"]["transaction_id"]
+    await db_session.commit()
+
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def lift():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_lift(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    lift_date=date.today(),
+                    recorded_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    async def reverse():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).reverse_contribution(
+                    UUID(chitti["id"]),
+                    UUID(transaction_id),
+                    reason="lift reversal race",
+                    reversed_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    results = await asyncio.gather(lift(), reverse())
+    assert all(isinstance(value, dict) for value in results)
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        contributions = list((await fresh.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+            )
+        )).scalars().all())
+        assert [row.expected_amount for row in contributions] == [
+            Decimal("5000"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+        assert [row.paid_amount for row in contributions] == [
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+        ]
+        assert [row.remaining_amount for row in contributions] == [
+            Decimal("5000"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+        assert sum(row.expected_amount for row in contributions) == Decimal("23600")
+        assert sum(row.paid_amount for row in contributions) == Decimal("0")
+        assert sum(row.remaining_amount for row in contributions) == Decimal("23600")
+
+        schedules = list((await fresh.execute(
+            select(ChittiPeriodSchedule).where(
+                ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+            ).order_by(ChittiPeriodSchedule.period_number)
+        )).scalars().all())
+        assert [row.expected_collection for row in schedules] == [
+            Decimal("5000"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+        assert [row.actual_collection for row in schedules] == [
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+            Decimal("0"),
+        ]
+        assert [row.pending_collection for row in schedules] == [
+            Decimal("5000"),
+            Decimal("6200"),
+            Decimal("6200"),
+            Decimal("6200"),
+        ]
+
+        ledger = list((await fresh.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == UUID(chitti["id"]),
+                ChittiTransaction.period_number == 1,
+            )
+        )).scalars().all())
+        assert sum(row.transaction_type == "CONTRIBUTION" for row in ledger) == 1
+        assert sum(row.transaction_type == "REVERSAL" for row in ledger) == 1
+
+
+@pytest.mark.asyncio
+async def test_lift_concurrent_with_payout_preserves_totals(
+    client, test_user, test_engine, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_lift_chitti(client, headers, member_count=1)
+    await db_session.commit()
+    sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def lift():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_lift(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    lift_date=date.today(),
+                    recorded_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    async def payout():
+        async with sessions() as session:
+            try:
+                result = await ChittiService(session).record_payout(
+                    UUID(chitti["id"]),
+                    member_id=members[0]["id"],
+                    period_number=1,
+                    gross_payout=Decimal("1000"),
+                    discount_amount=Decimal("0"),
+                    fee_amount=Decimal("0"),
+                    net_payout=Decimal("1000"),
+                    payout_method="CASH",
+                    idempotency_key="lift-vs-payout",
+                    created_by=test_user["user"].id,
+                )
+                await session.commit()
+                return result
+            except Exception as exc:
+                await session.rollback()
+                return exc
+
+    results = await asyncio.gather(lift(), payout())
+    assert all(isinstance(value, dict) for value in results)
+
+    fresh_sessions = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+    async with fresh_sessions() as fresh:
+        payouts = list((await fresh.execute(
+            select(ChittiPayout).where(
+                ChittiPayout.chitti_id == UUID(chitti["id"]),
+                ChittiPayout.period_number == 1,
+            )
+        )).scalars().all())
+        assert len(payouts) == 1
+        assert payouts[0].net_payout == Decimal("1000")
+
+        schedule = (
+            await fresh.execute(
+                select(ChittiPeriodSchedule).where(
+                    ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+                    ChittiPeriodSchedule.period_number == 1,
+                )
+            )
+        ).scalar_one()
+        assert schedule.actual_payout == Decimal("1000")
 
 
 @pytest.mark.asyncio

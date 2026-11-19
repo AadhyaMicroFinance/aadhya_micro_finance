@@ -646,7 +646,7 @@ class ChittiService:
             member.id,
             member_number,
             chitti.start_date,
-            member_lift_period=engine.lift_period_for_member(member_number, payout_order),
+            member_lift_period=None,
         )
         for entry in contributions:
             entry["chitti_id"] = chitti.id
@@ -843,7 +843,7 @@ class ChittiService:
         created_by: Optional[UUID] = None,
     ) -> dict:
         """Record a contribution payment for a member."""
-        chitti = await self.chitti_repo.get_by_id(chitti_id)
+        chitti = await self.chitti_repo.get_by_id_for_update(chitti_id)
         if not chitti:
             raise NotFoundException("Chitti", chitti_id)
         if chitti.status != "RUNNING":
@@ -970,9 +970,6 @@ class ChittiService:
             await self.schedule_repo.update(
                 period_schedule,
                 actual_collection=period_schedule.actual_collection + amount,
-                pending_collection=max(
-                    period_schedule.pending_collection - amount, Decimal("0")
-                ),
             )
 
         # Record transaction with the business date and idempotency key.
@@ -1016,10 +1013,10 @@ class ChittiService:
         reversed_by: Optional[UUID] = None,
     ) -> dict:
         """Reverse a Chitti contribution by adding a ledger row and restoring dues."""
-        chitti = await self.chitti_repo.get_by_id(chitti_id)
+        chitti = await self.chitti_repo.get_by_id_for_update(chitti_id)
         if not chitti:
             raise NotFoundException("Chitti", chitti_id)
-        original = await self.txn_repo.get_by_id(transaction_id)
+        original = await self.txn_repo.get_by_id_for_update(transaction_id)
         if not original or original.chitti_id != chitti.id:
             raise NotFoundException("Chitti transaction", transaction_id)
         if original.transaction_type != "CONTRIBUTION" or not original.member_id or not original.period_number:
@@ -1028,14 +1025,16 @@ class ChittiService:
         existing = await self.txn_repo.get_by_idempotency_key(key)
         if existing:
             return {"transaction_id": str(existing.id), "original_transaction_id": str(original.id), "amount": float(existing.amount), "duplicate": True}
-        contribution = await self.contribution_repo.get_by_chitti_member_period(
+        contribution = await self.contribution_repo.get_by_chitti_member_period_for_update(
             chitti.id, original.member_id, original.period_number
         )
         if not contribution or contribution.paid_amount < original.amount:
             raise BadRequestException("Contribution balances do not support this reversal.")
+        schedule = await self.schedule_repo.get_by_period_for_update(
+            chitti.id, original.period_number
+        )
         new_paid = contribution.paid_amount - original.amount
         new_remaining = contribution.remaining_amount + original.amount
-        schedule = await self.schedule_repo.get_by_period(chitti.id, original.period_number)
         if new_remaining <= 0:
             new_status = "PAID"
         elif new_paid > 0:
@@ -1052,7 +1051,6 @@ class ChittiService:
             await self.schedule_repo.update(
                 schedule,
                 actual_collection=max(schedule.actual_collection - original.amount, Decimal("0")),
-                pending_collection=schedule.pending_collection + original.amount,
             )
         reversal = await self.txn_repo.create(
             chitti_id=chitti.id, transaction_type="REVERSAL", member_id=original.member_id,
@@ -1141,13 +1139,13 @@ class ChittiService:
             raise BadRequestException("A lift can be recorded only for a running Chitti.")
         if lift_date > today_ist():
             raise BadRequestException("Lift date cannot be in the future.")
-        member = await self.member_repo.get_by_id(UUID(member_id))
+        member = await self.member_repo.get_by_id_for_update(UUID(member_id))
         if not member or member.chitti_id != chitti.id or member.status != "ACTIVE":
             raise BadRequestException("Select an active member enrolled in this Chitti.")
         duration = int(snapshot.get("duration", 0))
         if period_number < 1 or period_number > duration:
             raise BadRequestException("Lift period is outside the Chitti schedule.")
-        schedule = await self.schedule_repo.get_by_period(chitti.id, period_number)
+        schedule = await self.schedule_repo.get_by_period_for_update(chitti.id, period_number)
         if not schedule or schedule.due_date > lift_date:
             raise BadRequestException("The selected lift period is not eligible on this lift date.")
         existing = await self.lift_repo.get_by_period(chitti.id, period_number)
@@ -1188,7 +1186,7 @@ class ChittiService:
         chitti = await self.chitti_repo.get_by_id_for_update(chitti_id)
         if not chitti:
             raise NotFoundException("Chitti", chitti_id)
-        event = await self.session.get(ChittiLiftEvent, lift_id)
+        event = await self.lift_repo.get_by_id_for_update(lift_id)
         if not event or event.chitti_id != chitti.id:
             raise NotFoundException("Chitti lift event", lift_id)
         if event.reversed_at:
@@ -1197,7 +1195,7 @@ class ChittiService:
         await self.lift_repo.update(
             event, reversed_at=now_ist(), reversed_by=reversed_by, reversal_reason=reason
         )
-        member = await self.member_repo.get_by_id(event.member_id)
+        member = await self.member_repo.get_by_id_for_update(event.member_id)
         remaining_lifts = await self.lift_repo.get_active_for_member(chitti.id, member.id)
         first_lift = min(remaining_lifts, key=lambda row: row.period_number) if remaining_lifts else None
         await self.member_repo.update(
@@ -1233,6 +1231,11 @@ class ChittiService:
         for row in contributions:
             if row.period_number < from_period:
                 continue
+            row = await self.contribution_repo.get_by_chitti_member_period_for_update(
+                chitti.id, member.id, row.period_number
+            )
+            if not row:
+                continue
             if hasattr(engine.contribution_strategy, "calculate_installment_for_member"):
                 expected = engine.contribution_strategy.calculate_installment_for_member(
                     row.period_number, duration, total_value, member_count, lift_period
@@ -1266,9 +1269,10 @@ class ChittiService:
         fee_amount: Decimal = Decimal("0"),
         net_payout: Decimal,
         payout_method: str,
+        idempotency_key: Optional[str] = None,
         created_by: Optional[UUID] = None,
     ) -> dict:
-        chitti = await self.chitti_repo.get_by_id(chitti_id)
+        chitti = await self.chitti_repo.get_by_id_for_update(chitti_id)
         if not chitti:
             raise NotFoundException("Chitti", chitti_id)
 
@@ -1280,6 +1284,90 @@ class ChittiService:
         duration = int(snapshot.get("duration", 0))
         if period_number < 1 or period_number > duration:
             raise BadRequestException("Payout period is outside the Chitti schedule.")
+
+        money_values = (gross_payout, discount_amount, fee_amount, net_payout)
+        if any(not value.is_finite() for value in money_values):
+            raise BadRequestException("Payout amounts must be finite.")
+        if any(value < Decimal("0") for value in money_values):
+            raise BadRequestException("Payout amounts cannot be negative.")
+
+        cents = Decimal("0.01")
+        gross_payout = gross_payout.quantize(cents, rounding=ROUND_HALF_UP)
+        discount_amount = discount_amount.quantize(cents, rounding=ROUND_HALF_UP)
+        fee_amount = fee_amount.quantize(cents, rounding=ROUND_HALF_UP)
+        net_payout = net_payout.quantize(cents, rounding=ROUND_HALF_UP)
+        if net_payout != gross_payout - discount_amount - fee_amount:
+            raise BadRequestException(
+                "Net payout must equal gross payout minus discount and fee.",
+                error_code="PAYOUT_AMOUNT_MISMATCH",
+            )
+
+        period_schedule = await self.schedule_repo.get_by_period_for_update(
+            chitti.id, period_number
+        )
+        if not period_schedule:
+            raise BadRequestException(
+                "Payout period schedule is missing.",
+                error_code="PAYOUT_PERIOD_SCHEDULE_MISSING",
+            )
+
+        existing_payout = await self.payout_repo.get_by_chitti_member_period_for_update(
+            chitti.id, member.id, period_number
+        )
+        if existing_payout:
+            if (
+                existing_payout.gross_payout == gross_payout
+                and existing_payout.discount_amount == discount_amount
+                and existing_payout.fee_amount == fee_amount
+                and existing_payout.net_payout == net_payout
+                and existing_payout.payout_method == payout_method
+            ):
+                return {
+                    "id": str(existing_payout.id),
+                    "gross_payout": existing_payout.gross_payout,
+                    "net_payout": existing_payout.net_payout,
+                    "status": existing_payout.status,
+                    "duplicate": True,
+                }
+            raise ConflictException(
+                "A payout is already recorded for this member and period.",
+                error_code="DUPLICATE_PAYOUT",
+            )
+
+        if idempotency_key:
+            key = idempotency_key
+        else:
+            import hashlib
+            canonical = (
+                f"{chitti.id}|{member.id}|{period_number}|{gross_payout}"
+                f"|{discount_amount}|{fee_amount}|{net_payout}|{payout_method}"
+            )
+            key = f"payout-{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+        existing_ledger = await self.txn_repo.get_by_idempotency_key(key)
+        if existing_ledger:
+            if (
+                existing_ledger.chitti_id == chitti.id
+                and existing_ledger.member_id == member.id
+                and existing_ledger.period_number == period_number
+                and existing_ledger.amount == net_payout
+                and existing_ledger.payment_method == payout_method
+                and existing_ledger.transaction_type == "PAYOUT"
+            ):
+                payout = await self.payout_repo.get_by_chitti_member_period_for_update(
+                    chitti.id, member.id, period_number
+                )
+                if payout:
+                    return {
+                        "id": str(payout.id),
+                        "gross_payout": payout.gross_payout,
+                        "net_payout": payout.net_payout,
+                        "status": payout.status,
+                        "duplicate": True,
+                    }
+            raise ConflictException(
+                "This payout idempotency key was already used for different payout details.",
+                error_code="PAYOUT_IDEMPOTENCY_KEY_REUSED",
+            )
 
         from app.utils.timezone import now_ist
         paid_at = now_ist()
@@ -1298,12 +1386,10 @@ class ChittiService:
         )
 
         # Update period schedule
-        period_schedule = await self.schedule_repo.get_by_period(chitti.id, period_number)
-        if period_schedule:
-            await self.schedule_repo.update(
-                period_schedule,
-                actual_payout=period_schedule.actual_payout + net_payout,
-            )
+        await self.schedule_repo.update(
+            period_schedule,
+            actual_payout=period_schedule.actual_payout + net_payout,
+        )
 
         # Record transaction
         await self.txn_repo.create(
@@ -1313,7 +1399,25 @@ class ChittiService:
             amount=net_payout,
             payment_method=payout_method,
             period_number=period_number,
+            idempotency_key=key,
             created_by=created_by,
+        )
+
+        await AuditService(self.session).log(
+            user_id=created_by,
+            action="CHITTI_PAYOUT_RECORDED",
+            entity_type="chitti_payout",
+            entity_id=payout.id,
+            new_value={
+                "chitti_id": str(chitti.id),
+                "member_id": str(member.id),
+                "period_number": period_number,
+                "gross_payout": str(gross_payout),
+                "discount_amount": str(discount_amount),
+                "fee_amount": str(fee_amount),
+                "net_payout": str(net_payout),
+                "payout_method": payout_method,
+            },
         )
 
         return {
@@ -1321,6 +1425,7 @@ class ChittiService:
             "gross_payout": payout.gross_payout,
             "net_payout": payout.net_payout,
             "status": payout.status,
+            "duplicate": False,
         }
 
     # ===========================================================================
@@ -1663,9 +1768,7 @@ class ChittiService:
                     member.id,
                     member.member_number,
                     chitti.start_date,
-                    member_lift_period=engine.lift_period_for_member(
-                        member.member_number, member.payout_order
-                    ),
+                    member_lift_period=None,
                 )
                 for entry in entries:
                     entry["chitti_id"] = chitti.id
@@ -1701,21 +1804,32 @@ class ChittiService:
         for con in contributions:
             entry = aggregates.setdefault(
                 con.period_number,
-                {"expected": Decimal("0"), "paid": Decimal("0")},
+                {
+                    "expected": Decimal("0"),
+                    "paid": Decimal("0"),
+                    "remaining": Decimal("0"),
+                },
             )
             values = effective_values[con.id]
             entry["expected"] += values["expected"]
             entry["paid"] += values["paid"]
+            entry["remaining"] += values["remaining"]
 
         schedule_rows = []
         today = today_ist()
-        for schedule in await self.schedule_repo.get_by_chitti_id(chitti.id):
+        schedules = await self.schedule_repo.get_by_chitti_id(chitti.id)
+        for schedule in schedules:
+            schedule = await self.schedule_repo.get_by_period_for_update(
+                chitti.id, schedule.period_number
+            )
+            if not schedule:
+                continue
             entry = aggregates.get(schedule.period_number)
             if entry is None:
                 continue
             expected = entry["expected"]
             paid = entry["paid"]
-            pending = max(expected - paid, Decimal("0"))
+            pending = entry["remaining"]
             if expected > 0 and pending == 0:
                 status = "COMPLETED"
             elif paid > 0:
