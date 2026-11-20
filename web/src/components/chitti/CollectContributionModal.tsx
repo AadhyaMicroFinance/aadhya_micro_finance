@@ -45,18 +45,23 @@ export default function CollectContributionModal({
   );
 
   const open = (rows ?? []).filter((r) => Number(r.remaining_amount) > 0);
-  const selected = open.find((r) => r.period_number === period) ?? null;
+  const periodOptions =
+    open.length > 0
+      ? [open[0]]
+      : rows?.length
+        ? [rows[rows.length - 1]]
+        : [];
+  const selected = periodOptions.find((r) => r.period_number === period) ?? null;
 
   const load = useCallback(async () => {
     try {
       const data = await chittiApi.getMemberContributions(chittiId, member.id);
       setRows(data);
-      const wanted =
-        (presetPeriod != null && data.find((r) => r.period_number === presetPeriod && Number(r.remaining_amount) > 0)) ||
-        data.find((r) => Number(r.remaining_amount) > 0);
+      const outstanding = data.filter((r) => Number(r.remaining_amount) > 0);
+      const wanted = outstanding[0] ?? data[data.length - 1];
       if (wanted) {
         setPeriod(wanted.period_number);
-        setAmount(String(wanted.remaining_amount));
+        setAmount(outstanding.length > 0 ? String(wanted.remaining_amount) : "");
       }
     } catch (e) {
       setError(getApiErrorMessage(e, "Could not load this member's contributions."));
@@ -70,19 +75,14 @@ export default function CollectContributionModal({
   const submit = async () => {
     if (saving || !selected) return;
     const value = Number(amount);
-    const remaining = Number(selected.remaining_amount);
     if (!Number.isFinite(value) || value <= 0) {
       setError("Enter an amount greater than zero.");
-      return;
-    }
-    if (value > remaining + 0.005) {
-      setError(`Only ${formatCurrency(remaining)} is left to collect for this period.`);
       return;
     }
     setSaving(true);
     setError(null);
     try {
-      await chittiApi.recordContribution(chittiId, {
+      const result = await chittiApi.recordContribution(chittiId, {
         member_id: member.id,
         period_number: selected.period_number,
         amount: value,
@@ -92,8 +92,14 @@ export default function CollectContributionModal({
         notes: notes.trim() || undefined,
         idempotency_key: idempotencyKey.current,
       });
+      const credit = Number(result.unallocated_credit ?? 0);
+      const allocationSummary = result.allocations.length
+        ? ` Allocated to ${result.allocations
+            .map((allocation) => `period ${allocation.period_number}`)
+            .join(", ")}.`
+        : "";
       await onSaved(
-        `${formatCurrency(value)} collected from ${member.name} (period ${selected.period_number}).`
+        `${formatCurrency(value)} collected from ${member.name} starting at period ${selected.period_number}.${allocationSummary}${credit > 0 ? ` ${formatCurrency(credit)} remains as member credit.` : ""}`
       );
     } catch (e: unknown) {
       setError(getApiErrorMessage(e, "Could not record this contribution."));
@@ -101,11 +107,6 @@ export default function CollectContributionModal({
       setSaving(false);
     }
   };
-
-  const previewChange =
-    selected && Number(amount) > 0
-      ? Math.max(Number(selected.remaining_amount) - Number(amount), 0)
-      : null;
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -130,29 +131,34 @@ export default function CollectContributionModal({
         <div className="space-y-4 p-4 pb-0 sm:p-6 sm:pb-0">
           {rows === null ? (
             <p className="text-sm text-surface-500">Loading what this member owes…</p>
-          ) : open.length === 0 ? (
-            <div className="flex items-center gap-3 rounded-xl bg-success-50 p-4 text-sm text-success-700">
-              <CheckCircle2 size={18} />
-              Every period for this member is fully paid.
-            </div>
+          ) : periodOptions.length === 0 ? (
+            <p className="text-sm text-surface-500">No contribution periods are available.</p>
           ) : (
             <>
+              {open.length === 0 && (
+                <div className="flex items-center gap-3 rounded-xl bg-success-50 p-4 text-sm text-success-700">
+                  <CheckCircle2 size={18} />
+                  All scheduled periods are paid. Any new receipt will remain as member credit.
+                </div>
+              )}
               <div>
-                <label className="label">Which period?</label>
+                <label className="label">Allocation starts at</label>
                 <select
                   className="input-field"
                   value={period ?? ""}
                   onChange={(e) => {
                     const next = Number(e.target.value);
                     setPeriod(next);
-                    const row = open.find((r) => r.period_number === next);
-                    if (row) setAmount(String(row.remaining_amount));
+                    const row = periodOptions.find((r) => r.period_number === next);
+                    if (row) setAmount(open.length > 0 ? String(row.remaining_amount) : "");
                     setError(null);
                   }}
                 >
-                  {open.map((r) => (
+                  {periodOptions.map((r) => (
                     <option key={r.id} value={r.period_number}>
-                      Period {r.period_number} — {formatCurrency(r.remaining_amount)} due
+                      {open.length > 0
+                        ? `Period ${r.period_number} — ${formatCurrency(r.remaining_amount)} due, then forward`
+                        : `Member credit — all periods settled`}
                     </option>
                   ))}
                 </select>
@@ -178,9 +184,11 @@ export default function CollectContributionModal({
                     Period {selected.period_number}: expected{" "}
                     {formatCurrency(selected.expected_amount)}, already paid{" "}
                     {formatCurrency(selected.paid_amount)}
-                    {previewChange !== null && ` → ${formatCurrency(previewChange)} will remain`}
                   </p>
                 )}
+                <p className="mt-1 text-xs text-surface-500">
+                  Receipts apply in period order. Excess remains as credit and is used against future contributions.
+                </p>
               </div>
 
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -236,7 +244,7 @@ export default function CollectContributionModal({
             <button
               onClick={submit}
               className="btn-primary w-full sm:w-auto"
-              disabled={saving || !selected || open.length === 0}
+              disabled={saving || !selected}
             >
               {saving ? "Recording…" : "Confirm collection"}
             </button>

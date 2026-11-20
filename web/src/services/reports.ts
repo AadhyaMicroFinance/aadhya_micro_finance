@@ -23,6 +23,7 @@ export interface DailySummary {
   pending_total: number;
   finance_pending: number;
   chitti_pending: number;
+  chitti_unallocated_credit: number;
   collection_rate: number;
 }
 
@@ -86,6 +87,7 @@ export interface RangeReport {
   report_type: string; start_date: string; end_date: string;
   collected_total: number; finance_collected: number; chitti_collected: number;
   finance_pending: number; chitti_pending: number;
+  chitti_unallocated_credit: number;
   breakdown?: Array<Record<string, string | number | boolean | null>>;
   transactions: Array<Record<string, string | number | boolean | null>>;
   pending_details: Array<Record<string, string | number | boolean | null>>;

@@ -748,7 +748,7 @@ function MemberExpanded({
           <p className="text-[10px] font-bold uppercase tracking-wider text-surface-400">
             Financial summary
           </p>
-          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+          <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">
             <div>
               <p className="text-[10px] uppercase text-surface-400">Paid</p>
               <p className="text-sm font-semibold text-success-600">
@@ -765,6 +765,12 @@ function MemberExpanded({
               <p className="text-[10px] uppercase text-surface-400">Expected</p>
               <p className="text-sm font-semibold text-surface-900">
                 {formatCurrency(Number(member.total_expected || 0))}
+              </p>
+            </div>
+            <div>
+              <p className="text-[10px] uppercase text-surface-400">Member credit</p>
+              <p className="text-sm font-semibold text-brand-700">
+                {formatCurrency(Number(member.unallocated_credit || 0))}
               </p>
             </div>
             <div>

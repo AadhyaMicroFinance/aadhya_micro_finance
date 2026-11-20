@@ -293,3 +293,9 @@ Local test URLs:
 - **Change:** Pending rows are now grouped chronologically by due date (oldest first), then by Finance account or Chitti. Added an in-list filter for customer name/ID/mobile and account/Chitti identifiers, with a matching-record count. The pending list has its own bounded 65vh scroll region so a large due list can be browsed without making the whole page excessively long. The existing customer search and payment collection flow retain their compact width and behavior.
 - **Browser check:** Authenticated Chrome rendered 14 due records in `/payments/collect`, grouped under one due date and three account/Chitti groups. The list container measured 457px high with 1,882px of content and computed `overflow-y: auto`; page had no application error. This verifies bounded list scrolling on the available sample data; 100+ records were not present to test at production scale.
 - **Checks:** Collect Payment page ESLint passed; frontend `npx tsc --noEmit` passed; `git diff --check` passed. No payment action was submitted and no customer/financial record was changed.
+
+## Chitti Release Preparation (2026-11-20)
+- Backup: C:\Users\ak8a6\AppData\Local\Temp\kilo\aadhya_backup_20261120_121048 + aadhya_repo.bundle
+- Migrations: 0001-0005 linear single head.
+- Tests: flow 10/10; lift+constraints 40/40; reports 35/35; frontend tsc exit 0.
+- Status: conditionally ready; awaiting commit approval.

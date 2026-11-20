@@ -42,6 +42,7 @@ export interface AnalyticsKpis {
   total_chitti_value: number;
   total_expected: number;
   total_collected: number;
+  total_unallocated_credit: number;
   total_pending: number;
   total_overdue: number;
   total_members: number;
@@ -65,6 +66,7 @@ export interface DailyPoint {
   date: string;
   expected: number;
   collected: number;
+  unallocated_credit: number;
   pending: number;
 }
 
@@ -95,6 +97,7 @@ export interface ChittiMetric {
   active_members: number;
   expected: number;
   collected: number;
+  unallocated_credit: number;
   pending: number;
   overdue: number;
   today_collection: number;
@@ -123,6 +126,7 @@ export interface MemberPaymentRow {
   chitti_name: string | null;
   expected_total: number;
   paid_total: number;
+  unallocated_credit: number;
   pending_total: number;
   due_total: number;
   due_pending: number;
@@ -146,6 +150,7 @@ export interface PendingDetail {
   amount_pending: number;
   amount_expected: number;
   amount_paid: number;
+  unallocated_credit: number;
   last_payment_date: string | null;
   total_outstanding: number;
   status: string;
@@ -176,6 +181,7 @@ export interface FinancialSummary {
   total_outstanding: number;
   total_overdue: number;
   total_advance: number;
+  total_unallocated_credit: number;
   total_refunds: number;
   total_adjustments: number;
   daily_collection: number;

@@ -619,6 +619,13 @@ export default function ChittiAnalyticsPage() {
                 sub={`${formatCurrency(data.kpis.total_overdue)} overdue`}
               />
               <KpiCard
+                label="Unallocated Member Credit"
+                value={formatCurrency(data.kpis.total_unallocated_credit)}
+                icon={<Wallet size={18} />}
+                gradient="from-cyan-600 via-sky-600 to-blue-700"
+                sub="Available for future contributions"
+              />
+              <KpiCard
                 label="Collected Today"
                 value={formatCurrency(data.kpis.today_collected)}
                 icon={<CheckCircle2 size={18} />}
@@ -1454,6 +1461,11 @@ export default function ChittiAnalyticsPage() {
                     label: "Advance Payments",
                     value: data.financial_summary.total_advance,
                     tone: "bg-brand-50 text-brand-700",
+                  },
+                  {
+                    label: "Unallocated Credit",
+                    value: data.financial_summary.total_unallocated_credit,
+                    tone: "bg-cyan-50 text-cyan-700",
                   },
                   {
                     label: "Refunds / Reversals",
