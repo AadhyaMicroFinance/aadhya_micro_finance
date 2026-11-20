@@ -17,6 +17,7 @@ from app.models.chitti import (
     ChittiPlan,
     ChittiTransaction,
     ChittiLiftEvent,
+    ChittiPaymentAllocation,
 )
 from app.repositories.base import BaseRepository
 
@@ -204,6 +205,17 @@ class ChittiMemberRepository(BaseRepository[ChittiMember]):
             select(ChittiMember).where(
                 ChittiMember.chitti_id == chitti_id,
                 ChittiMember.member_number == member_number,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_by_chitti_and_alias(
+        self, chitti_id: UUID, alias: str
+    ) -> Optional[ChittiMember]:
+        result = await self.session.execute(
+            select(ChittiMember).where(
+                ChittiMember.chitti_id == chitti_id,
+                ChittiMember.alias == alias,
             )
         )
         return result.scalar_one_or_none()
@@ -465,3 +477,41 @@ class ChittiTransactionRepository(BaseRepository[ChittiTransaction]):
             .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
+
+
+class ChittiPaymentAllocationRepository(BaseRepository[ChittiPaymentAllocation]):
+    def __init__(self, session: AsyncSession):
+        super().__init__(ChittiPaymentAllocation, session)
+
+    async def get_by_source_transaction_id(
+        self, transaction_id: UUID
+    ) -> list[ChittiPaymentAllocation]:
+        result = await self.session.execute(
+            select(ChittiPaymentAllocation)
+            .where(ChittiPaymentAllocation.source_transaction_id == transaction_id)
+            .order_by(ChittiPaymentAllocation.created_at, ChittiPaymentAllocation.id)
+        )
+        return list(result.scalars().all())
+
+    async def get_by_member_id(
+        self, chitti_id: UUID, member_id: UUID
+    ) -> list[ChittiPaymentAllocation]:
+        result = await self.session.execute(
+            select(ChittiPaymentAllocation)
+            .where(
+                ChittiPaymentAllocation.chitti_id == chitti_id,
+                ChittiPaymentAllocation.member_id == member_id,
+            )
+            .order_by(ChittiPaymentAllocation.created_at, ChittiPaymentAllocation.id)
+        )
+        return list(result.scalars().all())
+
+    async def get_by_chitti_id(
+        self, chitti_id: UUID
+    ) -> list[ChittiPaymentAllocation]:
+        result = await self.session.execute(
+            select(ChittiPaymentAllocation)
+            .where(ChittiPaymentAllocation.chitti_id == chitti_id)
+            .order_by(ChittiPaymentAllocation.created_at, ChittiPaymentAllocation.id)
+        )
+        return list(result.scalars().all())

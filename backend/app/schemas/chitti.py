@@ -175,6 +175,7 @@ class ChittiDashboardItem(BaseModel):
 class ChittiMemberAdd(BaseModel):
     customer_id: str
     payout_order: Optional[int] = Field(None, ge=0)
+    alias: Optional[str] = None
 
 
 class MemberAgreementSummary(BaseModel):
@@ -201,6 +202,7 @@ class ChittiMemberResponse(BaseModel):
     total_expected: Decimal = Decimal("0")
     total_paid: Decimal = Decimal("0")
     outstanding: Decimal = Decimal("0")
+    unallocated_credit: Decimal = Decimal("0")
     lifted: bool = False
     lifted_at: Optional[str] = None
     lift_period: Optional[int] = None
@@ -234,6 +236,7 @@ class ChittiMemberPayment(BaseModel):
     """One contribution or reversal against an installment (from the ledger)."""
 
     id: str
+    transaction_id: Optional[str] = None
     amount: Decimal
     transaction_type: Optional[str] = None
     payment_date: Optional[str] = None
@@ -392,6 +395,7 @@ class ChittiSummaryResponse(BaseModel):
     expected_collection: Decimal
     actual_collection: Decimal
     pending_collection: Decimal
+    unallocated_credit: Decimal = Decimal("0")
     total_payouts: Decimal
     outstanding: Decimal
     next_due_date: Optional[str] = None
@@ -454,6 +458,7 @@ class ChittiMemberDetail(BaseModel):
     total_expected_amount: Decimal = Decimal("0")
     total_paid_amount: Decimal = Decimal("0")
     outstanding_amount: Decimal = Decimal("0")
+    unallocated_credit: Decimal = Decimal("0")
     lifted: bool = False
     lifted_at: Optional[str] = None
     lift_period: Optional[int] = None

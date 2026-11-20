@@ -329,6 +329,7 @@ async def add_member(
         chitti_id,
         customer_id=body.customer_id,
         payout_order=body.payout_order,
+        alias=body.alias,
         created_by=current_user.id,
     )
     return ApiResponse(data=member)

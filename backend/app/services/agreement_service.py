@@ -67,6 +67,7 @@ class AgreementService:
         customer_id: str,
         payout_order: Optional[int] = None,
         created_by: Optional[UUID] = None,
+        alias: Optional[str] = None,
     ) -> dict:
         """Add a customer to a chitti as PENDING_AGREEMENT member."""
         chitti = await self.chitti_repo.get_by_id(chitti_id)
@@ -80,24 +81,20 @@ class AgreementService:
         if not customer:
             raise NotFoundException("Customer", customer_id)
 
-        # Check duplicate membership in THIS chitti only. The same customer may
-        # legitimately join other chitti schemes.
-        existing = await self.member_repo.get_by_chitti_and_customer(
-            chitti.id, UUID(customer_id)
+        # Multiple slots for the same customer are allowed; prevent duplicate member
+        # numbers and duplicate aliases within this chitti.
+        existing_num = await self.member_repo.get_by_chitti_and_member_number(
+            chitti.id, payout_order or 1
         )
-        if existing and existing.status not in ("CANCELLED", "REJECTED"):
-            raise ConflictException(
-                "This member is already enrolled in this Chitti.",
-                error_code="DUPLICATE_ENROLLMENT",
-                details={
-                    "customer_id": str(customer.id),
-                    "customer_name": customer.full_name,
-                    "chitti_id": str(chitti.id),
-                    "existing_member_id": str(existing.id),
-                    "existing_member_number": existing.member_number,
-                    "existing_status": existing.status,
-                },
-            )
+        # We don't know the member_number here yet; skip member_number duplicate
+        # check at this layer (handled when number is assigned). Keep alias check.
+        if alias:
+            existing_alias = await self.member_repo.get_by_chitti_and_alias(chitti.id, alias)
+            if existing_alias:
+                raise ConflictException(
+                    "Alias already used in this Chitti.",
+                    error_code="DUPLICATE_ALIAS",
+                )
 
         # Capacity counts every member holding a place, not only ACTIVE ones —
         # pending-agreement members already occupy a slot.
@@ -117,33 +114,18 @@ class AgreementService:
         max_num = await self.member_repo.max_member_number(chitti.id)
         member_number = max_num + 1
 
-        if existing:
-            # uq_chitti_member_customer forbids a second row, so re-enrol the
-            # previous cancelled/rejected membership instead of inserting one.
-            existing.agreement_id = None
-            member = await self.member_repo.update(
-                existing,
-                status="PENDING_AGREEMENT",
-                member_number=member_number,
-                payout_order=payout_order or member_number,
-                total_expected_amount=Decimal("0"),
-                total_paid_amount=Decimal("0"),
-                outstanding_amount=Decimal("0"),
-                lifted=False,
-                left_at=None,
-            )
-        else:
-            member = await self.member_repo.create(
-                chitti_id=chitti.id,
-                customer_id=UUID(customer_id),
-                member_number=member_number,
-                payout_order=payout_order or member_number,
-                status="PENDING_AGREEMENT",
-                total_expected_amount=Decimal("0"),
-                total_paid_amount=Decimal("0"),
-                outstanding_amount=Decimal("0"),
-                lifted=False,
-            )
+        member = await self.member_repo.create(
+            chitti_id=chitti.id,
+            customer_id=UUID(customer_id),
+            member_number=member_number,
+            payout_order=payout_order or member_number,
+            status="PENDING_AGREEMENT",
+            total_expected_amount=Decimal("0"),
+            total_paid_amount=Decimal("0"),
+            outstanding_amount=Decimal("0"),
+            lifted=False,
+            alias=alias or None,
+        )
 
         from app.services.audit_service import AuditService
         await AuditService(self.session).log(

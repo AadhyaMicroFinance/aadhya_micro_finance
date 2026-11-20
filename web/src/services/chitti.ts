@@ -107,6 +107,7 @@ export interface ChittiMember {
   chitti_id: string;
   customer_id: string;
   customer_name: string | null;
+  alias?: string | null;
   customer_code: string | null;
   mobile_number: string | null;
   member_number: number;
@@ -116,6 +117,7 @@ export interface ChittiMember {
   total_expected: number;
   total_paid: number;
   outstanding: number;
+  unallocated_credit?: number;
   lifted?: boolean;
   lifted_at?: string | null;
   lift_period?: number | null;
@@ -133,6 +135,7 @@ export interface ChittiPeriodSchedule {
   expected_collection: number;
   actual_collection: number;
   pending_collection: number;
+  unallocated_credit?: number;
   expected_payout: number;
   expected_payout_fee?: number;
   scheduled_member_number?: number | null;
@@ -190,6 +193,7 @@ export interface ChittiSummary {
   pending_collection: number;
   total_payouts: number;
   outstanding: number;
+  unallocated_credit?: number;
   next_due_date: string | null;
   next_payout_date: string | null;
 }
@@ -238,6 +242,25 @@ export interface ChittiContribution {
   remaining_amount: number;
   status: string;
   payments?: ChittiMemberPayment[];
+}
+
+/** Actual sequential allocation returned after a Chitti collection is posted. */
+export interface ChittiContributionAllocation {
+  period_number: number;
+  contribution_id: string | null;
+  amount: number;
+}
+
+export interface ChittiContributionReceipt {
+  transaction_id: string;
+  contribution_id: string | null;
+  paid_amount: number;
+  remaining_amount: number;
+  status: string;
+  allocated_amount: number;
+  unallocated_credit: number;
+  allocations: ChittiContributionAllocation[];
+  duplicate: boolean;
 }
 
 export interface Agreement {
@@ -416,6 +439,7 @@ export const chittiApi = {
     data: {
       customer_id: string;
       payout_order?: number;
+      alias?: string;
     }
   ) => {
     const res = await apiClient.post<ApiResponse<ChittiMember>>(
@@ -542,8 +566,8 @@ export const chittiApi = {
       notes?: string;
       idempotency_key: string;
     }
-  ) => {
-    const res = await apiClient.post<ApiResponse<Record<string, unknown>>>(
+  ): Promise<ChittiContributionReceipt> => {
+    const res = await apiClient.post<ApiResponse<ChittiContributionReceipt>>(
       `/chitti/${chittiId}/contributions`,
       data
     );

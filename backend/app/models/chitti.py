@@ -178,8 +178,14 @@ class ChittiMember(BaseModel):
 
     __tablename__ = "chitti_members"
     __table_args__ = (
-        UniqueConstraint("chitti_id", "customer_id", name="uq_chitti_member_customer"),
         UniqueConstraint("chitti_id", "member_number", name="uq_chitti_member_number"),
+        Index(
+            "uq_chitti_member_alias",
+            "chitti_id",
+            "alias",
+            unique=True,
+            postgresql_where=text("alias IS NOT NULL"),
+        ),
     )
 
     chitti_id: Mapped[uuid.UUID] = mapped_column(
@@ -192,6 +198,7 @@ class ChittiMember(BaseModel):
         ForeignKey("customers.id", ondelete="CASCADE"),
         nullable=False,
     )
+    alias: Mapped[str | None] = mapped_column(String(100), nullable=True)
     member_number: Mapped[int] = mapped_column(Integer, nullable=False)
     payout_order: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
@@ -400,6 +407,10 @@ class ChittiPayout(BaseModel):
     __tablename__ = "chitti_payouts"
     __table_args__ = (
         UniqueConstraint(
+            "ledger_transaction_id",
+            name="uq_chitti_payout_ledger_transaction",
+        ),
+        UniqueConstraint(
             "chitti_id", "member_id", "period_number",
             name="uq_chitti_payout_member_period",
         ),
@@ -422,6 +433,11 @@ class ChittiPayout(BaseModel):
         UUID(as_uuid=True),
         ForeignKey("chitti_members.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    ledger_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chitti_transactions.id", ondelete="RESTRICT"),
+        nullable=True,
     )
     period_number: Mapped[int] = mapped_column(Integer, nullable=False)
 
@@ -452,6 +468,11 @@ class ChittiPayout(BaseModel):
     chitti: Mapped["Chitti"] = relationship("Chitti", back_populates="payouts")
     member: Mapped["ChittiMember"] = relationship(
         "ChittiMember", back_populates="payouts"
+    )
+    ledger_transaction: Mapped["ChittiTransaction | None"] = relationship(
+        "ChittiTransaction",
+        foreign_keys=[ledger_transaction_id],
+        viewonly=True,
     )
 
 
@@ -530,6 +551,10 @@ class ChittiTransaction(BaseModel):
     __tablename__ = "chitti_transactions"
     __table_args__ = (
         CheckConstraint("amount >= 0", name="ck_chitti_transaction_amount_nonnegative"),
+        UniqueConstraint(
+            "original_transaction_id",
+            name="uq_chitti_transaction_original",
+        ),
     )
 
     chitti_id: Mapped[uuid.UUID] = mapped_column(
@@ -547,6 +572,11 @@ class ChittiTransaction(BaseModel):
     member_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("chitti_members.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    original_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("chitti_transactions.id", ondelete="RESTRICT"),
         nullable=True,
     )
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
@@ -575,3 +605,97 @@ class ChittiTransaction(BaseModel):
 
     # Relationships
     chitti: Mapped["Chitti"] = relationship("Chitti", back_populates="transactions")
+    original_transaction: Mapped["ChittiTransaction | None"] = relationship(
+        "ChittiTransaction",
+        remote_side="ChittiTransaction.id",
+        foreign_keys=[original_transaction_id],
+        viewonly=True,
+    )
+
+
+class ChittiPaymentAllocation(BaseModel):
+    """Append-only allocation movements for a contribution receipt or credit."""
+
+    __tablename__ = "chitti_payment_allocations"
+    __table_args__ = (
+        CheckConstraint(
+            "amount <> 0",
+            name="ck_chitti_payment_allocation_amount_nonzero",
+        ),
+        CheckConstraint(
+            "(allocation_type = 'CREDIT' AND contribution_id IS NULL) OR "
+            "(allocation_type = 'CONTRIBUTION' AND contribution_id IS NOT NULL)",
+            name="ck_chitti_payment_allocation_target",
+        ),
+        Index(
+            "ix_chitti_payment_allocations_source_transaction",
+            "source_transaction_id",
+        ),
+        Index(
+            "ix_chitti_payment_allocations_member",
+            "chitti_id",
+            "member_id",
+        ),
+        Index(
+            "ix_chitti_payment_allocations_contribution",
+            "contribution_id",
+        ),
+    )
+
+    chitti_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "chittis.id",
+            name="fk_chitti_payment_allocations_chitti_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    member_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "chitti_members.id",
+            name="fk_chitti_payment_allocations_member_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    source_transaction_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "chitti_transactions.id",
+            name="fk_chitti_payment_allocations_source_transaction_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    event_transaction_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "chitti_transactions.id",
+            name="fk_chitti_payment_allocations_event_transaction_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    contribution_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "chitti_member_contributions.id",
+            name="fk_chitti_payment_allocations_contribution_id",
+            ondelete="RESTRICT",
+        ),
+        nullable=True,
+    )
+    allocation_type: Mapped[str] = mapped_column(
+        Enum("CONTRIBUTION", "CREDIT", name="chitti_payment_allocation_type_enum"),
+        nullable=False,
+    )
+    event_type: Mapped[str] = mapped_column(
+        Enum(
+            "PAYMENT", "REVERSAL", "CREDIT_UTILIZATION", "LIFT_ADJUSTMENT",
+            name="chitti_payment_allocation_event_type_enum",
+        ),
+        nullable=False,
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
