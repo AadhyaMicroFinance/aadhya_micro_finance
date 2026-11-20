@@ -582,18 +582,73 @@ async def test_partial_contribution_settles_only_remaining_balance(client, test_
         **base, "amount": "60.00", "idempotency_key": "partial-60",
     }, headers=headers)
     assert second.status_code == 200, second.text
-    overpay = await client.post(f"/api/v1/chitti/{chitti_id}/contributions", json={
+    credit_payment = await client.post(f"/api/v1/chitti/{chitti_id}/contributions", json={
         **base, "amount": "1.00", "idempotency_key": "after-settlement",
     }, headers=headers)
-    assert overpay.status_code == 400
-    assert overpay.json()["error"]["code"] == "CONTRIBUTION_PERIOD_ALREADY_PAID"
+    assert credit_payment.status_code == 200, credit_payment.text
+    assert Decimal(str(credit_payment.json()["data"]["unallocated_credit"])) == Decimal("1.00")
+    member_after_credit = (await client.get(
+        f"/api/v1/chitti/{chitti_id}/members", headers=headers
+    )).json()["data"][0]
+    assert member_after_credit["unallocated_credit"] == 1
+    assert member_after_credit["outstanding"] == 0
     history = await client.get("/api/v1/payments/", params={"per_page": 100}, headers=headers)
     chitti_receipts = [row for row in history.json()["data"] if row.get("chitti_account_id") == chitti_id]
-    assert len(chitti_receipts) == 2
+    assert len(chitti_receipts) == 3
 
 
 @pytest.mark.asyncio
-async def test_concurrent_full_payments_cannot_overcollect(client, test_user, test_engine, db_session):
+async def test_combined_settlement_and_next_period_partial_allocation(client, test_user):
+    """A receipt may settle one period and partially fund the next in order."""
+    headers = _auth(test_user)
+    plan_response = await client.post("/api/v1/chitti/plans", json={
+        "name": "Sequential allocation test", "chitti_type": "FIXED",
+        "total_value": "300.00", "member_count": 1, "frequency": "DAILY", "duration": 3,
+        "contribution_rules": {
+            "type": "FIXED", "installment_amount": "100.00", "partial_payments_allowed": True,
+        },
+        "payout_rules": {"type": "SCHEDULED", "payout_order": "MEMBER_NUMBER"},
+    }, headers=headers)
+    assert plan_response.status_code == 200, plan_response.text
+    chitti_response = await client.post("/api/v1/chitti/", json={
+        "plan_id": plan_response.json()["data"]["id"], "name": "Sequential allocation chitti",
+        "member_count": 1, "start_date": date.today().isoformat(),
+    }, headers=headers)
+    assert chitti_response.status_code == 200, chitti_response.text
+    chitti_id = chitti_response.json()["data"]["id"]
+    customer = (await _make_customers(client, headers, 1))[0]
+    member = await _enroll(client, headers, chitti_id, customer["id"], 1)
+    await _activate_member(client, headers, chitti_id, member["id"])
+    started = await client.post(f"/api/v1/chitti/{chitti_id}/start", headers=headers)
+    assert started.status_code == 200, started.text
+
+    receipt = await client.post(f"/api/v1/chitti/{chitti_id}/contributions", json={
+        "member_id": member["id"], "period_number": 1, "amount": "150.00",
+        "payment_method": "CASH", "payment_date": date.today().isoformat(),
+        "idempotency_key": "settle-period-one-and-partial-period-two",
+    }, headers=headers)
+    assert receipt.status_code == 200, receipt.text
+    data = receipt.json()["data"]
+    assert data["allocated_amount"] == 150.0
+    assert data["unallocated_credit"] == 0.0
+    assert data["allocations"] == [
+        {"period_number": 1, "contribution_id": data["allocations"][0]["contribution_id"], "amount": 100.0},
+        {"period_number": 2, "contribution_id": data["allocations"][1]["contribution_id"], "amount": 50.0},
+    ]
+
+    contributions = (await client.get(
+        f"/api/v1/chitti/{chitti_id}/members/{member['id']}/contributions", headers=headers
+    )).json()["data"]
+    assert [(row["period_number"], float(row["paid_amount"]), float(row["remaining_amount"]), row["status"])
+            for row in contributions] == [
+        (1, 100.0, 0.0, "PAID"),
+        (2, 50.0, 50.0, "PARTIALLY_PAID"),
+        (3, 0.0, 100.0, "UPCOMING"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_payments_preserve_excess_as_member_credit(client, test_user, test_engine, db_session):
     headers = _auth(test_user)
     plan_response = await client.post("/api/v1/chitti/plans", json={
         "name": "Concurrent payment test", "chitti_type": "FIXED", "total_value": "100.00",
@@ -632,11 +687,17 @@ async def test_concurrent_full_payments_cannot_overcollect(client, test_user, te
                 return exc
 
     results = await asyncio.gather(submit("concurrent-a"), submit("concurrent-b"))
-    assert sum(isinstance(value, dict) for value in results) == 1
-    assert sum(isinstance(value, Exception) for value in results) == 1
+    assert sum(isinstance(value, dict) for value in results) == 2
+    assert sum(isinstance(value, Exception) for value in results) == 0
     history = await client.get("/api/v1/payments/", params={"per_page": 100}, headers=headers)
     chitti_receipts = [row for row in history.json()["data"] if row.get("chitti_account_id") == chitti_id]
-    assert len(chitti_receipts) == 1
+    assert len(chitti_receipts) == 2
+    member_data = (await client.get(
+        f"/api/v1/chitti/{chitti_id}/members", headers=headers
+    )).json()["data"][0]
+    assert member_data["total_paid"] == 200
+    assert member_data["unallocated_credit"] == 100
+    assert member_data["outstanding"] == 0
 
 
 @pytest.mark.asyncio
@@ -722,11 +783,11 @@ async def test_two_chitti_payments_sync_history_schedule_progress_and_reports(cl
         f"/api/v1/chitti/{chitti_id}/contributions",
         json={"member_id": members[0]["id"], "period_number": 2, "amount": "100.00",
               "payment_method": "CASH", "payment_date": date.today().isoformat(),
-              "idempotency_key": "future-period-advance-block"},
+              "idempotency_key": "future-period-advance"},
         headers=headers,
     )
-    assert future_advance.status_code == 400
-    assert future_advance.json()["error"]["code"] == "CONTRIBUTION_PERIOD_NOT_DUE"
+    assert future_advance.status_code == 200, future_advance.text
+    assert Decimal(str(future_advance.json()["data"]["allocated_amount"])) == Decimal("100.00")
 
     history_response = await client.get(
         "/api/v1/payments/", params={"per_page": 100}, headers=headers
@@ -737,11 +798,11 @@ async def test_two_chitti_payments_sync_history_schedule_progress_and_reports(cl
         payment for payment in history["data"]
         if payment.get("chitti_account_id") == chitti_id
     ]
-    assert len(chitti_receipts) == 2
+    assert len(chitti_receipts) == 3
     assert {payment["amount"] for payment in chitti_receipts} == {100.0}
-    assert {payment["period_number"] for payment in chitti_receipts} == {1}
+    assert {payment["period_number"] for payment in chitti_receipts} == {1, 2}
     assert all(payment["transaction_id"].startswith("CHT-") for payment in chitti_receipts)
-    assert len({payment["id"] for payment in chitti_receipts}) == 2
+    assert len({payment["id"] for payment in chitti_receipts}) == 3
 
     schedule = (await client.get(
         f"/api/v1/chitti/{chitti_id}/schedule", headers=headers
@@ -753,7 +814,9 @@ async def test_two_chitti_payments_sync_history_schedule_progress_and_reports(cl
     assert schedule[0]["payout_schedule_available"] is True
     assert schedule[0]["scheduled_member_number"] == 1
     assert float(schedule[0]["expected_payout"]) == 200
-    assert schedule[1]["status"] == "UPCOMING"
+    assert schedule[1]["status"] == "PARTIALLY_PAID"
+    assert float(schedule[1]["actual_collection"]) == 100
+    assert float(schedule[1]["pending_collection"]) == 100
     assert schedule[1]["scheduled_member_number"] == 2
     assert float(schedule[1]["expected_payout"]) == 200
 
@@ -795,8 +858,11 @@ async def test_two_chitti_payments_sync_history_schedule_progress_and_reports(cl
     member_rows = (await client.get(
         f"/api/v1/chitti/{chitti_id}/members", headers=headers
     )).json()["data"]
-    assert all(row["total_paid"] == 100 for row in member_rows)
-    assert all(row["outstanding"] == 1300 for row in member_rows)
+    # The first member's explicit period-two payment is a valid advance
+    # allocation, so totals reflect ₹200 paid for that member and ₹100 for the
+    # second member; the ledger remains separately allocated by period.
+    assert sorted(row["total_paid"] for row in member_rows) == [100, 200]
+    assert sorted(row["outstanding"] for row in member_rows) == [1200, 1300]
 
     for member in members:
         contributions = (await client.get(
@@ -810,7 +876,9 @@ async def test_two_chitti_payments_sync_history_schedule_progress_and_reports(cl
         f"/api/v1/payments/customer/{customers[0]['id']}/eligible-accounts",
         headers=headers,
     )).json()["data"]
-    assert eligible["chitti_memberships"][0]["current_period"] == 2
+    # Period two has already been settled as an advance, so quick collection
+    # correctly offers the next outstanding period.
+    assert eligible["chitti_memberships"][0]["current_period"] == 3
     assert eligible["chitti_memberships"][0]["amount_due"] == 100
 
     chitti_dashboard = (await client.get(
@@ -822,4 +890,5 @@ async def test_two_chitti_payments_sync_history_schedule_progress_and_reports(cl
     daily = (await client.get(
         f"/api/v1/reports/daily?date={date.today().isoformat()}", headers=headers
     )).json()["data"]
-    assert daily["chitti_collected"] == 200
+    # Daily collections are receipt based and include the valid advance receipt.
+    assert daily["chitti_collected"] == 300

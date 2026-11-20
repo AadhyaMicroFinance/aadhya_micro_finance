@@ -15,6 +15,8 @@ import asyncio
 from io import BytesIO, StringIO
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from uuid import UUID
 
 import pytest
@@ -24,16 +26,23 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.models.audit import AuditLog
 from app.models.payment import PaymentTransaction
 from app.models.chitti import (
+    Chitti,
     ChittiMember,
     ChittiMemberContribution,
     ChittiPeriodSchedule,
     ChittiPayout,
     ChittiTransaction,
     ChittiLiftEvent,
+    ChittiPaymentAllocation,
 )
+from app.core.exceptions import BadRequestException
 from app.repositories.chitti_repo import ChittiTransactionRepository
 from app.repositories.audit_repo import AuditLogRepository
+from app.services.analytics_service import ChittiAnalyticsService
 from app.services.chitti_service import ChittiService
+from app.services.chitti_financial_values import aggregate_period_values
+from app.services.report_service import ReportService
+from app.utils.timezone import today_ist
 
 PLAN = {
     "name": "Report Consistency Plan",
@@ -53,6 +62,148 @@ PLAN = {
 
 def _auth(test_user):
     return {"Authorization": f"Bearer {test_user['token']}"}
+
+
+def test_legacy_period_values_fall_back_to_schedule_and_reconcile_pending():
+    chitti_id = UUID(int=1)
+    schedule = SimpleNamespace(
+        chitti_id=chitti_id,
+        period_number=1,
+        expected_collection=Decimal("100"),
+        actual_collection=Decimal("25"),
+        pending_collection=Decimal("90"),
+    )
+
+    values = aggregate_period_values([schedule], [], {})
+
+    assert values[(chitti_id, 1)] == {
+        "expected": Decimal("100"),
+        "paid": Decimal("25"),
+        "pending": Decimal("75"),
+    }
+
+
+@pytest.mark.parametrize(
+    ("expected", "paid", "due_date", "status"),
+    [
+        (Decimal("100"), Decimal("40"), None, "PARTIALLY_PAID"),
+        (Decimal("100"), Decimal("100"), None, "PAID"),
+        (Decimal("100"), Decimal("150"), None, "ADVANCE_PAID"),
+        (Decimal("0"), Decimal("10"), None, "ADVANCE_PAID"),
+    ],
+)
+def test_analytics_contribution_state_respects_effective_amounts(
+    expected, paid, due_date, status
+):
+    contribution = SimpleNamespace(
+        expected_amount=expected,
+        paid_amount=paid,
+    )
+
+    assert ChittiAnalyticsService._contribution_state(
+        contribution,
+        due_date,
+        date.today(),
+        effective_expected=expected,
+    ) == status
+
+
+@pytest.mark.asyncio
+async def test_pending_report_ignores_stale_paid_status():
+    due_date = today_ist()
+    contribution = SimpleNamespace(
+        id=UUID(int=1),
+        chitti_id=UUID(int=2),
+        period_number=1,
+        status="PAID",
+    )
+    pending_row = SimpleNamespace(
+        ChittiMemberContribution=contribution,
+        due_date=due_date,
+        chitti_code="CHT-TEST",
+        customer_id=UUID(int=3),
+        full_name="Test Member",
+        customer_code="CUS-TEST",
+        mobile_number="9000000000",
+        chitti_name="Test Chitti",
+        member_number=1,
+    )
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = 0
+
+        async def execute(self, statement):
+            self.calls += 1
+            rows = [] if self.calls == 1 else [pending_row]
+            return SimpleNamespace(all=lambda: rows)
+
+    service = ReportService(FakeSession())
+
+    async def effective_value(_):
+        return {
+            "expected": Decimal("100"),
+            "paid": Decimal("0"),
+            "remaining": Decimal("100"),
+        }
+
+    service._effective_contribution_value = effective_value
+    result = await service.get_pending_details(report_date=due_date)
+
+    assert len(result) == 1
+    assert result[0]["pending"] == Decimal("100")
+    assert result[0]["status"] == "PENDING"
+
+
+@pytest.mark.asyncio
+async def test_contribution_idempotency_key_cannot_match_payout_transaction():
+    chitti_id = UUID(int=1)
+    member_id = UUID(int=2)
+    contribution = SimpleNamespace(id=UUID(int=3))
+    payout = SimpleNamespace(
+        id=UUID(int=4),
+        chitti_id=chitti_id,
+        transaction_type="PAYOUT",
+        member_id=member_id,
+        period_number=1,
+        amount=Decimal("100"),
+    )
+    service = object.__new__(ChittiService)
+    service.chitti_repo = SimpleNamespace(
+        get_by_id_for_update=AsyncMock(
+            return_value=SimpleNamespace(id=chitti_id, status="RUNNING")
+        )
+    )
+    service.member_repo = SimpleNamespace(
+        get_by_id=AsyncMock(
+            return_value=SimpleNamespace(id=member_id, chitti_id=chitti_id)
+        ),
+        get_by_id_for_update=AsyncMock(
+            return_value=SimpleNamespace(id=member_id, chitti_id=chitti_id)
+        ),
+    )
+    service.contribution_repo = SimpleNamespace(
+        get_by_chitti_member_period_for_update=AsyncMock(
+            return_value=contribution
+        )
+    )
+    service.txn_repo = SimpleNamespace(
+        get_by_idempotency_key=AsyncMock(return_value=payout)
+    )
+
+    with pytest.raises(BadRequestException) as exc:
+        await service.record_contribution(
+            chitti_id,
+            member_id=str(member_id),
+            period_number=1,
+            amount=Decimal("100"),
+            payment_method="CASH",
+            payment_date=date.today(),
+            idempotency_key="payout-key-reused-as-contribution",
+        )
+
+    assert exc.value.error_code == "IDEMPOTENCY_KEY_REUSED"
+    service.txn_repo.get_by_idempotency_key.assert_awaited_once()
 
 
 async def _customer(client, headers, index):
@@ -172,6 +323,116 @@ async def _running_lift_chitti(client, headers, member_count=2):
     assert started.status_code == 200, started.text
     assert started.json()["data"]["status"] == "RUNNING"
     return chitti, enrolled
+
+
+@pytest.mark.asyncio
+async def test_lift_credit_is_applied_and_reversed_across_period_allocations(
+    client, test_user, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_lift_chitti(client, headers, member_count=1)
+    member_id = members[0]["id"]
+    payment = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": member_id,
+            "period_number": 1,
+            "amount": "25000.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "lift-credit-allocation-payment",
+        },
+        headers=headers,
+    )
+    assert payment.status_code == 200, payment.text
+    transaction_id = payment.json()["data"]["transaction_id"]
+    assert payment.json()["data"]["unallocated_credit"] == 5000
+
+    allocations = list((await db_session.execute(
+        select(ChittiPaymentAllocation).where(
+            ChittiPaymentAllocation.source_transaction_id == UUID(transaction_id)
+        )
+    )).scalars().all())
+    assert sum(
+        (row.amount for row in allocations if row.allocation_type == "CONTRIBUTION"),
+        Decimal("0"),
+    ) == Decimal("20000.00")
+    assert sum(
+        (row.amount for row in allocations if row.allocation_type == "CREDIT"),
+        Decimal("0"),
+    ) == Decimal("5000.00")
+
+    lift = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/lifts",
+        json={
+            "member_id": member_id,
+            "period_number": 1,
+            "lift_date": date.today().isoformat(),
+        },
+        headers=headers,
+    )
+    assert lift.status_code == 200, lift.text
+
+    member_data = next(
+        row for row in (
+            await client.get(
+                f"/api/v1/chitti/{chitti['id']}/members", headers=headers
+            )
+        ).json()["data"]
+        if row["id"] == member_id
+    )
+    assert member_data["total_expected"] == 23600
+    assert member_data["total_paid"] == 25000
+    assert member_data["unallocated_credit"] == 1400
+    assert member_data["outstanding"] == 0
+
+    schedule = (await client.get(
+        f"/api/v1/chitti/{chitti['id']}/schedule", headers=headers
+    )).json()["data"]
+    assert sum(row["expected_collection"] for row in schedule) == 23600
+    assert sum(row["actual_collection"] for row in schedule) == 23600
+    assert sum(row["pending_collection"] for row in schedule) == 0
+
+    overview = (await client.get(
+        "/api/v1/analytics/chitti/overview", headers=headers
+    )).json()["data"]
+    metric = next(
+        row for row in overview["chitti_metrics"] if row["id"] == chitti["id"]
+    )
+    assert metric["unallocated_credit"] == 1400
+    assert overview["kpis"]["total_unallocated_credit"] == 1400
+
+    reversal = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/transactions/{transaction_id}/reverse",
+        json={"reversal_reason": "Reverse allocated receipt"},
+        headers=headers,
+    )
+    assert reversal.status_code == 200, reversal.text
+
+    member_after_reversal = next(
+        row for row in (
+            await client.get(
+                f"/api/v1/chitti/{chitti['id']}/members", headers=headers
+            )
+        ).json()["data"]
+        if row["id"] == member_id
+    )
+    assert member_after_reversal["total_paid"] == 0
+    assert member_after_reversal["unallocated_credit"] == 0
+    assert member_after_reversal["outstanding"] == 23600
+
+    schedule_after_reversal = (await client.get(
+        f"/api/v1/chitti/{chitti['id']}/schedule", headers=headers
+    )).json()["data"]
+    assert sum(row["actual_collection"] for row in schedule_after_reversal) == 0
+    assert sum(row["pending_collection"] for row in schedule_after_reversal) == 23600
+
+    allocations_after_reversal = list((await db_session.execute(
+        select(ChittiPaymentAllocation).where(
+            ChittiPaymentAllocation.source_transaction_id == UUID(transaction_id)
+        )
+    )).scalars().all())
+    assert sum((row.amount for row in allocations_after_reversal), Decimal("0")) == Decimal("0")
 
 
 @pytest.mark.asyncio
@@ -319,6 +580,15 @@ async def test_chitti_partial_reversal_restores_ledger_and_audit(client, test_us
     assert repeated.status_code == 200
     assert repeated.json()["data"]["duplicate"] is True
 
+    reversal_rows = list((await db_session.execute(
+        select(ChittiTransaction).where(
+            ChittiTransaction.chitti_id == UUID(chitti["id"]),
+            ChittiTransaction.transaction_type == "REVERSAL",
+        )
+    )).scalars().all())
+    assert len(reversal_rows) == 1
+    assert reversal_rows[0].original_transaction_id == UUID(original_id)
+
     rows = (await client.get(
         f"/api/v1/chitti/{chitti['id']}/members/{members[0]['id']}/contributions",
         headers=headers,
@@ -332,6 +602,169 @@ async def test_chitti_partial_reversal_restores_ledger_and_audit(client, test_us
         select(AuditLog).where(AuditLog.action == "CHITTI_CONTRIBUTION_REVERSED")
     )).scalars().all())
     assert len(audit) == 1
+
+
+@pytest.mark.asyncio
+async def test_normal_contribution_duplicate_creates_one_audit_entry(
+    client, test_user, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    body = {
+        "member_id": members[0]["id"],
+        "period_number": 1,
+        "amount": "400.00",
+        "payment_method": "CASH",
+        "payment_date": date.today().isoformat(),
+        "idempotency_key": "normal-contribution-audit",
+    }
+
+    first = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json=body,
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["data"]["duplicate"] is False
+
+    contribution = (
+        await db_session.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                ChittiMemberContribution.period_number == 1,
+            )
+        )
+    ).scalar_one()
+    member = (
+        await db_session.execute(
+            select(ChittiMember).where(ChittiMember.id == UUID(members[0]["id"]))
+        )
+    ).scalar_one()
+    schedule = (
+        await db_session.execute(
+            select(ChittiPeriodSchedule).where(
+                ChittiPeriodSchedule.chitti_id == UUID(chitti["id"]),
+                ChittiPeriodSchedule.period_number == 1,
+            )
+        )
+    ).scalar_one()
+    contribution.expected_amount = Decimal("1250.00")
+    contribution.remaining_amount = Decimal("850.00")
+    contribution.status = "PARTIALLY_PAID"
+    member.total_expected_amount = Decimal("4321.00")
+    member.total_paid_amount = Decimal("432.00")
+    member.outstanding_amount = Decimal("3889.00")
+    schedule.expected_collection = Decimal("9999.00")
+    schedule.actual_collection = Decimal("7777.00")
+    schedule.pending_collection = Decimal("2222.00")
+    await db_session.flush()
+    before_retry = (
+        contribution.expected_amount,
+        contribution.remaining_amount,
+        contribution.status,
+        member.total_expected_amount,
+        member.total_paid_amount,
+        member.outstanding_amount,
+        schedule.expected_collection,
+        schedule.actual_collection,
+        schedule.pending_collection,
+    )
+
+    repeated = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json=body,
+        headers=headers,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["data"]["duplicate"] is True
+    after_retry = (
+        contribution.expected_amount,
+        contribution.remaining_amount,
+        contribution.status,
+        member.total_expected_amount,
+        member.total_paid_amount,
+        member.outstanding_amount,
+        schedule.expected_collection,
+        schedule.actual_collection,
+        schedule.pending_collection,
+    )
+    assert after_retry == before_retry
+
+    transaction_id = UUID(first.json()["data"]["transaction_id"])
+    transaction = (
+        await db_session.execute(
+            select(ChittiTransaction).where(ChittiTransaction.id == transaction_id)
+        )
+    ).scalar_one()
+    assert transaction.idempotency_key == body["idempotency_key"]
+    assert transaction.amount == Decimal(body["amount"])
+    audit_entries = list((await db_session.execute(
+        select(AuditLog).where(
+            AuditLog.action == "CHITTI_CONTRIBUTION_RECORDED",
+            AuditLog.entity_id == transaction_id,
+        )
+    )).scalars().all())
+    assert len(audit_entries) == 1
+    payload = audit_entries[0].new_value
+    assert payload["chitti_id"] == chitti["id"]
+    assert payload["member_id"] == members[0]["id"]
+    assert payload["transaction_id"] == str(transaction_id)
+    assert payload["contribution_id"] == first.json()["data"]["contribution_id"]
+    assert payload["period_number"] == 1
+    assert payload["amount"] == "400.00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("paid", "expected_outstanding"),
+    [
+        (Decimal("100"), 0.0),
+        (Decimal("40"), 60.0),
+        (Decimal("150"), 0.0),
+    ],
+)
+async def test_member_detail_outstanding_is_clamped_without_losing_overpayment(
+    client, test_user, db_session, paid, expected_outstanding
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_chitti(client, headers, members=1)
+    contributions = list(
+        (
+            await db_session.execute(
+                select(ChittiMemberContribution)
+                .where(
+                    ChittiMemberContribution.chitti_id == UUID(chitti["id"]),
+                    ChittiMemberContribution.member_id == UUID(members[0]["id"]),
+                )
+                .order_by(ChittiMemberContribution.period_number)
+            )
+        ).scalars().all()
+    )
+    for contribution in contributions:
+        contribution.expected_amount = Decimal("0")
+        contribution.paid_amount = Decimal("0")
+        contribution.remaining_amount = Decimal("0")
+        contribution.status = "UPCOMING"
+    first = contributions[0]
+    first.expected_amount = Decimal("100")
+    first.paid_amount = paid
+    first.remaining_amount = max(Decimal("100") - paid, Decimal("0"))
+    first.status = "PAID" if first.remaining_amount == 0 else "PARTIALLY_PAID"
+    await db_session.flush()
+
+    response = await client.get(
+        f"/api/v1/chitti/{chitti['id']}/members/{members[0]['id']}",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    data = response.json()["data"]
+    assert data["total_expected_amount"] == 100.0
+    assert data["total_paid_amount"] == float(paid)
+    assert data["outstanding_amount"] == expected_outstanding
+
+    await db_session.refresh(first)
+    assert first.paid_amount == paid
 
 
 @pytest.mark.asyncio
@@ -807,6 +1240,7 @@ async def test_normal_and_duplicate_payout_posting(
         assert len(ledger) == 1
         assert ledger[0].amount == Decimal("850.00")
         assert ledger[0].idempotency_key == "normal-payout-repeat"
+        assert payouts[0].ledger_transaction_id == ledger[0].id
 
         schedule = (
             await fresh.execute(
@@ -1611,6 +2045,153 @@ async def test_lift_paid_before_lift_recalculates_member_and_period_totals(
             Decimal("6200"),
             Decimal("6200"),
         ]
+
+        analytics = (
+            await client.get("/api/v1/analytics/chitti/overview", headers=headers)
+        ).json()["data"]
+        member_metric = next(
+            row for row in analytics["member_rows"]
+            if row["member_id"] == members[0]["id"]
+        )
+        assert member_metric["expected_total"] == 23600.0
+        assert member_metric["paid_total"] == 5000.0
+        assert member_metric["pending_total"] == 18600.0
+
+        chitti_metric = next(
+            row for row in analytics["chitti_metrics"]
+            if row["id"] == chitti["id"]
+        )
+        assert chitti_metric["expected"] == 23600.0
+        assert chitti_metric["collected"] == 5000.0
+        assert chitti_metric["pending"] == 18600.0
+
+
+@pytest.mark.asyncio
+async def test_lift_effective_values_override_stale_period_and_report_aggregates(
+    client, test_user, db_session
+):
+    headers = _auth(test_user)
+    chitti, members = await _running_lift_chitti(client, headers, member_count=1)
+    contribution = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/contributions",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "amount": "5000.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "lift-effective-report-reconciliation",
+        },
+        headers=headers,
+    )
+    assert contribution.status_code == 200, contribution.text
+    lift = await client.post(
+        f"/api/v1/chitti/{chitti['id']}/lifts",
+        json={
+            "member_id": members[0]["id"],
+            "period_number": 1,
+            "lift_date": date.today().isoformat(),
+        },
+        headers=headers,
+    )
+    assert lift.status_code == 200, lift.text
+    await db_session.commit()
+
+    chitti_row = (
+        await db_session.execute(select(Chitti).where(Chitti.id == UUID(chitti["id"])))
+    ).scalar_one()
+    schedules = list((await db_session.execute(
+        select(ChittiPeriodSchedule)
+        .where(ChittiPeriodSchedule.chitti_id == chitti_row.id)
+        .order_by(ChittiPeriodSchedule.period_number)
+    )).scalars().all())
+    contributions = list((await db_session.execute(
+        select(ChittiMemberContribution)
+        .where(ChittiMemberContribution.chitti_id == chitti_row.id)
+        .order_by(ChittiMemberContribution.period_number)
+    )).scalars().all())
+    payment = (
+        await db_session.execute(
+            select(ChittiTransaction).where(
+                ChittiTransaction.chitti_id == chitti_row.id,
+                ChittiTransaction.member_id == UUID(members[0]["id"]),
+                ChittiTransaction.transaction_type == "CONTRIBUTION",
+                ChittiTransaction.period_number == 1,
+            )
+        )
+    ).scalar_one()
+    payment.payment_date = schedules[1].due_date
+
+    for schedule in schedules:
+        schedule.expected_collection = Decimal("5000")
+        schedule.actual_collection = (
+            Decimal("5000") if schedule.period_number == 1 else Decimal("0")
+        )
+        schedule.pending_collection = (
+            Decimal("0") if schedule.period_number == 1 else Decimal("5000")
+        )
+    # Simulate the legacy stale cache that used to exclude this still-due member
+    # from report drill-downs even though the Lift-effective amount is positive.
+    contributions[1].remaining_amount = Decimal("0")
+    contributions[1].status = "PAID"
+    await db_session.commit()
+
+    first_date = schedules[0].due_date.isoformat()
+    last_date = schedules[-1].due_date.isoformat()
+    analytics_response = await client.get(
+        "/api/v1/analytics/chitti/overview",
+        params={"start_date": first_date, "end_date": last_date},
+        headers=headers,
+    )
+    assert analytics_response.status_code == 200, analytics_response.text
+    analytics = analytics_response.json()["data"]
+    assert analytics["kpis"]["range_expected"] == 23600.0
+    assert analytics["kpis"]["range_pending"] == 18600.0
+    assert analytics["kpis"]["total_expected"] == 23600.0
+    assert analytics["kpis"]["total_pending"] == 18600.0
+    assert sum(row["expected"] for row in analytics["daily"]["series"]) == 23600.0
+    assert analytics["daily"]["pending"] == 18600.0
+    period_two_series = next(
+        row for row in analytics["daily"]["series"]
+        if row["date"] == schedules[1].due_date.isoformat()
+    )
+    assert period_two_series["collected"] == 5000.0
+    assert period_two_series["pending"] == 6200.0
+    metric = next(
+        row for row in analytics["chitti_metrics"] if row["id"] == chitti["id"]
+    )
+    assert metric["expected"] == 23600.0
+    assert metric["pending"] == 18600.0
+
+    period_two_date = schedules[1].due_date.isoformat()
+    report_response = await client.get(
+        "/api/v1/reports/daily",
+        params={"date": period_two_date},
+        headers=headers,
+    )
+    assert report_response.status_code == 200, report_response.text
+    report = report_response.json()["data"]
+    assert report["chitti_expected"] == 6200.0
+    assert report["chitti_collected"] == 5000.0
+    assert report["chitti_pending"] == 6200.0
+    pending = next(
+        row for row in report["pending_details"]
+        if row["source"] == "CHITTI"
+        and row["reference_id"] == str(contributions[1].id)
+    )
+    assert pending["expected"] == 6200.0
+    assert pending["pending"] == 6200.0
+    assert pending["status"] != "PAID"
+
+    plan_response = await client.get(
+        f"/api/v1/reports/chitti-plans/{chitti_row.plan_id}/metrics",
+        headers=headers,
+    )
+    assert plan_response.status_code == 200, plan_response.text
+    plan_metrics = plan_response.json()["data"]
+    assert Decimal(plan_metrics["total_expected"]) == Decimal("23600")
+    assert Decimal(plan_metrics["total_collected"]) == Decimal("5000")
+    assert Decimal(plan_metrics["total_pending"]) == Decimal("18600")
 
 
 @pytest.mark.asyncio

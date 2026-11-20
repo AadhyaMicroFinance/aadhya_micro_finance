@@ -6,6 +6,7 @@ import os
 import uuid
 from datetime import date, timedelta
 from decimal import Decimal
+from urllib.parse import urlparse
 
 import pytest
 import pytest_asyncio
@@ -24,6 +25,13 @@ TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",
 )
 
+# The suite recreates the public schema. Keep its destructive capability pinned
+# to the disposable Docker endpoint rather than accepting any database whose
+# name merely happens to end in ``_test``.
+TEST_DATABASE_HOSTS = {"127.0.0.1", "localhost", "::1"}
+TEST_DATABASE_PORT = 5434
+TEST_DATABASE_NAME = "finance_chitti_test"
+
 
 # The engine and every session fixture share one (function-scoped) event loop.
 # A custom event_loop fixture used to be defined here; it conflicted with
@@ -37,14 +45,22 @@ def _assert_scratch_database() -> None:
         raise RuntimeError(
             "TEST_DATABASE_URL must be explicitly configured to a dedicated disposable test database."
         )
-    database = TEST_DATABASE_URL.rsplit("/", 1)[-1]
+    target = urlparse(TEST_DATABASE_URL)
+    database = target.path.rsplit("/", 1)[-1]
     if not database.endswith("_test") or "?" in database:
         raise RuntimeError(
             f"Refusing to reset schema of non-test database '{database}'. "
             "TEST_DATABASE_URL must point at a *_test database."
         )
-    from urllib.parse import urlparse
-    target = urlparse(TEST_DATABASE_URL)
+    if (
+        target.hostname not in TEST_DATABASE_HOSTS
+        or target.port != TEST_DATABASE_PORT
+        or database != TEST_DATABASE_NAME
+    ):
+        raise RuntimeError(
+            "TEST_DATABASE_URL must target the dedicated local "
+            f"{TEST_DATABASE_NAME} endpoint on port {TEST_DATABASE_PORT}."
+        )
     from app.config import get_settings
     development = urlparse(get_settings().DATABASE_URL)
     if (target.hostname, target.port, target.path) == (
