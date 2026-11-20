@@ -24,12 +24,18 @@ from app.models.chitti import (
     ChittiMember,
     ChittiMemberContribution,
     ChittiPeriodSchedule,
+    ChittiPaymentAllocation,
     ChittiTransaction,
+    ChittiLiftEvent,
 )
 from app.models.customer import Customer
 from app.models.finance import FinanceSchedule
 from app.models.payment import PaymentTransaction
 from app.models.user import User
+from app.services.chitti_financial_values import (
+    aggregate_period_values,
+    effective_contribution_values,
+)
 from app.utils.timezone import today_ist
 
 
@@ -60,6 +66,65 @@ class ReportService:
 
     def __init__(self, session: AsyncSession):
         self.session = session
+        self._effective_cache: dict[UUID, dict] = {}
+        self._period_cache: dict[UUID, dict] = {}
+
+    async def _load_chitti_effective_values(self, chitti_id: UUID) -> None:
+        if chitti_id in self._effective_cache:
+            return
+        chitti = (await self.session.execute(
+            select(Chitti).where(Chitti.id == chitti_id)
+        )).scalar_one_or_none()
+        members = list((await self.session.execute(
+            select(ChittiMember).where(ChittiMember.chitti_id == chitti_id)
+        )).scalars().all())
+        lifts = list((await self.session.execute(
+            select(ChittiLiftEvent).where(ChittiLiftEvent.chitti_id == chitti_id)
+        )).scalars().all())
+        rows = list((await self.session.execute(
+            select(ChittiMemberContribution).where(
+                ChittiMemberContribution.chitti_id == chitti_id
+            )
+        )).scalars().all())
+        schedules = list((await self.session.execute(
+            select(ChittiPeriodSchedule).where(
+                ChittiPeriodSchedule.chitti_id == chitti_id
+            )
+        )).scalars().all())
+        values = (
+            effective_contribution_values(chitti, members, lifts, rows)
+            if chitti else {}
+        )
+        self._effective_cache[chitti_id] = values
+        self._period_cache[chitti_id] = aggregate_period_values(
+            schedules, rows, values
+        )
+
+    async def _effective_contribution_value(self, contribution) -> dict:
+        chitti_id = contribution.chitti_id
+        await self._load_chitti_effective_values(chitti_id)
+        return self._effective_cache[chitti_id].get(
+            contribution.id,
+            {
+                "expected": contribution.expected_amount,
+                "paid": contribution.paid_amount,
+                "remaining": contribution.remaining_amount,
+            },
+        )
+
+    async def _effective_period_value(self, schedule) -> dict:
+        await self._load_chitti_effective_values(schedule.chitti_id)
+        return self._period_cache[schedule.chitti_id].get(
+            (schedule.chitti_id, schedule.period_number),
+            {
+                "expected": schedule.expected_collection,
+                "paid": schedule.actual_collection,
+                "pending": max(
+                    schedule.expected_collection - schedule.actual_collection,
+                    Decimal("0"),
+                ),
+            },
+        )
 
     async def get_range_report(self, start_date: date, end_date: date, report_type: str) -> dict:
         """Aggregate existing authoritative daily ledgers over a bounded date range."""
@@ -125,6 +190,7 @@ class ReportService:
             "chitti_collected": sum((Decimal(str(r["amount"])) * (-1 if r.get("is_reversal") else 1) for r in summary_chitti_rows), Decimal("0")),
             "finance_pending": sum((Decimal(str(r["pending"])) for r in summary_finance_due), Decimal("0")),
             "chitti_pending": sum((Decimal(str(r["pending"])) for r in summary_chitti_due), Decimal("0")),
+            "chitti_unallocated_credit": await self._unallocated_credit_total(),
             "transactions": rows, "pending_details": pending,
             "breakdown": breakdown,
         })
@@ -181,8 +247,19 @@ class ReportService:
             "pending_total": pending["total"],
             "finance_pending": pending["finance"],
             "chitti_pending": pending["chitti"],
+            "chitti_unallocated_credit": await self._unallocated_credit_total(),
             "collection_rate": float(collection_rate),
         })
+
+    async def _unallocated_credit_total(self) -> Decimal:
+        result = await self.session.execute(
+            select(func.coalesce(func.sum(ChittiPaymentAllocation.amount), Decimal("0")))
+            .where(ChittiPaymentAllocation.allocation_type == "CREDIT")
+        )
+        total = Decimal(str(result.scalar_one()))
+        if total < 0:
+            raise RuntimeError("Chitti payment allocation history contains negative credit.")
+        return total
 
     # ===========================================================================
     # Detailed daily report (metrics + by-user + pending + recent)
@@ -377,6 +454,7 @@ class ReportService:
         fully paid, with the owning customer attached. This powers the
         'pending when clicked' drill-down."""
         d = report_date or today_ist()
+        today = today_ist()
         items: list[dict] = []
 
         # ---- Finance installments due on the day ----
@@ -451,12 +529,22 @@ class ReportService:
             .join(Customer, Customer.id == ChittiMember.customer_id)
             .where(
                 ChittiPeriodSchedule.due_date.between(d, end_date) if end_date else ChittiPeriodSchedule.due_date == d,
-                ChittiMemberContribution.remaining_amount > 0,
                 Chitti.status.in_(FINANCIAL_CHITTI_STATUSES),
             )
         )
         for r in chitti_rows.all():
             con = r.ChittiMemberContribution
+            effective = await self._effective_contribution_value(con)
+            if effective["remaining"] <= 0:
+                continue
+            if effective["paid"] > 0:
+                status = "PARTIALLY_PAID"
+            elif r.due_date < today:
+                status = "OVERDUE"
+            elif r.due_date > today:
+                status = "UPCOMING"
+            else:
+                status = "PENDING"
             items.append({
                 "source": "CHITTI",
                 "reference_id": str(con.id),
@@ -469,10 +557,10 @@ class ReportService:
                 "due_date": str(r.due_date),
                 "chitti_name": r.chitti_name,
                 "member_number": r.member_number,
-                "expected": con.expected_amount,
-                "paid": con.paid_amount,
-                "pending": con.remaining_amount,
-                "status": con.status,
+                "expected": effective["expected"],
+                "paid": effective["paid"],
+                "pending": effective["remaining"],
+                "status": status,
             })
 
         return items
@@ -657,15 +745,18 @@ class ReportService:
         )
         total_members = member_count.scalar() or 0
 
-        # Schedule aggregates
-        sched_agg = await self.session.execute(
-            select(
-                func.coalesce(func.sum(ChittiPeriodSchedule.expected_collection), Decimal("0")),
-                func.coalesce(func.sum(ChittiPeriodSchedule.actual_collection), Decimal("0")),
-                func.coalesce(func.sum(ChittiPeriodSchedule.pending_collection), Decimal("0")),
-            ).where(ChittiPeriodSchedule.chitti_id.in_(chitti_ids))
-        )
-        expected, collected, pending = sched_agg.one()
+        for chitti in chittis:
+            await self._load_chitti_effective_values(chitti.id)
+        chitti_by_id = {chitti.id: chitti for chitti in chittis}
+        period_values = [
+            values
+            for chitti_id, chitti in chitti_by_id.items()
+            if chitti.status in FINANCIAL_CHITTI_STATUSES
+            for values in self._period_cache[chitti_id].values()
+        ]
+        expected = sum((values["expected"] for values in period_values), Decimal("0"))
+        collected = sum((values["paid"] for values in period_values), Decimal("0"))
+        pending = sum((values["pending"] for values in period_values), Decimal("0"))
 
         # Payouts total
         from app.models.chitti import ChittiPayout
@@ -717,17 +808,19 @@ class ReportService:
         finance_total, finance_count = fin.one()
 
         chit = await self.session.execute(
-            select(
-                func.coalesce(func.sum(ChittiPeriodSchedule.expected_collection), Decimal("0")),
-                func.count(ChittiPeriodSchedule.id),
-            )
+            select(ChittiPeriodSchedule)
             .join(Chitti, Chitti.id == ChittiPeriodSchedule.chitti_id)
             .where(
                 ChittiPeriodSchedule.due_date == d,
                 Chitti.status.in_(FINANCIAL_CHITTI_STATUSES),
             )
         )
-        chitti_total, chitti_count = chit.one()
+        chitti_schedules = list(chit.scalars().all())
+        chitti_total = Decimal("0")
+        for schedule in chitti_schedules:
+            values = await self._effective_period_value(schedule)
+            chitti_total += values["expected"]
+        chitti_count = len(chitti_schedules)
 
         return {
             "finance_total": finance_total,
@@ -831,19 +924,18 @@ class ReportService:
         finance_pending = fin.scalar() or Decimal("0")
 
         chit = await self.session.execute(
-            select(
-                func.coalesce(
-                    func.sum(ChittiPeriodSchedule.pending_collection), Decimal("0")
-                )
-            )
+            select(ChittiPeriodSchedule)
             .join(Chitti, Chitti.id == ChittiPeriodSchedule.chitti_id)
             .where(
                 ChittiPeriodSchedule.due_date == d,
-                ChittiPeriodSchedule.pending_collection > 0,
                 Chitti.status.in_(FINANCIAL_CHITTI_STATUSES),
             )
         )
-        chitti_pending = chit.scalar() or Decimal("0")
+        chitti_schedules = list(chit.scalars().all())
+        chitti_pending = Decimal("0")
+        for schedule in chitti_schedules:
+            values = await self._effective_period_value(schedule)
+            chitti_pending += values["pending"]
 
         return {
             "finance": finance_pending,

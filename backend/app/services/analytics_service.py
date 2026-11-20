@@ -4,10 +4,9 @@ Chitti analytics service — single source of truth for the Chitti control centr
 Money flows are read from the immutable chitti ledger (`chitti_transactions`):
   CONTRIBUTION increases money received, REVERSAL decreases it.
 
-Expected / pending / overdue come from `chitti_period_schedule` (period level,
-carries due dates) and `chitti_member_contributions` (member level, tracks
-partial payments).  Nothing here is hardcoded — every figure is aggregated from
-those tables.
+Expected / pending / overdue use Lift-effective member contributions when
+available, grouped by period schedule due dates. Legacy periods without member
+contribution rows fall back to their persisted schedule aggregates.
 
 All arithmetic is Decimal; values are converted to float only when building the
 response payload (presentation boundary).
@@ -26,16 +25,23 @@ from app.models.chitti import (
     ChittiMember,
     ChittiMemberContribution,
     ChittiPeriodSchedule,
+    ChittiPaymentAllocation,
     ChittiPlan,
     ChittiTransaction,
+    ChittiLiftEvent,
 )
 from app.models.customer import Customer
 from app.models.user import User
+from app.services.chitti_financial_values import (
+    aggregate_period_values,
+    unallocated_credit_by_member,
+)
 from app.utils.timezone import from_utc, today_ist
 
 ZERO = Decimal("0")
 CONTRIBUTION_TYPES = ("CONTRIBUTION", "REVERSAL")
 METHODS = ("CASH", "UPI", "BANK_TRANSFER", "OTHER")
+FINANCIAL_CHITTI_STATUSES = ("RUNNING", "PAUSED", "COMPLETED")
 
 
 def _f(value) -> float:
@@ -102,6 +108,12 @@ class ChittiAnalyticsService:
         member_by_id = {m.id: m for m in members}
         schedules = await self._load_schedules(chitti_ids)
         contributions = await self._load_contributions(chitti_ids, member_id)
+        effective_values = await self._effective_contribution_values(
+            chittis, members, contributions
+        )
+        period_values = aggregate_period_values(
+            schedules, contributions, effective_values
+        )
         ledger = await self._load_ledger(chitti_ids, member_id, payment_mode)
         user_names = await self._load_user_names({t.created_by for t in ledger})
 
@@ -119,28 +131,88 @@ class ChittiAnalyticsService:
 
         # DRAFT/CANCELLED chittis have schedules but nothing is actually due yet,
         # so they must not inflate expected / pending / overdue totals.
-        financial_ids = {c.id for c in chittis if c.status not in ("DRAFT", "CANCELLED")}
+        financial_ids = {
+            c.id for c in chittis if c.status in FINANCIAL_CHITTI_STATUSES
+        }
         fin_schedules = [s for s in schedules if s.chitti_id in financial_ids]
 
+        schedule_by_key = {(s.chitti_id, s.period_number): s for s in schedules}
+        effective_fin_schedules = [
+            (schedule, period_values[(schedule.chitti_id, schedule.period_number)])
+            for schedule in fin_schedules
+        ]
+        effective_financial_periods = [
+            values for (chitti_id, _), values in period_values.items()
+            if chitti_id in financial_ids
+        ]
+        allocations = await self._load_allocations(chitti_ids, member_id)
+        credits_by_member = unallocated_credit_by_member(allocations)
+        total_unallocated_credit = sum(credits_by_member.values(), ZERO)
+        contribution_rows = []
+        for con in contributions:
+            sched = schedule_by_key.get((con.chitti_id, con.period_number))
+            due = sched.due_date if sched else None
+            effective = effective_values[con.id]
+            contribution_rows.append(
+                {
+                    "contribution": con,
+                    "due_date": due,
+                    "effective": effective,
+                    "state": self._contribution_state(
+                        con,
+                        due,
+                        today,
+                        effective_expected=effective["expected"],
+                        effective_remaining=effective["remaining"],
+                    ),
+                }
+            )
+
         expected_range = sum(
-            (s.expected_collection for s in fin_schedules if start <= s.due_date <= end),
+            (
+                values["expected"]
+                for schedule, values in effective_fin_schedules
+                if start <= schedule.due_date <= end
+            ),
             ZERO,
         )
         expected_today = sum(
-            (s.expected_collection for s in fin_schedules if s.due_date == today), ZERO
+            (
+                values["expected"]
+                for schedule, values in effective_fin_schedules
+                if schedule.due_date == today
+            ),
+            ZERO,
         )
-
-        total_expected = sum((s.expected_collection for s in fin_schedules), ZERO)
-        total_actual = sum((s.actual_collection for s in fin_schedules), ZERO)
+        pending_range = sum(
+            (
+                values["pending"]
+                for schedule, values in effective_fin_schedules
+                if start <= schedule.due_date <= end
+            ),
+            ZERO,
+        )
+        pending_today = sum(
+            (
+                values["pending"]
+                for schedule, values in effective_fin_schedules
+                if schedule.due_date == today
+            ),
+            ZERO,
+        )
+        total_expected = sum(
+            (values["expected"] for values in effective_financial_periods),
+            ZERO,
+        )
         total_pending = sum(
-            (max(s.expected_collection - s.actual_collection, ZERO) for s in fin_schedules),
+            (values["pending"] for values in effective_financial_periods),
             ZERO,
         )
         overdue_amount = sum(
             (
-                max(s.expected_collection - s.actual_collection, ZERO)
-                for s in fin_schedules
-                if s.due_date < today
+                values["pending"]
+                for schedule, values in effective_fin_schedules
+                if schedule.due_date < today
             ),
             ZERO,
         )
@@ -155,21 +227,10 @@ class ChittiAnalyticsService:
         enrolled_member_count = len(members)
 
         # ---- member-level rows (derived from contributions + schedule dates) ----
-        schedule_by_key = {(s.chitti_id, s.period_number): s for s in schedules}
-        contribution_rows = []
-        for con in contributions:
-            sched = schedule_by_key.get((con.chitti_id, con.period_number))
-            due = sched.due_date if sched else None
-            contribution_rows.append(
-                {
-                    "contribution": con,
-                    "due_date": due,
-                    "state": self._contribution_state(con, due, today),
-                }
-            )
-
         member_rows = self._build_member_rows(
-            members, customers, contributions, schedule_by_key, ledger, today
+            members, customers, contributions, schedule_by_key, ledger, today,
+            effective_values=effective_values,
+            credits_by_member=credits_by_member,
         )
         chitti_name_map = {c.id: c.name for c in chittis}
         for row in member_rows:
@@ -179,12 +240,15 @@ class ChittiAnalyticsService:
             member_rows = [r for r in member_rows if r["status"] == wanted]
 
         pending_details = self._build_pending_details(
-            contribution_rows, member_by_id, customers, chittis, ledger, today
+            contribution_rows, member_by_id, customers, chittis, ledger, today,
+            credits_by_member=credits_by_member,
         )
 
         # ---- series & distributions ----
-        daily_series = self._daily_series(fin_schedules, ledger, start, end, today)
-        monthly_series = self._monthly_series(fin_schedules, ledger, end)
+        daily_series = self._daily_series(
+            fin_schedules, ledger, start, end, today, period_values
+        )
+        monthly_series = self._monthly_series(fin_schedules, ledger, end, period_values)
         status_distribution = self._status_distribution(contribution_rows)
         mode_distribution = self._mode_distribution(range_txns)
         today_by_method = self._method_totals(today_txns)
@@ -194,18 +258,21 @@ class ChittiAnalyticsService:
         due_today_members = {
             con.member_id
             for con, s in ((c, schedule_by_key.get((c.chitti_id, c.period_number))) for c in contributions)
-            if s and s.due_date == today
+            if con.chitti_id in financial_ids and s and s.due_date == today
         }
         partial_today = sum(
             1
             for row in contribution_rows
-            if row["due_date"] == today
-            and ZERO < row["contribution"].paid_amount < row["contribution"].expected_amount
+            if row["contribution"].chitti_id in financial_ids
+            and row["due_date"] == today
+            and ZERO < row["contribution"].paid_amount < row["effective"]["expected"]
         )
         overdue_contributions = sum(
             1
             for row in contribution_rows
-            if row["state"] == "OVERDUE" and row["contribution"].remaining_amount > ZERO
+            if row["contribution"].chitti_id in financial_ids
+            and row["state"] == "OVERDUE"
+            and row["effective"]["remaining"] > ZERO
         )
 
         monthly_collected = sum(
@@ -228,17 +295,36 @@ class ChittiAnalyticsService:
         refunds = sum(
             (t.amount for t in ledger if t.transaction_type == "REVERSAL"), ZERO
         )
-        advance_total = sum(
+        advance_total = total_unallocated_credit + sum(
             (
-                max(row["contribution"].paid_amount - row["contribution"].expected_amount, ZERO)
+                max(row["contribution"].paid_amount - row["effective"]["expected"], ZERO)
+                + (
+                    row["effective"]["paid"]
+                    if schedule_by_key.get(
+                        (row["contribution"].chitti_id, row["contribution"].period_number)
+                    )
+                    and schedule_by_key[
+                        (row["contribution"].chitti_id, row["contribution"].period_number)
+                    ].due_date > today
+                    else ZERO
+                )
                 for row in contribution_rows
+                if row["contribution"].chitti_id in financial_ids
             ),
             ZERO,
         )
 
         # ---- chitti-wise metrics ----
         chitti_metrics = self._build_chitti_metrics(
-            chittis, plan_names, members, schedules, ledger, today, month=today.month
+            chittis,
+            plan_names,
+            members,
+            schedules,
+            ledger,
+            today,
+            month=today.month,
+            period_values=period_values,
+            credits_by_member=credits_by_member,
         )
         if chitti_id:
             chitti_metrics = [m for m in chitti_metrics if m["id"] == str(chitti_id)]
@@ -262,7 +348,7 @@ class ChittiAnalyticsService:
                 "date": str(today),
                 "expected": _f(expected_today),
                 "collected": _f(collected_today),
-                "pending": _f(max(expected_today - collected_today, ZERO)),
+                "pending": _f(pending_today),
                 "members_paid": len(paid_member_ids),
                 "members_due": len(due_today_members),
                 "members_unpaid": len(due_today_members - paid_member_ids),
@@ -278,16 +364,17 @@ class ChittiAnalyticsService:
                 "total_chitti_value": _f(total_value),
                 "total_expected": _f(total_expected),
                 "total_collected": _f(collected_lifetime),
+                "total_unallocated_credit": _f(total_unallocated_credit),
                 "total_pending": _f(total_pending),
                 "total_overdue": _f(overdue_amount),
                 "total_members": enrolled_member_count,
                 "collection_efficiency": _pct(collected_lifetime, total_expected),
                 "range_expected": _f(expected_range),
                 "range_collected": _f(collected_range),
-                "range_pending": _f(max(expected_range - collected_range, ZERO)),
+                "range_pending": _f(pending_range),
                 "today_expected": _f(expected_today),
                 "today_collected": _f(collected_today),
-                "today_pending": _f(max(expected_today - collected_today, ZERO)),
+                "today_pending": _f(pending_today),
                 "overdue_amount": _f(overdue_amount),
                 "overdue_members": sum(
                     1 for r in member_rows if r["status"] == "OVERDUE"
@@ -302,7 +389,7 @@ class ChittiAnalyticsService:
                 "series": daily_series,
                 "expected": _f(expected_range),
                 "collected": _f(collected_range),
-                "pending": _f(max(expected_range - collected_range, ZERO)),
+                "pending": _f(pending_range),
                 "by_method": self._method_totals(range_txns),
             },
             "monthly": {"series": monthly_series},
@@ -318,6 +405,7 @@ class ChittiAnalyticsService:
                 "total_outstanding": _f(total_pending),
                 "total_overdue": _f(overdue_amount),
                 "total_advance": _f(advance_total),
+                "total_unallocated_credit": _f(total_unallocated_credit),
                 "total_refunds": _f(refunds),
                 "total_adjustments": 0.0,
                 "daily_collection": _f(collected_today),
@@ -429,6 +517,36 @@ class ChittiAnalyticsService:
             stmt = stmt.where(ChittiMemberContribution.member_id == member_id)
         return list((await self.session.execute(stmt)).scalars().all())
 
+    async def _effective_contribution_values(
+        self,
+        chittis: list[Chitti],
+        members: list[ChittiMember],
+        contributions: list[ChittiMemberContribution],
+    ) -> dict:
+        result = {}
+        from app.services.chitti_financial_values import effective_contribution_values
+
+        members_by_chitti: dict[UUID, list[ChittiMember]] = {}
+        contributions_by_chitti: dict[UUID, list[ChittiMemberContribution]] = {}
+        for member in members:
+            members_by_chitti.setdefault(member.chitti_id, []).append(member)
+        for contribution in contributions:
+            contributions_by_chitti.setdefault(contribution.chitti_id, []).append(contribution)
+
+        for chitti in chittis:
+            lift_rows = list((await self.session.execute(
+                select(ChittiLiftEvent).where(
+                    ChittiLiftEvent.chitti_id == chitti.id
+                )
+            )).scalars().all())
+            result.update(effective_contribution_values(
+                chitti,
+                members_by_chitti.get(chitti.id, []),
+                lift_rows,
+                contributions_by_chitti.get(chitti.id, []),
+            ))
+        return result
+
     async def _load_ledger(
         self,
         chitti_ids: list[UUID],
@@ -445,6 +563,16 @@ class ChittiAnalyticsService:
             stmt = stmt.where(ChittiTransaction.member_id == member_id)
         if payment_mode:
             stmt = stmt.where(ChittiTransaction.payment_method == payment_mode)
+        return list((await self.session.execute(stmt)).scalars().all())
+
+    async def _load_allocations(
+        self, chitti_ids: list[UUID], member_id: Optional[UUID]
+    ) -> list[ChittiPaymentAllocation]:
+        stmt = select(ChittiPaymentAllocation).where(
+            ChittiPaymentAllocation.chitti_id.in_(chitti_ids)
+        )
+        if member_id:
+            stmt = stmt.where(ChittiPaymentAllocation.member_id == member_id)
         return list((await self.session.execute(stmt)).scalars().all())
 
     async def _load_user_names(self, user_ids: set) -> dict:
@@ -467,15 +595,23 @@ class ChittiAnalyticsService:
 
     @staticmethod
     def _contribution_state(
-        con: ChittiMemberContribution, due_date: Optional[date], today: date
+        con: ChittiMemberContribution,
+        due_date: Optional[date],
+        today: date,
+        effective_expected: Optional[Decimal] = None,
+        effective_remaining: Optional[Decimal] = None,
     ) -> str:
         paid = con.paid_amount
-        expected = con.expected_amount
-        remaining = max(expected - paid, ZERO)
-        if paid >= expected and expected > ZERO:
-            return "PAID"
+        expected = effective_expected if effective_expected is not None else con.expected_amount
+        remaining = (
+            effective_remaining
+            if effective_remaining is not None
+            else max(expected - paid, ZERO)
+        )
         if paid > expected:
             return "ADVANCE_PAID"
+        if paid >= expected and expected > ZERO:
+            return "PAID"
         if due_date and due_date < today and remaining > ZERO:
             return "OVERDUE"
         if paid > ZERO and remaining > ZERO:
@@ -490,6 +626,8 @@ class ChittiAnalyticsService:
         schedule_by_key,
         ledger,
         today: date,
+        effective_values: dict,
+        credits_by_member: Optional[dict] = None,
     ) -> list[dict]:
         contribs_by_member: dict = {}
         for con in contributions:
@@ -517,9 +655,25 @@ class ChittiAnalyticsService:
         for member in members:
             customer = customers.get(member.customer_id)
             cons = contribs_by_member.get(member.id, [])
-            expected_total = sum((c.expected_amount for c in cons), ZERO)
-            paid_total = sum((c.paid_amount for c in cons), ZERO)
-            pending_total = sum((max(c.expected_amount - c.paid_amount, ZERO) for c in cons), ZERO)
+            expected_total = sum(
+                (
+                    effective_values.get(c.id, {}).get("expected", c.expected_amount)
+                    for c in cons
+                ),
+                ZERO,
+            )
+            credit = (credits_by_member or {}).get(member.id, ZERO)
+            paid_total = sum((c.paid_amount for c in cons), ZERO) + credit
+            pending_total = sum(
+                (
+                    effective_values.get(c.id, {}).get(
+                        "remaining",
+                        max(c.expected_amount - c.paid_amount, ZERO),
+                    )
+                    for c in cons
+                ),
+                ZERO,
+            )
 
             # Status must reflect what is due SO FAR — future installments are not
             # arrears, so they never make an up-to-date member "partially paid".
@@ -527,13 +681,20 @@ class ChittiAnalyticsService:
             due_expected = ZERO
             due_paid = ZERO
             due_pending = ZERO
-            advance = ZERO
+            advance = credit
             for c in cons:
                 sched = schedule_by_key.get((c.chitti_id, c.period_number))
-                remaining = max(c.expected_amount - c.paid_amount, ZERO)
-                advance += max(c.paid_amount - c.expected_amount, ZERO)
+                effective = effective_values.get(c.id, {})
+                effective_expected = effective.get("expected", c.expected_amount)
+                remaining = effective.get(
+                    "remaining",
+                    max(c.expected_amount - c.paid_amount, ZERO),
+                )
+                advance += max(c.paid_amount - effective_expected, ZERO)
+                if sched and sched.due_date > today:
+                    advance += effective.get("paid", c.paid_amount)
                 if sched and sched.due_date <= today:
-                    due_expected += c.expected_amount
+                    due_expected += effective_expected
                     due_paid += c.paid_amount
                     due_pending += remaining
                     if sched.due_date < today and remaining > ZERO:
@@ -562,6 +723,7 @@ class ChittiAnalyticsService:
                     "chitti_name": None,  # filled by caller if needed
                     "expected_total": _f(expected_total),
                     "paid_total": _f(paid_total),
+                    "unallocated_credit": _f(credit),
                     "pending_total": _f(pending_total),
                     "due_total": _f(due_expected),
                     "due_pending": _f(due_pending),
@@ -583,6 +745,7 @@ class ChittiAnalyticsService:
         chittis,
         ledger,
         today: date,
+        credits_by_member: Optional[dict] = None,
     ) -> list[dict]:
         chitti_names = {c.id: c.name for c in chittis}
         outstanding_by_member: dict = {}
@@ -598,7 +761,8 @@ class ChittiAnalyticsService:
         details = []
         for row in contribution_rows:
             con = row["contribution"]
-            if con.remaining_amount <= ZERO:
+            effective = row["effective"]
+            if effective["remaining"] <= ZERO:
                 continue
             member = member_by_id.get(con.member_id)
             if not member:
@@ -616,9 +780,12 @@ class ChittiAnalyticsService:
                     "period_number": con.period_number,
                     "due_date": str(due) if due else None,
                     "days_overdue": days_overdue,
-                    "amount_pending": _f(con.remaining_amount),
-                    "amount_expected": _f(con.expected_amount),
-                    "amount_paid": _f(con.paid_amount),
+                    "amount_pending": _f(effective["remaining"]),
+                    "amount_expected": _f(effective["expected"]),
+                    "amount_paid": _f(effective["paid"]),
+                    "unallocated_credit": _f(
+                        (credits_by_member or {}).get(member.id, ZERO)
+                    ),
                     "last_payment_date": str(last_payment[member.id]) if member.id in last_payment else None,
                     "total_outstanding": _f(
                         outstanding_by_member.setdefault(str(member.id), ZERO)
@@ -631,7 +798,10 @@ class ChittiAnalyticsService:
         totals: dict = {}
         for row in contribution_rows:
             con = row["contribution"]
-            totals[con.member_id] = totals.get(con.member_id, ZERO) + con.remaining_amount
+            totals[con.member_id] = (
+                totals.get(con.member_id, ZERO)
+                + row["effective"]["remaining"]
+            )
         for d in details:
             member_out = totals.get(UUID(d["member_id"]), ZERO)
             d["total_outstanding"] = _f(member_out)
@@ -639,15 +809,23 @@ class ChittiAnalyticsService:
         details.sort(key=lambda d: (-d["days_overdue"], d["due_date"] or ""))
         return details
 
-    def _daily_series(self, schedules, ledger, start: date, end: date, today: date) -> list[dict]:
+    def _daily_series(
+        self, schedules, ledger, start: date, end: date, today: date, period_values: dict
+    ) -> list[dict]:
         span = (end - start).days
         if span > 120:
             start = end - timedelta(days=119)
             span = 119
 
         expected_by_date: dict = {}
+        pending_by_date: dict = {}
         for s in schedules:
-            expected_by_date[s.due_date] = expected_by_date.get(s.due_date, ZERO) + s.expected_collection
+            values = period_values[(s.chitti_id, s.period_number)]
+            expected = values["expected"]
+            expected_by_date[s.due_date] = expected_by_date.get(s.due_date, ZERO) + expected
+            pending_by_date[s.due_date] = (
+                pending_by_date.get(s.due_date, ZERO) + values["pending"]
+            )
 
         collected_by_date: dict = {}
         for t in ledger:
@@ -668,12 +846,12 @@ class ChittiAnalyticsService:
                     "date": str(d),
                     "expected": _f(expected),
                     "collected": _f(collected),
-                    "pending": _f(max(expected - collected, ZERO)),
+                    "pending": _f(pending_by_date.get(d, ZERO)),
                 }
             )
         return series
 
-    def _monthly_series(self, schedules, ledger, end: date) -> list[dict]:
+    def _monthly_series(self, schedules, ledger, end: date, period_values: dict) -> list[dict]:
         months: list[tuple[int, int]] = []
         y, m = end.year, end.month
         for _ in range(6):
@@ -687,7 +865,8 @@ class ChittiAnalyticsService:
         expected_by_month: dict = {}
         for s in schedules:
             key = (s.due_date.year, s.due_date.month)
-            expected_by_month[key] = expected_by_month.get(key, ZERO) + s.expected_collection
+            expected = period_values[(s.chitti_id, s.period_number)]["expected"]
+            expected_by_month[key] = expected_by_month.get(key, ZERO) + expected
 
         collected_by_month: dict = {}
         for t in ledger:
@@ -716,7 +895,7 @@ class ChittiAnalyticsService:
             state = row["state"]
             entry = buckets.setdefault(state, {"status": state, "count": 0, "amount": ZERO})
             entry["count"] += 1
-            entry["amount"] += row["contribution"].expected_amount
+            entry["amount"] += row["effective"]["expected"]
         order = ["PAID", "PARTIALLY_PAID", "PENDING", "OVERDUE", "ADVANCE_PAID"]
         out = []
         for state in order:
@@ -748,7 +927,16 @@ class ChittiAnalyticsService:
         return [m for m in ChittiAnalyticsService._method_totals(txns) if m["count"] > 0]
 
     def _build_chitti_metrics(
-        self, chittis, plan_names, members, schedules, ledger, today: date, month: int
+        self,
+        chittis,
+        plan_names,
+        members,
+        schedules,
+        ledger,
+        today: date,
+        month: int,
+        period_values: dict,
+        credits_by_member: Optional[dict] = None,
     ) -> list[dict]:
         members_by_chitti: dict = {}
         for m in members:
@@ -773,25 +961,36 @@ class ChittiAnalyticsService:
         out = []
         for c in chittis:
             scheds = sched_by_chitti.get(c.id, [])
-            expected = sum((s.expected_collection for s in scheds), ZERO)
-            actual = sum((s.actual_collection for s in scheds), ZERO)
-            pending = sum((max(s.expected_collection - s.actual_collection, ZERO) for s in scheds), ZERO)
+            financial = c.status in FINANCIAL_CHITTI_STATUSES
+            values_by_period = [
+                values for (chitti_id, _), values in period_values.items()
+                if financial and chitti_id == c.id
+            ]
+            expected = sum((v["expected"] for v in values_by_period), ZERO)
+            actual = sum((v["paid"] for v in values_by_period), ZERO)
+            pending = sum((v["pending"] for v in values_by_period), ZERO)
             overdue = sum(
                 (
-                    max(s.expected_collection - s.actual_collection, ZERO)
-                    for s in scheds
-                    if s.due_date < today
+                    period_values[(s.chitti_id, s.period_number)]["pending"]
+                    for s in scheds if financial and s.due_date < today
                 ),
                 ZERO,
             )
-            if c.status in ("DRAFT", "CANCELLED"):
-                # Not running yet — past plan dates are not arrears.
-                overdue = ZERO
             next_due = next(
-                (s.due_date for s in scheds if s.due_date >= today and s.actual_collection < s.expected_collection),
+                (
+                    s.due_date for s in scheds
+                    if financial
+                    and s.due_date >= today
+                    and period_values[(s.chitti_id, s.period_number)]["paid"]
+                    < period_values[(s.chitti_id, s.period_number)]["expected"]
+                ),
                 None,
             )
             chitti_members = members_by_chitti.get(c.id, [])
+            chitti_credit = sum(
+                ((credits_by_member or {}).get(member.id, ZERO) for member in chitti_members),
+                ZERO,
+            )
             out.append(
                 {
                     "id": str(c.id),
@@ -807,6 +1006,7 @@ class ChittiAnalyticsService:
                     "active_members": sum(1 for m in chitti_members if m.status == "ACTIVE"),
                     "expected": _f(expected),
                     "collected": _f(collected_by_chitti.get(c.id, ZERO)),
+                    "unallocated_credit": _f(chitti_credit),
                     "pending": _f(pending),
                     "overdue": _f(overdue),
                     "today_collection": _f(today_by_chitti.get(c.id, ZERO)),
@@ -887,6 +1087,7 @@ class ChittiAnalyticsService:
                 "total_chitti_value": 0.0,
                 "total_expected": 0.0,
                 "total_collected": 0.0,
+                "total_unallocated_credit": 0.0,
                 "total_pending": 0.0,
                 "total_overdue": 0.0,
                 "total_members": 0,
@@ -915,6 +1116,7 @@ class ChittiAnalyticsService:
                 "total_outstanding": 0.0,
                 "total_overdue": 0.0,
                 "total_advance": 0.0,
+                "total_unallocated_credit": 0.0,
                 "total_refunds": 0.0,
                 "total_adjustments": 0.0,
                 "daily_collection": 0.0,

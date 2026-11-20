@@ -17,6 +17,7 @@ from app.models.chitti import (  # noqa: F401
     ChittiPayout,
     ChittiTransaction,
     ChittiLiftEvent,
+    ChittiPaymentAllocation,
 )
 from app.models.payment import PaymentTransaction  # noqa: F401
 from app.models.audit import AuditLog  # noqa: F401

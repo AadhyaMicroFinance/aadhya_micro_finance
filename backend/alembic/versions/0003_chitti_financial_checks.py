@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 from sqlalchemy import text
+import re
 
 
 revision: str = "0003_chitti_financial_checks"
@@ -39,33 +40,124 @@ CONSTRAINTS = (
 )
 
 
+def _normalize_check(definition: str):
+    value = re.sub(r"\bcheck\b", "", definition.lower())
+    value = re.sub(r"::\s*(numeric|integer|bigint|smallint|real|double precision)", "", value)
+    value = value.replace('"', "")
+    compact = re.sub(r"\s+", "", value)
+    tokens = re.findall(
+        r"[a-z_][a-z0-9_]*|\d+(?:\.\d+)?|>=|<=|<>|!=|[=()+\-*/]",
+        compact,
+    )
+    if "".join(tokens) != compact:
+        raise ValueError(f"Unsupported CHECK expression: {definition}")
+
+    position = 0
+
+    def parse_atom():
+        nonlocal position
+        token = tokens[position]
+        if token == "(":
+            position += 1
+            result = parse_comparison()
+            if tokens[position] != ")":
+                raise ValueError(f"Unbalanced CHECK expression: {definition}")
+            position += 1
+            return result
+        if token in (")", "=", ">=", "<=", "<>", "!=", "+", "-", "*", "/"):
+            raise ValueError(f"Invalid CHECK expression: {definition}")
+        position += 1
+        return token
+
+    def parse_product():
+        nonlocal position
+        result = parse_atom()
+        while position < len(tokens) and tokens[position] in ("*", "/"):
+            operator = tokens[position]
+            position += 1
+            result = (operator, result, parse_atom())
+        return result
+
+    def parse_sum():
+        nonlocal position
+        result = parse_product()
+        while position < len(tokens) and tokens[position] in ("+", "-"):
+            operator = tokens[position]
+            position += 1
+            result = (operator, result, parse_product())
+        return result
+
+    def parse_comparison():
+        nonlocal position
+        result = parse_sum()
+        if position < len(tokens) and tokens[position] in ("=", ">=", "<=", "<>", "!="):
+            operator = tokens[position]
+            position += 1
+            result = (operator, result, parse_sum())
+        return result
+
+    parsed = parse_comparison()
+    if position != len(tokens):
+        raise ValueError(f"Unexpected CHECK expression tokens: {definition}")
+    return parsed
+
+
+def _constraint_definition(bind, table_name: str, constraint_name: str):
+    return bind.execute(
+        text(
+            "SELECT contype, pg_get_constraintdef(oid), convalidated, "
+            "obj_description(oid, 'pg_constraint') "
+            "FROM pg_constraint "
+            "WHERE conname = :constraint_name "
+            "AND conrelid = CAST(:table_name AS regclass)"
+        ),
+        {
+            "constraint_name": constraint_name,
+            "table_name": table_name,
+        },
+    ).first()
+
+
+def _validate_constraint(row, table_name: str, constraint_name: str, condition: str) -> None:
+    constraint_type = row[0].decode() if row and isinstance(row[0], bytes) else (row[0] if row else None)
+    if not row or constraint_type != "c" or not row[2]:
+        raise RuntimeError(
+            f"Constraint {table_name}.{constraint_name} is not a validated CHECK constraint."
+        )
+    if _normalize_check(row[1]) != _normalize_check(f"CHECK ({condition})"):
+        raise RuntimeError(
+            f"Constraint {table_name}.{constraint_name} has an incompatible definition."
+        )
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     for table_name, constraint_name, condition in CONSTRAINTS:
-        exists = bind.execute(
-            text(
-                "SELECT 1 FROM pg_constraint "
-                "WHERE conname = :constraint_name "
-                "AND conrelid = CAST(:table_name AS regclass)"
-            ),
-            {
-                "constraint_name": constraint_name,
-                "table_name": table_name,
-            },
-        ).first()
-        if exists:
+        existing = _constraint_definition(bind, table_name, constraint_name)
+        if existing:
+            _validate_constraint(existing, table_name, constraint_name, condition)
             continue
         op.create_check_constraint(
             constraint_name,
             table_name,
             condition,
         )
+        op.execute(
+            f"COMMENT ON CONSTRAINT {constraint_name} ON {table_name} "
+            "IS 'owned-by-0003-chitti-financial-checks'"
+        )
 
 
 def downgrade() -> None:
-    for table_name, constraint_name, _ in reversed(CONSTRAINTS):
-        op.drop_constraint(
-            constraint_name,
-            table_name,
-            type_="check",
-        )
+    bind = op.get_bind()
+    for table_name, constraint_name, condition in reversed(CONSTRAINTS):
+        existing = _constraint_definition(bind, table_name, constraint_name)
+        if not existing:
+            continue
+        _validate_constraint(existing, table_name, constraint_name, condition)
+        if existing[3] == "owned-by-0003-chitti-financial-checks":
+            op.drop_constraint(
+                constraint_name,
+                table_name,
+                type_="check",
+            )
