@@ -4,9 +4,9 @@ End-to-end Chitti regression tests.
 Covers the reported defects:
   BUG-001  enrolled member count must be identical on dashboard, summary and
            the members list
-  BUG-002  duplicate enrollment in the SAME chitti is rejected with a
-           structured DUPLICATE_ENROLLMENT error, while the same customer may
-           join a DIFFERENT chitti
+  BUG-002  the same customer may hold multiple independent slots in the SAME
+           chitti, each with its own membership id, member number, agreement
+           and contribution schedule, while capacity remains enforced
   BUG-003  activation prerequisites are reported with exact reasons instead of
            an opaque failure
   BUG-004  a successful start persists RUNNING in the database and is visible
@@ -50,14 +50,14 @@ async def _make_plan(client, headers):
     return resp.json()["data"]
 
 
-async def _make_chitti(client, headers, plan_id, name="Regression Chitti"):
+async def _make_chitti(client, headers, plan_id, name="Regression Chitti", member_count=10):
     resp = await client.post(
         "/api/v1/chitti/",
         json={
             "plan_id": plan_id,
             "name": name,
             "start_date": date.today().isoformat(),
-            "member_count": 10,
+            "member_count": member_count,
         },
         headers=headers,
     )
@@ -82,10 +82,15 @@ async def _make_customers(client, headers, count):
     return customers
 
 
-async def _enroll(client, headers, chitti_id, customer_id, payout_order):
+async def _enroll(client, headers, chitti_id, customer_id, payout_order=None, alias=None):
+    payload = {"customer_id": customer_id}
+    if payout_order is not None:
+        payload["payout_order"] = payout_order
+    if alias is not None:
+        payload["alias"] = alias
     resp = await client.post(
         f"/api/v1/chitti/{chitti_id}/members",
-        json={"customer_id": customer_id, "payout_order": payout_order},
+        json=payload,
         headers=headers,
     )
     assert resp.status_code == 200, resp.text
@@ -143,22 +148,121 @@ async def test_member_count_duplicate_and_activation(client, test_user):
     assert summary["member_count"] == summary["member_capacity"] == 10
     assert summary["active_members"] == 0
 
-    # BUG-002: duplicate enrollment in the same chitti.
-    duplicate = await client.post(
+    # BUG-002: a second slot for the same customer needs an alias so that its
+    # own payments and agreement can never be mixed with the main slot.
+    missing_alias = await client.post(
         f"/api/v1/chitti/{chitti_id}/members",
         json={"customer_id": customers[0]["id"]},
         headers=headers,
     )
-    assert duplicate.status_code == 409, duplicate.text
-    error = duplicate.json()["error"]
-    assert error["code"] == "DUPLICATE_ENROLLMENT"
-    assert error["message"] == "This member is already enrolled in this Chitti."
-    assert error["details"]["existing_member_id"] == members[0]["id"]
-    after_duplicate = (await client.get(f"/api/v1/chitti/{chitti_id}/members", headers=headers)).json()["data"]
-    assert len(after_duplicate) == 10, "a rejected duplicate must not create a row"
+    assert missing_alias.status_code == 400, missing_alias.text
+    assert missing_alias.json()["error"]["code"] == "ALIAS_REQUIRED"
+    after_missing_alias = (await client.get(f"/api/v1/chitti/{chitti_id}/members", headers=headers)).json()["data"]
+    assert len(after_missing_alias) == 10, "a rejected request must not create a row"
 
-    # Re-enrolment after cancellation reuses the existing row instead of
-    # violating uq_chitti_member_customer (which used to surface as HTTP 500).
+    # Capacity still counts membership rows, so an aliased extra slot cannot
+    # bypass the configured limit.
+    full = await client.post(
+        f"/api/v1/chitti/{chitti_id}/members",
+        json={"customer_id": customers[0]["id"], "alias": "Full Chitti Probe"},
+        headers=headers,
+    )
+    assert full.status_code == 400, full.text
+    assert full.json()["error"]["code"] == "CHITTI_FULL"
+
+    # Create a fresh 3-slot Chitti to prove independent same-customer slots.
+    slot_plan_resp = await client.post(
+        "/api/v1/chitti/plans",
+        json={**PLAN, "name": "Multi Slot Regression Plan", "member_count": 3},
+        headers=headers,
+    )
+    assert slot_plan_resp.status_code == 200, slot_plan_resp.text
+    slot_plan = slot_plan_resp.json()["data"]
+    slot_chitti_resp = await client.post(
+        "/api/v1/chitti/",
+        json={
+            "plan_id": slot_plan["id"],
+            "name": "Multi Slot Regression Chitti",
+            "start_date": date.today().isoformat(),
+            "member_count": 3,
+        },
+        headers=headers,
+    )
+    assert slot_chitti_resp.status_code == 200, slot_chitti_resp.text
+    slot_chitti = slot_chitti_resp.json()["data"]
+    slot_chitti_id = slot_chitti["id"]
+
+    slots = [
+        await _enroll(client, headers, slot_chitti_id, customers[0]["id"], alias=alias)
+        for alias in ("Main slot", "Second slot", "Third slot")
+    ]
+    assert len({slot["id"] for slot in slots}) == 3, "each slot needs its own membership id"
+    assert len({slot["member_number"] for slot in slots}) == 3, "each slot needs its own member number"
+    assert [slot["alias"] for slot in slots] == ["Main slot", "Second slot", "Third slot"]
+
+    slot_summary = (await client.get(f"/api/v1/chitti/{slot_chitti_id}/summary", headers=headers)).json()["data"]
+    assert slot_summary["enrolled_members"] == 3
+    assert slot_summary["member_capacity"] == 3
+
+    # Every slot counts toward capacity, including slots of the same customer.
+    fourth = await client.post(
+        f"/api/v1/chitti/{slot_chitti_id}/members",
+        json={"customer_id": customers[0]["id"], "alias": "Fourth slot"},
+        headers=headers,
+    )
+    assert fourth.status_code == 400, fourth.text
+    assert fourth.json()["error"]["code"] == "CHITTI_FULL"
+
+    for slot in slots:
+        await _activate_member(client, headers, slot_chitti_id, slot["id"])
+        agreement = (await client.get(
+            f"/api/v1/chitti/{slot_chitti_id}/members/{slot['id']}/agreement",
+            headers=headers,
+        )).json()["data"]
+        assert agreement["chitti_member_id"] == slot["id"]
+
+    contribution_sets = []
+    for slot in slots:
+        rows = (await client.get(
+            f"/api/v1/chitti/{slot_chitti_id}/members/{slot['id']}/contributions",
+            headers=headers,
+        )).json()["data"]
+        assert rows, "each slot must have its own contribution schedule"
+        assert all(row["member_id"] == slot["id"] for row in rows)
+        contribution_sets.append({row["id"] for row in rows})
+    assert contribution_sets[0].isdisjoint(contribution_sets[1])
+    assert contribution_sets[1].isdisjoint(contribution_sets[2])
+
+    started = await client.post(f"/api/v1/chitti/{slot_chitti_id}/start", headers=headers)
+    assert started.status_code == 200, started.text
+
+    paid = await client.post(
+        f"/api/v1/chitti/{slot_chitti_id}/contributions",
+        json={
+            "member_id": slots[0]["id"],
+            "period_number": 1,
+            "amount": "1000.00",
+            "payment_method": "CASH",
+            "payment_date": date.today().isoformat(),
+            "idempotency_key": "multi-slot-slot-1-period-1",
+        },
+        headers=headers,
+    )
+    assert paid.status_code == 200, paid.text
+
+    slot0_rows = (await client.get(
+        f"/api/v1/chitti/{slot_chitti_id}/members/{slots[0]['id']}/contributions",
+        headers=headers,
+    )).json()["data"]
+    slot1_rows = (await client.get(
+        f"/api/v1/chitti/{slot_chitti_id}/members/{slots[1]['id']}/contributions",
+        headers=headers,
+    )).json()["data"]
+    assert float(next(row for row in slot0_rows if row["period_number"] == 1)["paid_amount"]) > 0
+    assert float(next(row for row in slot1_rows if row["period_number"] == 1)["paid_amount"]) == 0
+
+    # Re-enrolment after cancellation creates a new independent slot instead
+    # of reusing or updating the cancelled membership.
     cancelled = await client.post(
         f"/api/v1/chitti/{chitti_id}/members/{members[1]['id']}/cancel",
         json={"reason": "regression test"},
@@ -166,7 +270,8 @@ async def test_member_count_duplicate_and_activation(client, test_user):
     )
     assert cancelled.status_code == 200, cancelled.text
     re_added = await _enroll(client, headers, chitti_id, customers[1]["id"], 11)
-    assert re_added["id"] == members[1]["id"]
+    assert re_added["id"] != members[1]["id"]
+    assert re_added["member_number"] != members[1]["member_number"]
     assert re_added["status"] == "PENDING_AGREEMENT"
 
     # The list endpoint used by "All Chittis" exposes the same counts.
@@ -252,8 +357,12 @@ async def test_member_count_duplicate_and_activation(client, test_user):
 
     # Sign every remaining agreement, then the chitti becomes startable.
     final_confirmation = None
-    for member in members[1:]:
-        final_confirmation = await _activate_member(client, headers, chitti_id, member["id"])
+    remaining_member_ids = [
+        re_added["id"] if member["id"] == members[1]["id"] else member["id"]
+        for member in members[1:]
+    ]
+    for member_id in remaining_member_ids:
+        final_confirmation = await _activate_member(client, headers, chitti_id, member_id)
 
     # Final agreement confirmation activates the member but leaves the Chitti
     # ready until the operator invokes the explicit manual Start action.
@@ -270,10 +379,10 @@ async def test_member_count_duplicate_and_activation(client, test_user):
 
     schedule = (await client.get(f"/api/v1/chitti/{chitti_id}/schedule", headers=headers)).json()["data"]
     assert len(schedule) == 10
-    for member in members:
+    for member_id in [members[0]["id"]] + remaining_member_ids:
         contributions = (
             await client.get(
-                f"/api/v1/chitti/{chitti_id}/members/{member['id']}/contributions",
+                f"/api/v1/chitti/{chitti_id}/members/{member_id}/contributions",
                 headers=headers,
             )
         ).json()["data"]
@@ -443,7 +552,10 @@ async def test_lift_management_is_separate_from_payout_and_reversible(client, te
     )
     assert plan_response.status_code == 200, plan_response.text
     plan = plan_response.json()["data"]
-    chitti = await _make_chitti(client, headers, plan["id"], name="Lift Surcharge Test")
+    chitti = await _make_chitti(
+        client, headers, plan["id"], name="Lift Surcharge Test",
+        member_count=plan_payload["member_count"],
+    )
     customer = (await _make_customers(client, headers, 1))[0]
     member = await _enroll(client, headers, chitti["id"], customer["id"], 1)
     await _activate_member(client, headers, chitti["id"], member["id"])
@@ -586,11 +698,17 @@ async def test_partial_contribution_settles_only_remaining_balance(client, test_
         **base, "amount": "1.00", "idempotency_key": "after-settlement",
     }, headers=headers)
     assert credit_payment.status_code == 200, credit_payment.text
-    assert Decimal(str(credit_payment.json()["data"]["unallocated_credit"])) == Decimal("1.00")
+    # Cash above the payable instalments is not credit until an operator
+    # resolves it; it stays visible as unresolved excess.
+    assert Decimal(
+        str(credit_payment.json()["data"]["unresolved_excess"])
+    ) == Decimal("1.00")
+    assert credit_payment.json()["data"]["unallocated_credit"] == 0.0
     member_after_credit = (await client.get(
         f"/api/v1/chitti/{chitti_id}/members", headers=headers
     )).json()["data"][0]
-    assert member_after_credit["unallocated_credit"] == 1
+    assert member_after_credit["unallocated_credit"] == 0
+    assert member_after_credit["unresolved_excess"] == 1
     assert member_after_credit["outstanding"] == 0
     history = await client.get("/api/v1/payments/", params={"per_page": 100}, headers=headers)
     chitti_receipts = [row for row in history.json()["data"] if row.get("chitti_account_id") == chitti_id]
@@ -695,8 +813,9 @@ async def test_concurrent_payments_preserve_excess_as_member_credit(client, test
     member_data = (await client.get(
         f"/api/v1/chitti/{chitti_id}/members", headers=headers
     )).json()["data"][0]
-    assert member_data["total_paid"] == 200
-    assert member_data["unallocated_credit"] == 100
+    assert member_data["total_paid"] == 100
+    assert member_data["unallocated_credit"] == 0
+    assert member_data["unresolved_excess"] == 100
     assert member_data["outstanding"] == 0
 
 

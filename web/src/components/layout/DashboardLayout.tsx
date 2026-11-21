@@ -46,11 +46,16 @@ export default function DashboardLayout({ children }: { children: React.ReactNod
   if (!isAuthenticated) return null;
 
   return (
-    <div className="min-h-screen bg-surface-50">
+    <div className="flex h-[100dvh] w-full overflow-hidden bg-surface-50">
       <Sidebar open={navOpen} onClose={() => setNavOpen(false)} />
-      <div className="lg:ml-64">
+      <div className="flex min-w-0 flex-1 flex-col lg:ml-64">
         <TopBar onMenu={() => setNavOpen(true)} />
-        <main className="p-3 pb-12 sm:p-5 lg:p-8">{children}</main>
+        <main
+          data-app-scroll
+          className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-contain p-3 pb-12 sm:p-5 lg:p-8"
+        >
+          {children}
+        </main>
       </div>
     </div>
   );

@@ -1,5 +1,8 @@
 """
-Payment Transaction model — immutable financial ledger.
+Finance repayment ledger — immutable financial ledger.
+
+Chitti (Money Budget Schemes) money is owned by ``chitti_transactions`` and
+must never be recorded here. This table intentionally has no Chitti columns.
 """
 
 import uuid
@@ -36,14 +39,8 @@ class PaymentTransaction(BaseModel):
     finance_account_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("finance_accounts.id", ondelete="SET NULL"), nullable=True
     )
-    chitti_account_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("chittis.id", ondelete="SET NULL"), nullable=True
-    )
     finance_schedule_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("finance_schedules.id", ondelete="SET NULL"), nullable=True
-    )
-    chitti_schedule_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("chitti_period_schedule.id", ondelete="SET NULL"), nullable=True
     )
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     payment_method: Mapped[str] = mapped_column(
@@ -73,13 +70,7 @@ class PaymentTransaction(BaseModel):
     finance_account: Mapped["FinanceAccount | None"] = relationship(
         "FinanceAccount", back_populates="payments"
     )
-    chitti_group: Mapped["Chitti | None"] = relationship(
-        "Chitti"
-    )
     finance_schedule: Mapped["FinanceSchedule | None"] = relationship(
         "FinanceSchedule", back_populates="payments"
-    )
-    chitti_schedule: Mapped["ChittiPeriodSchedule | None"] = relationship(
-        "ChittiPeriodSchedule"
     )
     collector: Mapped["User | None"] = relationship("User")

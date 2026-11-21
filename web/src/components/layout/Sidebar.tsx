@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import BrandLockup from "@/components/branding/BrandLockup";
+import { useAuthStore } from "@/hooks/useAuth";
 import { cn } from "@/lib/utils";
 import {
   LayoutDashboard,
@@ -29,6 +30,7 @@ interface NavChild {
   label: string;
   href: string;
   icon: React.ReactNode;
+  permission?: string;
 }
 
 interface NavItem {
@@ -37,47 +39,104 @@ interface NavItem {
   icon: React.ReactNode;
   children?: NavChild[];
   group?: string;
+  permission?: string;
 }
 
 const navItems: NavItem[] = [
   { label: "Dashboard", href: "/dashboard", icon: <LayoutDashboard size={20} />, group: "OVERVIEW" },
-  { label: "Customers", href: "/customers", icon: <Users size={20} />, group: "CUSTOMERS" },
-  { label: "Finance", href: "/finance", icon: <Wallet size={20} />, group: "FINANCE" },
+  { label: "Customers", href: "/customers", icon: <Users size={20} />, group: "CUSTOMERS", permission: "customers:read" },
+  {
+    label: "Finance",
+    icon: <Wallet size={20} />,
+    group: "FINANCE",
+    permission: "finance:read",
+    children: [
+      { label: "Dashboard", href: "/finance/dashboard", icon: <LayoutDashboard size={16} />, permission: "finance:read" },
+      { label: "All Finances", href: "/finance", icon: <List size={16} />, permission: "finance:read" },
+      { label: "Collections", href: "/finance/collections", icon: <CircleDollarSign size={16} />, permission: "finance:read" },
+    ],
+  },
   {
     label: "Chittis",
     icon: <Handshake size={20} />,
     group: "CHITTI",
     children: [
-      { label: "Dashboard", href: "/chitti", icon: <LayoutDashboard size={16} /> },
-      { label: "Analytics", href: "/chitti/analytics", icon: <BarChart3 size={16} /> },
-      { label: "All Chittis", href: "/chitti/all", icon: <List size={16} /> },
-      { label: "Create Chitti", href: "/chitti/new", icon: <PlusCircle size={16} /> },
+      { label: "Dashboard", href: "/chitti", icon: <LayoutDashboard size={16} />, permission: "chitti:read" },
+      { label: "Analytics", href: "/chitti/analytics", icon: <BarChart3 size={16} />, permission: "chitti:read" },
+      { label: "All Chittis", href: "/chitti/all", icon: <List size={16} />, permission: "chitti:read" },
+      { label: "Plans", href: "/chitti/plans", icon: <List size={16} />, permission: "chitti:read" },
+      { label: "Create Chitti", href: "/chitti/new", icon: <PlusCircle size={16} />, permission: "chitti:create" },
     ],
   },
-  { label: "Payments", href: "/payments", icon: <CreditCard size={20} />, group: "TRANSACTIONS" },
-  { label: "Collect Payment", href: "/payments/collect", icon: <CircleDollarSign size={20} />, group: "TRANSACTIONS" },
-  { label: "Reports", href: "/reports", icon: <BarChart3 size={20} />, group: "ANALYTICS" },
-  { label: "WhatsApp", href: "/whatsapp", icon: <MessageCircle size={20} />, group: "COMMUNICATION" },
-  { label: "Users", href: "/users", icon: <Shield size={20} />, group: "ADMIN" },
-  { label: "Settings", href: "/settings", icon: <Settings size={20} />, group: "ADMIN" },
-  { label: "Audit Logs", href: "/audit", icon: <List size={20} />, group: "ADMIN" },
+  { label: "Payments", href: "/payments", icon: <CreditCard size={20} />, group: "TRANSACTIONS", permission: "payments:read" },
+  { label: "Collections", href: "/collections/today", icon: <List size={20} />, group: "TRANSACTIONS", permission: "payments:read" },
+  { label: "Collect Payment", href: "/payments/collect", icon: <CircleDollarSign size={20} />, group: "TRANSACTIONS", permission: "payments:create" },
+  { label: "Reports", href: "/reports", icon: <BarChart3 size={20} />, group: "ANALYTICS", permission: "reports:read" },
+  { label: "WhatsApp", href: "/whatsapp", icon: <MessageCircle size={20} />, group: "COMMUNICATION", permission: "whatsapp:read" },
+  { label: "Users", href: "/users", icon: <Shield size={20} />, group: "ADMIN", permission: "users:read" },
+  { label: "Settings", href: "/settings", icon: <Settings size={20} />, group: "ADMIN", permission: "settings:read" },
+  { label: "Audit Logs", href: "/audit", icon: <List size={20} />, group: "ADMIN", permission: "audit:read" },
 ];
 
 export default function Sidebar({ open = false, onClose }: { open?: boolean; onClose?: () => void }) {
   const pathname = usePathname();
+  const user = useAuthStore((state) => state.user);
+  const permissions = useMemo(() => new Set(user?.permissions ?? []), [user]);
+  const visibleNavItems = useMemo(
+    () => navItems
+      .map((item) => item.children
+        ? {
+            ...item,
+            children: item.children.filter(
+              (child) => !child.permission || permissions.has(child.permission)
+            ),
+          }
+        : item)
+      .filter((item) => item.children ? item.children.length > 0 : true)
+      .filter((item) => !item.permission || permissions.has(item.permission)),
+    [permissions]
+  );
+  const isChildRouteActive = (href: string) => {
+    if (pathname === href) return true;
+    // Detail and plan routes belong to the list view, not to the sibling
+    // "Dashboard" child whose prefix would otherwise also match them.
+    if (href === "/chitti/all" && pathname.startsWith("/chitti/")) {
+      return !["/chitti/analytics", "/chitti/new", "/chitti/plans"].some(
+        (prefix) => pathname.startsWith(prefix)
+      );
+    }
+    if (href === "/chitti/plans" && pathname.startsWith("/chitti/plans/")) return true;
+    // /finance/{uuid} is an account detail view, so it belongs to "All Finances",
+    // not to the Dashboard child whose prefix would otherwise match it.
+    if (href === "/finance" && pathname.startsWith("/finance/")) {
+      return !["/finance/dashboard", "/finance/collections"].some(
+        (prefix) => pathname.startsWith(prefix)
+      );
+    }
+    return false;
+  };
+
   const [openSections, setOpenSections] = useState<Set<string>>(() => {
     const active = navItems
-      .filter((item) => item.children?.some((child) => pathname === child.href || pathname.startsWith(child.href + "/")))
+      .filter((item) => item.children?.some((child) => isChildRouteActive(child.href)))
       .map((item) => item.label);
     return new Set(active);
   });
 
-  // The drawer must not scroll the page behind it on phones.
+  // The drawer must not scroll the app behind it on phones. The scrollable
+  // region is now the main panel, not the document body.
   useEffect(() => {
     if (typeof document === "undefined") return;
-    document.body.style.overflow = open ? "hidden" : "";
+    const scrollContainer = document.querySelector<HTMLElement>("[data-app-scroll]");
+    const previousBodyOverflow = document.body.style.overflow;
+    const previousContainerOverflow = scrollContainer?.style.overflow ?? "";
+    if (open) {
+      document.body.style.overflow = "hidden";
+      if (scrollContainer) scrollContainer.style.overflow = "hidden";
+    }
     return () => {
-      document.body.style.overflow = "";
+      document.body.style.overflow = previousBodyOverflow;
+      if (scrollContainer) scrollContainer.style.overflow = previousContainerOverflow;
     };
   }, [open]);
 
@@ -93,7 +152,7 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
   // Group items
   const groups: { label: string; items: NavItem[] }[] = [];
   let currentGroup = "";
-  for (const item of navItems) {
+  for (const item of visibleNavItems) {
     const g = item.group || "";
     if (g !== currentGroup) {
       groups.push({ label: g, items: [] });
@@ -116,7 +175,7 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
 
       <aside
         className={cn(
-          "fixed left-0 top-0 z-50 flex h-[100dvh] w-72 max-w-[85vw] flex-col border-r border-surface-100 bg-white transition-transform duration-200 ease-out lg:w-64 lg:translate-x-0",
+          "fixed left-0 top-0 z-50 flex h-[100dvh] w-72 max-w-[85vw] select-none flex-col border-r border-surface-100 bg-white transition-transform duration-200 ease-out lg:w-64 lg:translate-x-0",
           open ? "translate-x-0" : "-translate-x-full lg:translate-x-0"
         )}
       >
@@ -143,7 +202,7 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
               {group.items.map((item) => {
                 if (item.children) {
                   const isChildActive = item.children.some(
-                    (child) => pathname === child.href || pathname.startsWith(child.href + "/")
+                    (child) => isChildRouteActive(child.href)
                   );
                   const isOpen = openSections.has(item.label);
 
@@ -167,12 +226,13 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
                       {isOpen && (
                         <div className="ml-5 mt-1 space-y-0.5 border-l border-surface-100 pl-3 animate-slide-down">
                           {item.children.map((child) => {
-                            const isActive = pathname === child.href || pathname.startsWith(child.href + "/");
+                            const isActive = isChildRouteActive(child.href);
                             return (
                               <Link
                                 key={child.href}
                                 href={child.href}
                                 onClick={onClose}
+                                aria-current={isActive ? "page" : undefined}
                                 className={cn(
                                   "flex items-center gap-2.5 rounded-lg px-3 py-2.5 text-[13px] transition-all duration-150",
                                   isActive
@@ -197,6 +257,7 @@ export default function Sidebar({ open = false, onClose }: { open?: boolean; onC
                     key={item.href}
                     href={item.href!}
                     onClick={onClose}
+                    aria-current={isActive ? "page" : undefined}
                     className={cn(
                       "flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-all duration-150",
                       isActive

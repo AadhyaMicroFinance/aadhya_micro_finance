@@ -154,6 +154,7 @@ export default function ChittiMembersPanel({
         (m.customer_code ?? "").toLowerCase().includes(needle) ||
         String(m.member_number) === needle.replace("#", "") ||
         `#${m.member_number}` === needle ||
+        (m.alias ?? "").toLowerCase().includes(needle) ||
         (m.mobile_number ?? "").includes(needle)
       );
     });
@@ -217,6 +218,9 @@ export default function ChittiMembersPanel({
 
   const memberName = (member: ChittiMember) =>
     member.customer_name || member.customer_code || `Member #${member.member_number}`;
+
+  const slotLabel = (member: ChittiMember) =>
+    `#${member.member_number}${member.alias ? ` · ${member.alias}` : ""}`;
 
   const runAction = async (member: ChittiMember, action: AgreementAction) => {
     if (actionKey) return;
@@ -509,7 +513,7 @@ export default function ChittiMembersPanel({
                               {memberName(member)}
                             </p>
                             <p className="text-[11px] text-surface-500">
-                              #{member.member_number} · {member.customer_code ?? "—"}
+                              {slotLabel(member)} · {member.customer_code ?? "—"}
                             </p>
                             <p className={cn("text-[11px]", pay.tone)}>
                               {member.mobile_number || "—"} · {pay.label}
@@ -597,7 +601,7 @@ export default function ChittiMembersPanel({
                           {memberName(member)}
                         </p>
                         <p className="text-[11px] text-surface-500">
-                          #{member.member_number} · {member.customer_code ?? "—"} ·{" "}
+                          {slotLabel(member)} · {member.customer_code ?? "—"} ·{" "}
                           {member.mobile_number || "—"}
                         </p>
                       </div>
@@ -771,6 +775,12 @@ function MemberExpanded({
               <p className="text-[10px] uppercase text-surface-400">Member credit</p>
               <p className="text-sm font-semibold text-brand-700">
                 {formatCurrency(Number(member.unallocated_credit || 0))}
+              </p>
+            </div>
+            <div>
+              <p className="text-[10px] uppercase text-surface-400">Unresolved</p>
+              <p className="text-sm font-semibold text-warning-600">
+                {formatCurrency(Number(member.unresolved_excess || 0))}
               </p>
             </div>
             <div>

@@ -1097,7 +1097,9 @@ export default function ChittiAnalyticsPage() {
                                 {m.member_name}
                               </p>
                               <p className="text-[11px] text-surface-400">
-                                {m.mobile_number || m.customer_code || "—"}
+                                #{m.member_number}
+                                {m.member_alias ? ` · ${m.member_alias}` : ""}
+                                {" · "}{m.mobile_number || m.customer_code || "—"}
                               </p>
                             </div>
                           </div>
@@ -1276,7 +1278,11 @@ export default function ChittiAnalyticsPage() {
                       >
                         <td>
                           <p className="text-sm font-semibold text-surface-900">{r.member_name}</p>
-                          <p className="text-[11px] text-surface-400">{r.mobile_number || "—"}</p>
+                          <p className="text-[11px] text-surface-400">
+                            #{r.member_number}
+                            {r.member_alias ? ` · ${r.member_alias}` : ""}
+                            {" · "}{r.mobile_number || "—"}
+                          </p>
                         </td>
                         <td className="text-xs text-surface-600">{r.chitti_name}</td>
                         <td className="text-xs text-surface-600">Period {r.period_number}</td>

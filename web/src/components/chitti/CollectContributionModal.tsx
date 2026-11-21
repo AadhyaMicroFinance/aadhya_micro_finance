@@ -45,9 +45,12 @@ export default function CollectContributionModal({
   );
 
   const open = (rows ?? []).filter((r) => Number(r.remaining_amount) > 0);
+  const presetOption = open.find((r) => r.period_number === presetPeriod);
   const periodOptions =
     open.length > 0
-      ? [open[0]]
+      ? presetOption
+        ? [presetOption, ...open.filter((r) => r.period_number !== presetPeriod)]
+        : [open[0]]
       : rows?.length
         ? [rows[rows.length - 1]]
         : [];
@@ -58,10 +61,13 @@ export default function CollectContributionModal({
       const data = await chittiApi.getMemberContributions(chittiId, member.id);
       setRows(data);
       const outstanding = data.filter((r) => Number(r.remaining_amount) > 0);
-      const wanted = outstanding[0] ?? data[data.length - 1];
+      const preset = presetPeriod != null
+        ? outstanding.find((r) => r.period_number === presetPeriod)
+        : undefined;
+      const wanted = preset ?? outstanding[0] ?? data[data.length - 1];
       if (wanted) {
         setPeriod(wanted.period_number);
-        setAmount(outstanding.length > 0 ? String(wanted.remaining_amount) : "");
+        setAmount(Number(wanted.remaining_amount) > 0 ? String(wanted.remaining_amount) : "");
       }
     } catch (e) {
       setError(getApiErrorMessage(e, "Could not load this member's contributions."));
@@ -79,6 +85,9 @@ export default function CollectContributionModal({
       setError("Enter an amount greater than zero.");
       return;
     }
+    // Receipts above the outstanding schedule are valid member credit. The
+    // backend decides allocation, unresolved excess and available credit; the
+    // UI must never silently cap or reclassify that cash.
     setSaving(true);
     setError(null);
     try {
@@ -92,6 +101,7 @@ export default function CollectContributionModal({
         notes: notes.trim() || undefined,
         idempotency_key: idempotencyKey.current,
       });
+      const excess = Number(result.unresolved_excess ?? 0);
       const credit = Number(result.unallocated_credit ?? 0);
       const allocationSummary = result.allocations.length
         ? ` Allocated to ${result.allocations
@@ -99,7 +109,7 @@ export default function CollectContributionModal({
             .join(", ")}.`
         : "";
       await onSaved(
-        `${formatCurrency(value)} collected from ${member.name} starting at period ${selected.period_number}.${allocationSummary}${credit > 0 ? ` ${formatCurrency(credit)} remains as member credit.` : ""}`
+        `${formatCurrency(value)} collected from ${member.name} starting at period ${selected.period_number}.${allocationSummary}${excess > 0 ? ` ${formatCurrency(excess)} is unresolved excess and needs an operator decision.` : ""}${credit > 0 ? ` ${formatCurrency(credit)} is available member credit.` : ""}`
       );
     } catch (e: unknown) {
       setError(getApiErrorMessage(e, "Could not record this contribution."));
@@ -116,7 +126,7 @@ export default function CollectContributionModal({
             <h3 className="text-lg font-bold text-surface-900">Collect contribution</h3>
             <p className="text-xs text-surface-500">
               {member.name}
-              {member.number ? ` • Member #${member.number}` : ""} • cash, UPI or bank
+              {member.number ? ` • Member #${member.number}` : ""} • cash, UPI, bank or other
             </p>
           </div>
           <button
@@ -138,7 +148,7 @@ export default function CollectContributionModal({
               {open.length === 0 && (
                 <div className="flex items-center gap-3 rounded-xl bg-success-50 p-4 text-sm text-success-700">
                   <CheckCircle2 size={18} />
-                  All scheduled periods are paid. Any new receipt will remain as member credit.
+                  All scheduled periods are paid. Any new receipt is retained as member credit or unresolved excess; it is never refunded or moved automatically.
                 </div>
               )}
               <div>
@@ -187,7 +197,7 @@ export default function CollectContributionModal({
                   </p>
                 )}
                 <p className="mt-1 text-xs text-surface-500">
-                  Receipts apply in period order. Excess remains as credit and is used against future contributions.
+                  Receipts apply in period order. Anything beyond the outstanding schedule is recorded separately as member credit or unresolved excess; no cash is moved or refunded automatically.
                 </p>
               </div>
 

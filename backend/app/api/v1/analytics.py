@@ -2,19 +2,21 @@
 Analytics API endpoints — Chitti financial control centre.
 
 Every figure is computed from the chitti ledger, period schedules and member
-contributions. Global filters (date range, chitti, member, payment mode,
-payment status) are accepted by both endpoints so every card, chart and table
-reflects the same slice.
+contributions. Date range, chitti, member and payment mode apply to the whole
+overview. ``status`` is a member-status filter and applies to member rows only;
+KPIs and charts intentionally continue to report all ledger activity so they
+cannot be distorted by the selected member view.
 """
 
 from datetime import date
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from app.core.permissions import Permission, require_permissions
-from app.dependencies import CurrentUser, DBSession
+from app.dependencies import DBSession
+from app.models.user import User
 from app.schemas.common import ApiResponse, PaginatedResponse
 from app.services.analytics_service import ChittiAnalyticsService
 
@@ -30,7 +32,7 @@ async def chitti_analytics_overview(
     member_id: Optional[UUID] = Query(None),
     payment_mode: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     """Complete dashboard payload: KPIs, daily/monthly series, distributions,
     chitti-wise metrics, member-wise tracking, pending/overdue and ledger."""
@@ -57,7 +59,7 @@ async def chitti_analytics_transactions(
     payment_mode: Optional[str] = Query(None),
     start_date: Optional[date] = Query(None),
     end_date: Optional[date] = Query(None),
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     """Paginated chitti transaction ledger with search and filters."""
     svc = ChittiAnalyticsService(db)
@@ -77,6 +79,6 @@ async def chitti_analytics_transactions(
             "page": page,
             "per_page": per_page,
             "total": total,
-            "total_pages": max(1, -(-total // per_page)),
+            "total_pages": (total + per_page - 1) // per_page,
         },
     )

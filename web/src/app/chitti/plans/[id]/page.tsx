@@ -24,7 +24,10 @@ export default function PlanDetailPage() {
   const [plan, setPlan] = useState<ChittiPlan | null>(null);
   const [loading, setLoading] = useState(true);
   const [preview, setPreview] = useState<ChittiPreview | null>(null);
-  const [previewDate, setPreviewDate] = useState("2026-09-15");
+  const [previewDate, setPreviewDate] = useState(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  });
   const [previewLoading, setPreviewLoading] = useState(false);
   const [metrics, setMetrics] = useState<ChittiPlanMetrics | null>(null);
 

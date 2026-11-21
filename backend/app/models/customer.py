@@ -5,7 +5,7 @@ Customer model — full onboarding fields.
 import uuid
 from datetime import date, datetime
 
-from sqlalchemy import Date, Enum, String, Text, func
+from sqlalchemy import Date, Enum, Index, String, Text, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -54,6 +54,14 @@ class Customer(BaseModel):
         Enum("ACTIVE", "INACTIVE", "BLOCKED", name="customer_status_enum"),
         default="ACTIVE",
         nullable=False,
+    )
+
+    __table_args__ = (
+        Index(
+            "uq_customer_mobile_digits",
+            func.regexp_replace(mobile_number, r"\D", "", "g"),
+            unique=True,
+        ),
     )
 
     # Relationships

@@ -52,14 +52,36 @@ class CustomerRepository(BaseRepository[Customer]):
         )
         return result.scalar_one_or_none()
 
-    async def search(self, query: str) -> list[Customer]:
-        """Search customers by name, code, or mobile number."""
+    async def search(
+        self,
+        query: str,
+        *,
+        skip: int = 0,
+        limit: int = 25,
+        status: Optional[str] = None,
+    ) -> tuple[list[Customer], int]:
+        """Search customers with database-side pagination and a truthful total."""
         search = f"%{query}%"
-        result = await self.session.execute(
-            select(Customer).where(
-                (Customer.full_name.ilike(search))
-                | (Customer.customer_code.ilike(search))
-                | (Customer.mobile_number.ilike(search))
-            ).limit(50)
-        )
-        return list(result.scalars().all())
+        filters = [
+            (Customer.full_name.ilike(search))
+            | (Customer.customer_code.ilike(search))
+            | (Customer.mobile_number.ilike(search))
+        ]
+        if status:
+            filters.append(Customer.status == status)
+
+        total = (
+            await self.session.execute(
+                select(func.count()).select_from(Customer).where(*filters)
+            )
+        ).scalar_one()
+        rows = (
+            await self.session.execute(
+                select(Customer)
+                .where(*filters)
+                .order_by(Customer.full_name.asc(), Customer.id.asc())
+                .offset(skip)
+                .limit(limit)
+            )
+        ).scalars().all()
+        return list(rows), int(total)

@@ -22,6 +22,7 @@ from app.core.exceptions import (
     NotFoundException,
 )
 from app.repositories.chitti_repo import (
+    ENROLLED_EXCLUDED_STATUSES,
     ChittiContributionRepository,
     ChittiLiftEventRepository,
     ChittiMemberRepository,
@@ -602,56 +603,26 @@ class ChittiService:
     # ===========================================================================
 
     async def add_member(
-        self, chitti_id: UUID, *, customer_id: str, member_number: int,
+        self, chitti_id: UUID, *, customer_id: str, member_number: Optional[int] = None,
         payout_order: Optional[int] = None, alias: Optional[str] = None,
+        created_by: Optional[UUID] = None,
     ) -> dict:
-        chitti = await self.chitti_repo.get_by_id(chitti_id)
-        if not chitti:
-            raise NotFoundException("Chitti", chitti_id)
-        if chitti.status not in ("DRAFT", "UPCOMING"):
-            raise BadRequestException("Can only add members to DRAFT or UPCOMING chittis.")
+        """Enroll a member through the same path the API uses.
 
-        # Check customer exists
-        customer = await self.customer_repo.get_by_id(UUID(customer_id))
-        if not customer:
-            raise NotFoundException("Customer", customer_id)
+        ``member_number`` is accepted for source compatibility with older
+        callers but is no longer trusted: both paths now assign max + 1 while
+        holding the Chitti row lock. The agreement workflow owns status,
+        contribution generation and audit logging for every enrollment.
+        """
+        from app.services.agreement_service import AgreementService
 
-        # Multiple slots for the same customer are allowed; only the same slot
-        # (member number) may not be reused.
-        existing_num = await self.member_repo.get_by_chitti_and_member_number(
-            chitti.id, member_number
-        )
-        if existing_num:
-            raise ConflictException(f"Member number {member_number} is already taken.")
-
-        if alias:
-            existing_alias = await self.member_repo.get_by_chitti_and_alias(chitti.id, alias)
-            if existing_alias:
-                raise ConflictException("Alias already used in this Chitti.", error_code="DUPLICATE_ALIAS")
-
-        member = await self.member_repo.create(
-            chitti_id=chitti.id,
-            customer_id=UUID(customer_id),
-            member_number=member_number,
+        return await AgreementService(self.session).add_member(
+            chitti_id,
+            customer_id=customer_id,
             payout_order=payout_order,
-            status="ACTIVE",
-            alias=alias or None,
+            alias=alias,
+            created_by=created_by,
         )
-
-        # Generate contribution entries for this member
-        snapshot = chitti.plan_snapshot
-        engine = ChittiCalculationEngine(snapshot)
-        contributions = engine.generate_member_contributions(
-            member.id,
-            member_number,
-            chitti.start_date,
-            member_lift_period=None,
-        )
-        for entry in contributions:
-            entry["chitti_id"] = chitti.id
-            await self.contribution_repo.create(**entry)
-
-        return self._member_to_dict(member, customer)
 
     async def list_members(self, chitti_id: UUID) -> list[dict]:
         chitti = await self.chitti_repo.get_by_id(chitti_id)
@@ -673,6 +644,13 @@ class ChittiService:
         effective_values = await self._effective_contribution_values(chitti, all_contributions)
         allocation_rows = await self.allocation_repo.get_by_chitti_id(chitti.id)
         credits_by_member = self._unallocated_credit_by_member(allocation_rows)
+        unresolved_by_member: dict[UUID, Decimal] = {}
+        for row in allocation_rows:
+            if row.allocation_type == "UNRESOLVED":
+                unresolved_by_member[row.member_id] = (
+                    unresolved_by_member.get(row.member_id, Decimal("0"))
+                    + self._decimal(row.amount)
+                )
         lifted_by_member: dict = {}
         for payout in await self.payout_repo.get_by_chitti_id(chitti.id):
             lifted_by_member[payout.member_id] = (
@@ -688,7 +666,8 @@ class ChittiService:
             total_expected = sum((effective_values[c.id]["expected"] for c in contributions), Decimal("0"))
             allocated_paid = sum((c.paid_amount for c in contributions), Decimal("0"))
             credit = credits_by_member.get(m.id, Decimal("0"))
-            total_paid = allocated_paid + credit
+            unresolved = unresolved_by_member.get(m.id, Decimal("0"))
+            total_paid = allocated_paid
             outstanding = sum(
                 (effective_values[c.id]["remaining"] for c in contributions),
                 Decimal("0"),
@@ -710,9 +689,24 @@ class ChittiService:
                 agreement=agreement_summary,
                 lifted_amount=lifted_by_member.get(m.id, Decimal("0")),
                 unallocated_credit=credit,
+                unresolved_excess=unresolved,
                 outstanding=outstanding,
             ))
         return result
+
+    async def get_member_for_chitti(self, chitti_id: UUID, member_id: UUID):
+        """Return a member only when it belongs to the Chitti in the URL.
+
+        Agreement/cancellation routes carry both identifiers. Without this check
+        a member of another Chitti could be modified through a mismatched URL.
+        """
+        chitti = await self.chitti_repo.get_by_id(chitti_id)
+        if not chitti:
+            raise NotFoundException("Chitti", chitti_id)
+        member = await self.member_repo.get_by_id(member_id)
+        if not member or member.chitti_id != chitti.id:
+            raise NotFoundException("Member", member_id)
+        return member
 
     async def get_member_detail(self, chitti_id: UUID, member_id: UUID) -> dict:
         """Get full member detail including agreement info."""
@@ -730,10 +724,19 @@ class ChittiService:
         effective_values = await self._effective_contribution_values(chitti)
         total_expected = sum((effective_values[c.id]["expected"] for c in contributions), Decimal("0"))
         allocated_paid = sum((c.paid_amount for c in contributions), Decimal("0"))
-        credit = self._unallocated_credit(
-            await self.allocation_repo.get_by_member_id(chitti.id, member.id)
+        member_allocations = await self.allocation_repo.get_by_member_id(
+            chitti.id, member.id
         )
-        total_paid = allocated_paid + credit
+        credit = self._unallocated_credit(member_allocations)
+        unresolved = sum(
+            (
+                self._decimal(row.amount)
+                for row in member_allocations
+                if row.allocation_type == "UNRESOLVED"
+            ),
+            Decimal("0"),
+        )
+        total_paid = allocated_paid
         outstanding = sum(
             (effective_values[c.id]["remaining"] for c in contributions),
             Decimal("0"),
@@ -774,6 +777,7 @@ class ChittiService:
             "total_paid_amount": float(total_paid),
             "outstanding_amount": float(outstanding),
             "unallocated_credit": float(credit),
+            "unresolved_excess": float(unresolved),
             "lifted": member.lifted,
             "lifted_at": str(member.lifted_at) if member.lifted_at else None,
             "lift_period": member.lift_period,
@@ -981,6 +985,15 @@ class ChittiService:
                 ),
                 Decimal("0"),
             )
+            original_unresolved = sum(
+                (
+                    allocation.amount
+                    for allocation in prior_allocations
+                    if allocation.event_type == "PAYMENT"
+                    and allocation.allocation_type == "UNRESOLVED"
+                ),
+                Decimal("0"),
+            )
             return {
                 "transaction_id": str(existing_txn.id),
                 "contribution_id": str(prior.id) if prior else None,
@@ -991,6 +1004,7 @@ class ChittiService:
                     (row["amount"] for row in returned_allocations), 0.0
                 ),
                 "unallocated_credit": self._money(original_credit),
+                "unresolved_excess": self._money(original_unresolved),
                 "allocations": returned_allocations,
                 "duplicate": True,
             }
@@ -1107,13 +1121,16 @@ class ChittiService:
             amount_left -= applied
 
         if amount_left > 0:
+            # Cash received beyond the payable instalments is not credit yet: the
+            # operator must decide what it pays for. Keep it visible as unresolved
+            # excess until an explicit excess resolution converts it.
             await self.allocation_repo.create(
                 chitti_id=chitti.id,
                 member_id=member.id,
                 source_transaction_id=transaction.id,
                 event_transaction_id=transaction.id,
                 contribution_id=None,
-                allocation_type="CREDIT",
+                allocation_type="UNRESOLVED",
                 event_type="PAYMENT",
                 amount=amount_left,
             )
@@ -1152,7 +1169,8 @@ class ChittiService:
             "remaining_amount": self._money(contribution.remaining_amount),
             "status": contribution.status,
             "allocated_amount": self._money(amount - amount_left),
-            "unallocated_credit": self._money(amount_left),
+            "unallocated_credit": 0.0,
+            "unresolved_excess": self._money(amount_left),
             "allocations": [
                 {**item, "amount": self._money(item["amount"])}
                 for item in allocation_details
@@ -1192,22 +1210,25 @@ class ChittiService:
                     + allocation.amount
                 )
 
+        # Money already handed back to the customer must not be reversed twice.
+        refunded = await self._refunded_amount(original.id)
+        net_amount = self._decimal(original.amount) - refunded
+        if net_amount <= 0:
+            raise BadRequestException(
+                "This receipt has been fully refunded and cannot be reversed.",
+                error_code="RECEIPT_FULLY_REFUNDED",
+            )
         if allocations and sum(
             (row.amount for row in allocations), Decimal("0")
-        ) != original.amount:
+        ) != net_amount:
             raise BadRequestException(
                 "Payment allocation history does not reconcile to the original receipt.",
-                error_code="PAYMENT_ALLOCATION_MISMATCH",
-            )
-        if allocated_credit < 0:
-            raise BadRequestException(
-                "Payment credit history has an invalid negative balance.",
                 error_code="PAYMENT_ALLOCATION_MISMATCH",
             )
 
         reversal = await self.txn_repo.create(
             chitti_id=chitti.id, transaction_type="REVERSAL", member_id=original.member_id,
-            amount=original.amount, payment_method=original.payment_method,
+            amount=net_amount, payment_method=original.payment_method,
             reference_number=original.reference_number, period_number=original.period_number,
             notes=f"Reversal of {original.id}: {reason}", payment_date=today_ist(),
             idempotency_key=key, created_by=reversed_by,
@@ -1292,10 +1313,10 @@ class ChittiService:
             contribution = await self.contribution_repo.get_by_chitti_member_period_for_update(
                 chitti.id, original.member_id, original.period_number
             )
-            if not contribution or contribution.paid_amount < original.amount:
+            if not contribution or contribution.paid_amount < net_amount:
                 raise BadRequestException("Contribution balances do not support this reversal.")
             effective = await self._effective_contribution_values(chitti, [contribution])
-            new_paid = contribution.paid_amount - original.amount
+            new_paid = contribution.paid_amount - net_amount
             expected = effective[contribution.id]["expected"]
             new_remaining = max(expected - new_paid, Decimal("0"))
             schedule = await self.schedule_repo.get_by_period_for_update(
@@ -1315,7 +1336,6 @@ class ChittiService:
                 status=new_status,
             )
 
-        await self._apply_member_credit(chitti, member)
         await self._sync_period_schedules_from_contributions(chitti)
         await self._refresh_member_financials(chitti, member)
         from app.services.audit_service import AuditService
@@ -1341,11 +1361,25 @@ class ChittiService:
         if not chitti:
             raise NotFoundException("Chitti", chitti_id)
         payouts = await self.payout_repo.get_by_chitti_id(chitti.id)
+        members = {
+            member.id: member
+            for member in await self.member_repo.get_by_chitti_id(chitti.id)
+        }
+        customer_names: dict[UUID, str | None] = {}
+        for member in members.values():
+            if member.customer_id not in customer_names:
+                customer = await self.customer_repo.get_by_id(member.customer_id)
+                customer_names[member.customer_id] = (
+                    customer.full_name if customer else None
+                )
         return [
             {
                 "id": str(p.id),
                 "chitti_id": str(p.chitti_id),
                 "member_id": str(p.member_id),
+                "customer_name": customer_names.get(
+                    members[p.member_id].customer_id
+                ) if p.member_id in members else None,
                 "period_number": p.period_number,
                 "gross_payout": p.gross_payout,
                 "discount_amount": p.discount_amount,
@@ -1405,7 +1439,11 @@ class ChittiService:
         schedule = await self.schedule_repo.get_by_period_for_update(chitti.id, period_number)
         if not schedule or schedule.due_date > lift_date:
             raise BadRequestException("The selected lift period is not eligible on this lift date.")
-        existing = await self.lift_repo.get_by_period(chitti.id, period_number)
+        # Lift history is per membership slot. Another slot in this Chitti may
+        # lift in the same period, but this slot must not lift twice.
+        existing = await self.lift_repo.get_active_by_member_and_period(
+            chitti.id, member.id, period_number
+        )
         if existing and existing.reversed_at is None:
             raise ConflictException(
                 "A lift is already recorded for this period.",
@@ -1506,9 +1544,6 @@ class ChittiService:
             await self.contribution_repo.update(
                 row, expected_amount=expected, remaining_amount=remaining, status=status
             )
-        contributions = await self.contribution_repo.get_by_member_id(member.id)
-        await self._rebalance_overallocated_member_payments(chitti, member)
-        await self._apply_member_credit(chitti, member)
         await self._sync_period_schedules_from_contributions(chitti)
         await self._refresh_member_financials(chitti, member)
 
@@ -1812,6 +1847,20 @@ class ChittiService:
         }
 
     # ===========================================================================
+    # Explicit cross-module read interface
+    # ===========================================================================
+
+    async def get_effective_contribution_values(self, chitti, contributions=None) -> dict:
+        """Public, read-only view of a Chitti group's effective contribution values.
+
+        Other modules (for example the consolidated Payments collection screen)
+        must use this method instead of reaching into private Chitti helpers or
+        recomputing Chitti rules themselves. This method never mutates Chitti
+        records; it only projects values owned by the Chitti module.
+        """
+        return await self._effective_contribution_values(chitti, contributions)
+
+    # ===========================================================================
     # Helpers
     # ===========================================================================
 
@@ -1867,206 +1916,31 @@ class ChittiService:
             (effective[row.id]["remaining"] for row in contributions),
             Decimal("0"),
         )
+        # total_paid_amount reports allocated contributions only; available credit
+        # and unresolved excess are shown separately instead of inflating it.
         await self.member_repo.update(
             member,
             total_expected_amount=expected,
-            total_paid_amount=allocated + credit,
+            total_paid_amount=allocated,
             outstanding_amount=outstanding,
         )
 
-    async def _apply_member_credit(self, chitti, member) -> None:
-        """Apply existing receipt credit to the earliest outstanding periods."""
-        allocation_rows = await self.allocation_repo.get_by_member_id(
-            chitti.id, member.id
-        )
-        credit_by_source: dict[UUID, Decimal] = {}
-        for row in allocation_rows:
-            if row.allocation_type == "CREDIT":
-                credit_by_source[row.source_transaction_id] = (
-                    credit_by_source.get(row.source_transaction_id, Decimal("0"))
-                    + self._decimal(row.amount)
-                )
-        if any(balance < 0 for balance in credit_by_source.values()):
-            raise RuntimeError("Chitti payment allocation history contains negative source credit.")
-
-        transactions = await self.txn_repo.get_by_member_id(member.id)
-        transaction_by_id = {row.id: row for row in transactions}
-        reversed_sources = {
-            row.original_transaction_id
-            for row in transactions
-            if row.transaction_type == "REVERSAL" and row.original_transaction_id
-        }
-        sources = [
-            transaction_by_id[source_id]
-            for source_id, balance in credit_by_source.items()
-            if balance > 0
-            and source_id in transaction_by_id
-            and source_id not in reversed_sources
-            and transaction_by_id[source_id].transaction_type == "CONTRIBUTION"
-        ]
-        sources.sort(
-            key=lambda row: (
-                row.payment_date or date.min,
-                row.created_at,
-                row.id,
-            )
-        )
-        if not sources:
-            return
-
-        contributions = sorted(
-            await self.contribution_repo.get_by_member_id(member.id),
-            key=lambda row: row.period_number,
-        )
-        effective = await self._effective_contribution_values(chitti, contributions)
-        remaining_by_contribution = {
-            row.id: self._decimal(effective[row.id]["remaining"])
-            for row in contributions
-        }
-        for source in sources:
-            credit = credit_by_source[source.id]
-            for contribution in contributions:
-                if credit <= 0:
-                    break
-                remaining = remaining_by_contribution[contribution.id]
-                if remaining <= 0:
-                    continue
-                amount = min(credit, remaining)
-                await self.allocation_repo.create(
-                    chitti_id=chitti.id,
-                    member_id=member.id,
-                    source_transaction_id=source.id,
-                    event_transaction_id=None,
-                    contribution_id=None,
-                    allocation_type="CREDIT",
-                    event_type="CREDIT_UTILIZATION",
-                    amount=-amount,
-                )
-                await self.allocation_repo.create(
-                    chitti_id=chitti.id,
-                    member_id=member.id,
-                    source_transaction_id=source.id,
-                    event_transaction_id=None,
-                    contribution_id=contribution.id,
-                    allocation_type="CONTRIBUTION",
-                    event_type="CREDIT_UTILIZATION",
-                    amount=amount,
-                )
-                new_paid = self._decimal(contribution.paid_amount) + amount
-                expected = self._decimal(effective[contribution.id]["expected"])
-                new_remaining = max(expected - new_paid, Decimal("0"))
-                status = (
-                    "PAID" if new_remaining == 0 and expected > 0
-                    else "PARTIALLY_PAID" if new_paid > 0
-                    else contribution.status
-                )
-                await self.contribution_repo.update(
-                    contribution,
-                    expected_amount=expected,
-                    paid_amount=new_paid,
-                    remaining_amount=new_remaining,
-                    status=status,
-                )
-                remaining_by_contribution[contribution.id] = new_remaining
-                credit -= amount
-
-    async def _rebalance_overallocated_member_payments(self, chitti, member) -> None:
-        """Move newly managed overpayments to later dues or back to member credit."""
-        allocations = await self.allocation_repo.get_by_member_id(chitti.id, member.id)
+    async def _refunded_amount(self, receipt_id: UUID) -> Decimal:
+        """Cash already refunded against one receipt, from its own ledger legs."""
+        allocations = await self.allocation_repo.get_by_source_transaction_id(receipt_id)
         if not allocations:
-            return
-        transactions = await self.txn_repo.get_by_member_id(member.id)
-        transaction_by_id = {row.id: row for row in transactions}
-        reversed_sources = {
-            row.original_transaction_id
-            for row in transactions
-            if row.transaction_type == "REVERSAL" and row.original_transaction_id
-        }
-        by_contribution_source: dict[UUID, dict[UUID, Decimal]] = {}
-        for allocation in allocations:
-            if allocation.allocation_type != "CONTRIBUTION" or not allocation.contribution_id:
-                continue
-            sources = by_contribution_source.setdefault(allocation.contribution_id, {})
-            sources[allocation.source_transaction_id] = (
-                sources.get(allocation.source_transaction_id, Decimal("0"))
-                + self._decimal(allocation.amount)
-            )
-
-        contributions = sorted(
-            await self.contribution_repo.get_by_member_id(member.id),
-            key=lambda row: row.period_number,
+            return Decimal("0")
+        transactions = await self.txn_repo.get_by_chitti_id(allocations[0].chitti_id)
+        refund_ids = {row.id for row in transactions if row.transaction_type == "REFUND"}
+        total = sum(
+            (
+                -self._decimal(allocation.amount)
+                for allocation in allocations
+                if allocation.event_transaction_id in refund_ids
+            ),
+            Decimal("0"),
         )
-        for contribution in contributions:
-            source_amounts = by_contribution_source.get(contribution.id, {})
-            managed = sum(source_amounts.values(), Decimal("0"))
-            if managed <= 0:
-                continue
-            legacy_paid = self._decimal(contribution.paid_amount) - managed
-            if legacy_paid < 0:
-                raise RuntimeError(
-                    "Contribution paid amount is below its recorded allocations."
-                )
-            target = max(self._decimal(contribution.expected_amount) - legacy_paid, Decimal("0"))
-            excess = max(managed - target, Decimal("0"))
-            if excess <= 0:
-                continue
-            missing_sources = set(source_amounts) - set(transaction_by_id)
-            if missing_sources:
-                raise RuntimeError("Chitti allocation references a missing source transaction.")
-            source_order = sorted(
-                source_amounts,
-                key=lambda source_id: (
-                    transaction_by_id[source_id].payment_date or date.min,
-                    transaction_by_id[source_id].created_at,
-                    transaction_by_id[source_id].id,
-                ),
-                reverse=True,
-            )
-            for source_id in source_order:
-                if excess <= 0 or source_id in reversed_sources:
-                    continue
-                source_amount = source_amounts[source_id]
-                if source_amount <= 0:
-                    continue
-                moved = min(excess, source_amount)
-                await self.allocation_repo.create(
-                    chitti_id=chitti.id,
-                    member_id=member.id,
-                    source_transaction_id=source_id,
-                    event_transaction_id=None,
-                    contribution_id=contribution.id,
-                    allocation_type="CONTRIBUTION",
-                    event_type="LIFT_ADJUSTMENT",
-                    amount=-moved,
-                )
-                await self.allocation_repo.create(
-                    chitti_id=chitti.id,
-                    member_id=member.id,
-                    source_transaction_id=source_id,
-                    event_transaction_id=None,
-                    contribution_id=None,
-                    allocation_type="CREDIT",
-                    event_type="LIFT_ADJUSTMENT",
-                    amount=moved,
-                )
-                source_amounts[source_id] -= moved
-                excess -= moved
-            if excess > 0:
-                raise RuntimeError(
-                    "Unable to reconcile overallocated Chitti contribution payments."
-                )
-            paid = self._decimal(contribution.paid_amount) - (managed - target)
-            remaining = max(self._decimal(contribution.expected_amount) - paid, Decimal("0"))
-            await self.contribution_repo.update(
-                contribution,
-                paid_amount=paid,
-                remaining_amount=remaining,
-                status=(
-                    "PAID" if remaining == 0 and contribution.expected_amount > 0
-                    else "PARTIALLY_PAID" if paid > 0
-                    else "UPCOMING"
-                ),
-            )
+        return max(total, Decimal("0"))
 
     async def _effective_schedule_rows(self, chitti, schedules=None) -> list[dict]:
         """Read period totals/status from member contribution rows when available.
@@ -2175,7 +2049,7 @@ class ChittiService:
                 "expected": sum(
                     (self._decimal(effective_values[c.id]["expected"]) for c in contributions), Decimal("0")
                 ),
-                "collected": allocated + unallocated_credit,
+                "collected": allocated,
                 "pending": sum(
                     (self._decimal(effective_values[c.id]["remaining"]) for c in contributions), Decimal("0")
                 ),
@@ -2434,6 +2308,7 @@ class ChittiService:
         agreement=None,
         lifted_amount=Decimal("0"),
         unallocated_credit=Decimal("0"),
+        unresolved_excess=Decimal("0"),
         outstanding=None,
     ) -> dict:
         if outstanding is None:
@@ -2462,4 +2337,5 @@ class ChittiService:
             "total_paid": self._money(total_paid),
             "outstanding": self._money(outstanding),
             "unallocated_credit": self._money(unallocated_credit),
+            "unresolved_excess": self._money(unresolved_excess),
         }

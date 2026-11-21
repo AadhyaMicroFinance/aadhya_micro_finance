@@ -9,6 +9,8 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
+from app.core.exceptions import BadRequestException
+from app.utils.dates import add_months
 from app.utils.timezone import today_ist
 
 
@@ -46,6 +48,26 @@ class CalculationEngine:
         total_payable = principal_amount + interest_amount + fees
 
         if custom_installment_amount and custom_installment_amount > 0:
+            # A custom installment is a promise about the whole schedule. It
+            # must retire the total payable within the same one-cent-per-period
+            # rounding tolerance used by the automatic split; otherwise the
+            # account is born with a permanent shortfall or material overpay.
+            scheduled_total = custom_installment_amount * number_of_installments
+            tolerance = Decimal("0.01") * number_of_installments
+            if (
+                scheduled_total < total_payable
+                or scheduled_total > total_payable + tolerance
+            ):
+                raise BadRequestException(
+                    "Custom installment must cover the total payable without material overpayment.",
+                    error_code="CUSTOM_INSTALLMENT_DOES_NOT_COVER_TOTAL",
+                    details={
+                        "total_payable": str(total_payable),
+                        "number_of_installments": number_of_installments,
+                        "custom_installment_amount": str(custom_installment_amount),
+                        "scheduled_total": str(scheduled_total),
+                    },
+                )
             installment_amount = custom_installment_amount
         else:
             installment_amount = (
@@ -106,7 +128,11 @@ class CalculationEngine:
         schedule = []
 
         for i in range(1, number_of_installments + 1):
-            due_date = first_due_date + timedelta(days=days * (i - 1))
+            due_date = (
+                add_months(first_due_date, i - 1)
+                if frequency == "MONTHLY"
+                else first_due_date + timedelta(days=days * (i - 1))
+            )
             schedule.append({
                 "finance_account_id": account_id,
                 "installment_number": i,

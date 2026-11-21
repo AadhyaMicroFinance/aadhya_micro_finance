@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useCallback, useState, useEffect } from "react";
 import Link from "next/link";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import { chittiApi, type ChittiPlan } from "@/services/chitti";
@@ -14,14 +14,14 @@ export default function ChittiPlansPage() {
   const [loading, setLoading] = useState(true);
   const [showAll, setShowAll] = useState(false);
 
-  const loadPlans = async () => {
+  const loadPlans = useCallback(async () => {
     setLoading(true);
     try { const res = await chittiApi.listPlans({ per_page: 50, active_only: !showAll }); setPlans(res.data); }
     catch (e) { console.error(e); }
     finally { setLoading(false); }
-  };
+  }, [showAll]);
 
-  useEffect(() => { loadPlans(); }, [showAll]);
+  useEffect(() => { loadPlans(); }, [loadPlans]);
 
   const handleDuplicate = async (planId: string) => {
     if (!confirm("Duplicate this plan?")) return;

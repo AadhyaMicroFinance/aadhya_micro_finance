@@ -20,26 +20,40 @@ export const useAuthStore = create<AuthState>((set) => ({
   isLoading: true,
 
   login: async (username: string, password: string) => {
-    const tokens = await authApi.login({ username, password });
-    localStorage.setItem("access_token", tokens.access_token);
-    localStorage.setItem("refresh_token", tokens.refresh_token);
-    const user = await authApi.getMe();
-    set({ user, isAuthenticated: true });
+    // Clear any stale session before a fresh sign-in so neither the request
+    // interceptor nor the refresh flow can interfere with this attempt.
+    localStorage.removeItem("access_token");
+    localStorage.removeItem("refresh_token");
+    set({ isLoading: true });
+
+    try {
+      const tokens = await authApi.login({ username, password });
+      localStorage.setItem("access_token", tokens.access_token);
+      localStorage.setItem("refresh_token", tokens.refresh_token);
+      const user = await authApi.getMe();
+      set({ user, isAuthenticated: true, isLoading: false });
+    } catch (error) {
+      localStorage.removeItem("access_token");
+      localStorage.removeItem("refresh_token");
+      set({ user: null, isAuthenticated: false, isLoading: false });
+      // Re-throw so the login page can render the backend's error message.
+      throw error;
+    }
   },
 
   logout: () => {
     localStorage.removeItem("access_token");
     localStorage.removeItem("refresh_token");
-    set({ user: null, isAuthenticated: false });
+    set({ user: null, isAuthenticated: false, isLoading: false });
     window.location.href = "/login";
   },
 
   fetchUser: async () => {
     try {
       const user = await authApi.getMe();
-      set({ user, isAuthenticated: true });
+      set({ user, isAuthenticated: true, isLoading: false });
     } catch {
-      set({ user: null, isAuthenticated: false });
+      set({ user: null, isAuthenticated: false, isLoading: false });
     }
   },
 

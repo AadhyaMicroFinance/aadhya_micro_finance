@@ -70,20 +70,46 @@ class TestCalculateFinanceTotals:
         assert installment == Decimal("5300.00")
 
     def test_custom_installment_amount(self, calc):
-        """Custom installment overrides auto-calculation."""
+        """A custom installment may override the split when it retires the total."""
         total, installment = calc.calculate_finance_totals(
             principal_amount=Decimal("50000"),
             interest_rate=Decimal("0"),
             interest_type="FLAT",
             fees=Decimal("0"),
             number_of_installments=10,
-            custom_installment_amount=Decimal("6000"),
+            custom_installment_amount=Decimal("5000"),
         )
         assert total == Decimal("50000.00")
-        assert installment == Decimal("6000.00")
+        assert installment == Decimal("5000.00")
+
+    def test_custom_installment_must_cover_total(self, calc):
+        """A custom split cannot create a permanent shortfall or material overpay."""
+        from app.core.exceptions import BadRequestException
+
+        with pytest.raises(BadRequestException) as shortfall:
+            calc.calculate_finance_totals(
+                principal_amount=Decimal("50000"),
+                interest_rate=Decimal("0"),
+                interest_type="FLAT",
+                fees=Decimal("0"),
+                number_of_installments=10,
+                custom_installment_amount=Decimal("4000"),
+            )
+        assert shortfall.value.error_code == "CUSTOM_INSTALLMENT_DOES_NOT_COVER_TOTAL"
+
+        with pytest.raises(BadRequestException) as overpay:
+            calc.calculate_finance_totals(
+                principal_amount=Decimal("50000"),
+                interest_rate=Decimal("0"),
+                interest_type="FLAT",
+                fees=Decimal("0"),
+                number_of_installments=10,
+                custom_installment_amount=Decimal("6000"),
+            )
+        assert overpay.value.error_code == "CUSTOM_INSTALLMENT_DOES_NOT_COVER_TOTAL"
 
     def test_monthly_schedule_dates(self, calc):
-        """Schedule due dates should be 30 days apart for monthly."""
+        """Monthly due dates keep the calendar day instead of drifting 30 days."""
         schedule = calc.generate_schedule(
             account_id="test-id",
             installment_amount=Decimal("5000"),
@@ -92,9 +118,25 @@ class TestCalculateFinanceTotals:
             frequency="MONTHLY",
         )
         assert len(schedule) == 3
-        assert schedule[0]["due_date"] == date(2026, 9, 1)
-        assert schedule[1]["due_date"] == date(2026, 10, 1)
-        assert schedule[2]["due_date"] == date(2026, 10, 31)
+        assert [entry["due_date"] for entry in schedule] == [
+            date(2026, 9, 1),
+            date(2026, 10, 1),
+            date(2026, 11, 1),
+        ]
+
+    def test_monthly_schedule_clamps_month_end(self, calc):
+        schedule = calc.generate_schedule(
+            account_id="test-id",
+            installment_amount=Decimal("5000"),
+            first_due_date=date(2026, 1, 31),
+            number_of_installments=3,
+            frequency="MONTHLY",
+        )
+        assert [entry["due_date"] for entry in schedule] == [
+            date(2026, 1, 31),
+            date(2026, 2, 28),
+            date(2026, 3, 31),
+        ]
 
     def test_weekly_schedule_dates(self, calc):
         """Schedule due dates should be 7 days apart for weekly."""

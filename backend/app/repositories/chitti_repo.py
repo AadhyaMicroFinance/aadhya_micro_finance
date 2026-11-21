@@ -179,16 +179,33 @@ class ChittiMemberRepository(BaseRepository[ChittiMember]):
         )
         return result.scalar() or 0
 
-    async def get_by_chitti_and_customer(
+    async def list_by_chitti_and_customer(
         self, chitti_id: UUID, customer_id: UUID
-    ) -> Optional[ChittiMember]:
+    ) -> list[ChittiMember]:
+        """All slots held by one customer in one Chitti.
+
+        A customer may own several independent slots, so callers must not use
+        ``scalar_one_or_none`` here.
+        """
         result = await self.session.execute(
-            select(ChittiMember).where(
+            select(ChittiMember)
+            .where(
                 ChittiMember.chitti_id == chitti_id,
                 ChittiMember.customer_id == customer_id,
             )
+            .order_by(ChittiMember.member_number)
         )
-        return result.scalar_one_or_none()
+        return list(result.scalars().all())
+
+    async def get_by_chitti_and_customer(
+        self, chitti_id: UUID, customer_id: UUID
+    ) -> Optional[ChittiMember]:
+        """Backward-compatible single-slot lookup.
+
+        Prefer :meth:`list_by_chitti_and_customer` in multi-slot flows.
+        """
+        rows = await self.list_by_chitti_and_customer(chitti_id, customer_id)
+        return rows[0] if rows else None
 
     async def get_by_customer_id(self, customer_id: UUID) -> list[ChittiMember]:
         result = await self.session.execute(
@@ -212,10 +229,13 @@ class ChittiMemberRepository(BaseRepository[ChittiMember]):
     async def get_by_chitti_and_alias(
         self, chitti_id: UUID, alias: str
     ) -> Optional[ChittiMember]:
+        """Case-insensitive alias lookup matching uq_chitti_member_alias_ci."""
+        from app.core.aliases import alias_lookup_key
+
         result = await self.session.execute(
             select(ChittiMember).where(
                 ChittiMember.chitti_id == chitti_id,
-                ChittiMember.alias == alias,
+                func.lower(ChittiMember.alias) == alias_lookup_key(alias),
             )
         )
         return result.scalar_one_or_none()
@@ -369,9 +389,28 @@ class ChittiLiftEventRepository(BaseRepository[ChittiLiftEvent]):
         return list(result.scalars().all())
 
     async def get_by_period(self, chitti_id: UUID, period_number: int) -> Optional[ChittiLiftEvent]:
+        """Legacy Chitti-wide lookup; kept for backward compatibility."""
         result = await self.session.execute(
             select(ChittiLiftEvent).where(
                 ChittiLiftEvent.chitti_id == chitti_id,
+                ChittiLiftEvent.period_number == period_number,
+                ChittiLiftEvent.reversed_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def get_active_by_member_and_period(
+        self, chitti_id: UUID, member_id: UUID, period_number: int
+    ) -> Optional[ChittiLiftEvent]:
+        """Active lift for one slot and period.
+
+        Lift independence is per membership: a second slot in the same Chitti
+        may lift in the same period, but one slot must not lift twice.
+        """
+        result = await self.session.execute(
+            select(ChittiLiftEvent).where(
+                ChittiLiftEvent.chitti_id == chitti_id,
+                ChittiLiftEvent.member_id == member_id,
                 ChittiLiftEvent.period_number == period_number,
                 ChittiLiftEvent.reversed_at.is_(None),
             )
@@ -461,6 +500,19 @@ class ChittiTransactionRepository(BaseRepository[ChittiTransaction]):
         )
         return list(result.scalars().all())
 
+    async def get_by_chitti_and_type(
+        self, chitti_id: UUID, transaction_type: str
+    ) -> list[ChittiTransaction]:
+        result = await self.session.execute(
+            select(ChittiTransaction)
+            .where(
+                ChittiTransaction.chitti_id == chitti_id,
+                ChittiTransaction.transaction_type == transaction_type,
+            )
+            .order_by(ChittiTransaction.created_at)
+        )
+        return list(result.scalars().all())
+
     async def get_by_idempotency_key(self, key: str) -> Optional[ChittiTransaction]:
         result = await self.session.execute(
             select(ChittiTransaction).where(
@@ -502,6 +554,16 @@ class ChittiPaymentAllocationRepository(BaseRepository[ChittiPaymentAllocation])
                 ChittiPaymentAllocation.chitti_id == chitti_id,
                 ChittiPaymentAllocation.member_id == member_id,
             )
+            .order_by(ChittiPaymentAllocation.created_at, ChittiPaymentAllocation.id)
+        )
+        return list(result.scalars().all())
+
+    async def get_by_event_transaction_id(
+        self, transaction_id: UUID
+    ) -> list[ChittiPaymentAllocation]:
+        result = await self.session.execute(
+            select(ChittiPaymentAllocation)
+            .where(ChittiPaymentAllocation.event_transaction_id == transaction_id)
             .order_by(ChittiPaymentAllocation.created_at, ChittiPaymentAllocation.id)
         )
         return list(result.scalars().all())

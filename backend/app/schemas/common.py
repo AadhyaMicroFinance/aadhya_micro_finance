@@ -2,26 +2,26 @@
 Common schema types used across the application.
 """
 
-from typing import Any, Generic, Optional, TypeVar
+from typing import Generic, Optional, TypeVar
 from pydantic import BaseModel, Field
 
 T = TypeVar("T")
 
 
-class ApiResponse(BaseModel):
-    """Standard API response wrapper."""
+class ApiResponse(BaseModel, Generic[T]):
+    """Standard API response wrapper with an optional typed payload."""
 
     success: bool = True
-    data: Any = None
+    data: Optional[T] = None
     error: Optional[dict] = None
     meta: Optional[dict] = None
 
 
-class PaginatedResponse(BaseModel):
-    """Paginated list response."""
+class PaginatedResponse(BaseModel, Generic[T]):
+    """Paginated list response with a typed item payload."""
 
     success: bool = True
-    data: list[Any] = []
+    data: list[T] = Field(default_factory=list)
     meta: dict = Field(default_factory=lambda: {
         "page": 1,
         "per_page": 25,

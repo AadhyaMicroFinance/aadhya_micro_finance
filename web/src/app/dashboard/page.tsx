@@ -7,6 +7,7 @@ import { CardSkeleton } from "@/components/ui/Skeleton";
 import EmptyState from "@/components/ui/EmptyState";
 import Avatar from "@/components/ui/Avatar";
 import { reportApi, type DailyReport } from "@/services/reports";
+import { getApiErrorMessage } from "@/services/api-client";
 import { formatCurrency, cn } from "@/lib/utils";
 import {
   CalendarDays,
@@ -89,14 +90,17 @@ export default function DashboardPage() {
   const [report, setReport] = useState<DailyReport | null>(null);
   const [date, setDate] = useState<string>(todayIso());
   const [showPending, setShowPending] = useState(false);
+  const [error, setError] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
+    setError("");
     try {
       const data = await reportApi.getDailyReport(date);
       setReport(data);
     } catch (e) {
-      console.error(e);
+      setError(getApiErrorMessage(e, "Unable to load this day's report."));
+      setReport(null);
     } finally {
       setLoading(false);
     }
@@ -172,6 +176,13 @@ export default function DashboardPage() {
             )}
           </div>
         </div>
+
+        {error && (
+          <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-danger-200 bg-danger-50 px-4 py-3 text-sm text-danger-700">
+            <span className="flex-1">{error}</span>
+            <button type="button" onClick={() => void load()} className="btn-secondary btn-sm">Retry</button>
+          </div>
+        )}
 
         {/* KPI cards */}
         {loading ? (

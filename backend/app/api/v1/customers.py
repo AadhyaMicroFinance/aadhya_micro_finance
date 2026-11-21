@@ -5,10 +5,11 @@ Customer management API endpoints — full onboarding fields.
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from app.core.permissions import Permission, require_permissions
-from app.dependencies import CurrentUser, DBSession
+from app.dependencies import DBSession
+from app.models.user import User
 from app.schemas.customer import CustomerCreate, CustomerUpdate
 from app.schemas.common import ApiResponse, PaginatedResponse
 from app.services.customer_service import CustomerService
@@ -20,11 +21,13 @@ router = APIRouter()
 async def create_customer(
     body: CustomerCreate,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CUSTOMERS_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CUSTOMERS_WRITE)),
 ):
     """Register a new customer (onboarding)."""
     service = CustomerService(db)
-    customer = await service.create_customer(**body.model_dump())
+    customer = await service.create_customer(
+        **body.model_dump(), actor_id=current_user.id
+    )
     return ApiResponse(data=customer)
 
 
@@ -35,7 +38,7 @@ async def list_customers(
     per_page: int = Query(25, ge=1, le=100),
     status: Optional[str] = None,
     search: Optional[str] = None,
-    current_user: CurrentUser = require_permissions(Permission.CUSTOMERS_READ),
+    current_user: User = Depends(require_permissions(Permission.CUSTOMERS_READ)),
 ):
     service = CustomerService(db)
     items, total = await service.list_customers(
@@ -56,7 +59,7 @@ async def list_customers(
 async def get_customer(
     customer_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CUSTOMERS_READ),
+    current_user: User = Depends(require_permissions(Permission.CUSTOMERS_READ)),
 ):
     service = CustomerService(db)
     customer = await service.get_customer(customer_id)
@@ -68,11 +71,13 @@ async def update_customer(
     customer_id: UUID,
     body: CustomerUpdate,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CUSTOMERS_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CUSTOMERS_WRITE)),
 ):
     service = CustomerService(db)
     customer = await service.update_customer(
-        customer_id, **body.model_dump(exclude_unset=True)
+        customer_id,
+        **body.model_dump(exclude_unset=True),
+        actor_id=current_user.id,
     )
     return ApiResponse(data=customer)
 
@@ -81,7 +86,7 @@ async def update_customer(
 async def get_customer_ledger(
     customer_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CUSTOMERS_READ),
+    current_user: User = Depends(require_permissions(Permission.CUSTOMERS_READ)),
 ):
     service = CustomerService(db)
     ledger = await service.get_customer_ledger(customer_id)

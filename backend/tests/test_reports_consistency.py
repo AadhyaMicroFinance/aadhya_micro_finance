@@ -17,11 +17,11 @@ from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from openpyxl import load_workbook
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.models.audit import AuditLog
 from app.models.payment import PaymentTransaction
@@ -43,6 +43,7 @@ from app.services.chitti_service import ChittiService
 from app.services.chitti_financial_values import aggregate_period_values
 from app.services.report_service import ReportService
 from app.utils.timezone import today_ist
+from tests.finance_helpers import create_finance_account
 
 PLAN = {
     "name": "Report Consistency Plan",
@@ -62,6 +63,26 @@ PLAN = {
 
 def _auth(test_user):
     return {"Authorization": f"Bearer {test_user['token']}"}
+
+
+async def _reversal_headers(db_session):
+    """Payment reversal requires an explicit elevated permission."""
+    from app.core.security import create_access_token
+    from app.models.user import User
+
+    user = User(
+        id=uuid4(),
+        username=f"reversal-admin-{uuid4().hex[:6]}",
+        email=f"reversal-admin-{uuid4().hex[:6]}@test.com",
+        password_hash="x",
+        full_name="Reversal Admin",
+        role="SUPER_ADMIN",
+        is_active=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+    token = create_access_token(data={"sub": str(user.id), "role": user.role})
+    return {"Authorization": f"Bearer {token}"}
 
 
 def test_legacy_period_values_fall_back_to_schedule_and_reconcile_pending():
@@ -127,6 +148,7 @@ async def test_pending_report_ignores_stale_paid_status():
         mobile_number="9000000000",
         chitti_name="Test Chitti",
         member_number=1,
+        member_alias="Slot A",
     )
 
     class FakeSession:
@@ -153,6 +175,8 @@ async def test_pending_report_ignores_stale_paid_status():
     assert len(result) == 1
     assert result[0]["pending"] == Decimal("100")
     assert result[0]["status"] == "PENDING"
+    assert result[0]["member_number"] == 1
+    assert result[0]["member_alias"] == "Slot A"
 
 
 @pytest.mark.asyncio
@@ -241,7 +265,7 @@ async def _running_chitti(client, headers, members=2):
                 "plan_id": plan["id"],
                 "name": "Report Chitti",
                 "start_date": date.today().isoformat(),
-                "member_count": 4,
+                "member_count": members,
             },
             headers=headers,
         )
@@ -326,9 +350,10 @@ async def _running_lift_chitti(client, headers, member_count=2):
 
 
 @pytest.mark.asyncio
-async def test_lift_credit_is_applied_and_reversed_across_period_allocations(
+async def test_lift_recalculation_does_not_create_or_move_credit(
     client, test_user, db_session
 ):
+    """A lift changes expectations only; credit needs an operator decision."""
     headers = _auth(test_user)
     chitti, members = await _running_lift_chitti(client, headers, member_count=1)
     member_id = members[0]["id"]
@@ -346,21 +371,20 @@ async def test_lift_credit_is_applied_and_reversed_across_period_allocations(
     )
     assert payment.status_code == 200, payment.text
     transaction_id = payment.json()["data"]["transaction_id"]
-    assert payment.json()["data"]["unallocated_credit"] == 5000
+    assert payment.json()["data"]["unallocated_credit"] == 0.0
+    assert payment.json()["data"]["unresolved_excess"] == 5000.0
 
     allocations = list((await db_session.execute(
         select(ChittiPaymentAllocation).where(
             ChittiPaymentAllocation.source_transaction_id == UUID(transaction_id)
         )
     )).scalars().all())
-    assert sum(
-        (row.amount for row in allocations if row.allocation_type == "CONTRIBUTION"),
-        Decimal("0"),
-    ) == Decimal("20000.00")
-    assert sum(
-        (row.amount for row in allocations if row.allocation_type == "CREDIT"),
-        Decimal("0"),
-    ) == Decimal("5000.00")
+    by_type = {}
+    for row in allocations:
+        by_type[row.allocation_type] = by_type.get(row.allocation_type, Decimal("0")) + row.amount
+    assert by_type.get("CONTRIBUTION") == Decimal("20000.00")
+    assert by_type.get("UNRESOLVED") == Decimal("5000.00")
+    assert "CREDIT" not in by_type
 
     lift = await client.post(
         f"/api/v1/chitti/{chitti['id']}/lifts",
@@ -382,57 +406,24 @@ async def test_lift_credit_is_applied_and_reversed_across_period_allocations(
         if row["id"] == member_id
     )
     assert member_data["total_expected"] == 23600
-    assert member_data["total_paid"] == 25000
-    assert member_data["unallocated_credit"] == 1400
-    assert member_data["outstanding"] == 0
+    assert member_data["total_paid"] == 20000
+    assert member_data["unallocated_credit"] == 0
+    assert member_data["unresolved_excess"] == 5000
+    assert member_data["outstanding"] == 3600
 
     schedule = (await client.get(
         f"/api/v1/chitti/{chitti['id']}/schedule", headers=headers
     )).json()["data"]
     assert sum(row["expected_collection"] for row in schedule) == 23600
-    assert sum(row["actual_collection"] for row in schedule) == 23600
-    assert sum(row["pending_collection"] for row in schedule) == 0
+    assert sum(row["actual_collection"] for row in schedule) == 20000
+    assert sum(row["pending_collection"] for row in schedule) == 3600
 
-    overview = (await client.get(
-        "/api/v1/analytics/chitti/overview", headers=headers
-    )).json()["data"]
-    metric = next(
-        row for row in overview["chitti_metrics"] if row["id"] == chitti["id"]
-    )
-    assert metric["unallocated_credit"] == 1400
-    assert overview["kpis"]["total_unallocated_credit"] == 1400
-
-    reversal = await client.post(
-        f"/api/v1/chitti/{chitti['id']}/transactions/{transaction_id}/reverse",
-        json={"reversal_reason": "Reverse allocated receipt"},
-        headers=headers,
-    )
-    assert reversal.status_code == 200, reversal.text
-
-    member_after_reversal = next(
-        row for row in (
-            await client.get(
-                f"/api/v1/chitti/{chitti['id']}/members", headers=headers
-            )
-        ).json()["data"]
-        if row["id"] == member_id
-    )
-    assert member_after_reversal["total_paid"] == 0
-    assert member_after_reversal["unallocated_credit"] == 0
-    assert member_after_reversal["outstanding"] == 23600
-
-    schedule_after_reversal = (await client.get(
-        f"/api/v1/chitti/{chitti['id']}/schedule", headers=headers
-    )).json()["data"]
-    assert sum(row["actual_collection"] for row in schedule_after_reversal) == 0
-    assert sum(row["pending_collection"] for row in schedule_after_reversal) == 23600
-
-    allocations_after_reversal = list((await db_session.execute(
+    after = list((await db_session.execute(
         select(ChittiPaymentAllocation).where(
             ChittiPaymentAllocation.source_transaction_id == UUID(transaction_id)
         )
     )).scalars().all())
-    assert sum((row.amount for row in allocations_after_reversal), Decimal("0")) == Decimal("0")
+    assert len(after) == len(allocations)
 
 
 @pytest.mark.asyncio
@@ -442,30 +433,21 @@ async def test_reversal_restores_schedule_and_report(client, test_user, db_sessi
     today = date.today().isoformat()
     customer = await _customer(client, headers, 7)
 
-    account = (
-        await client.post(
-            "/api/v1/finance/",
-            json={
-                "customer_id": customer["id"],
-                "principal_amount": "3000.00",
-                "interest_rate": "0",
-                "interest_type": "FLAT",
-                "fees": "0",
-                "frequency": "WEEKLY",
-                "start_date": today,
-                "first_due_date": today,
-                "number_of_installments": 3,
-            },
-            headers=headers,
-        )
-    ).json()["data"]
+    account, _ = await create_finance_account(
+        client,
+        headers,
+        customer["id"],
+        frequency="WEEKLY",
+        number_of_installments=3,
+    )
 
     schedule = (
         await client.get(f"/api/v1/finance/{account['id']}/schedule", headers=headers)
     ).json()["data"]
     installment = next(s for s in schedule if s["due_date"] == today)
 
-    # A chitti id on the finance endpoint would double-count money.
+    # Chitti fields are not part of the Finance payment contract at all.
+    # Rejecting at the schema boundary keeps module ledgers structurally separate.
     blocked = await client.post(
         "/api/v1/payments/",
         json={
@@ -478,8 +460,9 @@ async def test_reversal_restores_schedule_and_report(client, test_user, db_sessi
         },
         headers=headers,
     )
-    assert blocked.status_code == 400, blocked.text
-    assert blocked.json()["error"]["code"] == "USE_CHITTI_CONTRIBUTION_ENDPOINT"
+    assert blocked.status_code == 422, blocked.text
+    assert "chitti_account_id" in blocked.text
+    assert (await db_session.scalar(select(func.count()).select_from(PaymentTransaction))) == 0
 
     payment_body = {
                 "customer_id": customer["id"],
@@ -509,12 +492,23 @@ async def test_reversal_restores_schedule_and_report(client, test_user, db_sessi
     assert paid_row["paid_amount"] == 1000.0
     assert paid_row["remaining_amount"] == 0.0
 
+    reversal_headers = await _reversal_headers(db_session)
     reversal = await client.post(
         f"/api/v1/payments/{payment['id']}/reverse",
         json={"reversal_reason": "cash returned"},
-        headers=headers,
+        headers=reversal_headers,
     )
     assert reversal.status_code == 200, reversal.text
+
+    # Retrying the same reversal must replay the first ledger row, not fail
+    # on its idempotency key or restore the installment twice.
+    replay = await client.post(
+        f"/api/v1/payments/{payment['id']}/reverse",
+        json={"reversal_reason": "cash returned"},
+        headers=reversal_headers,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["data"]["id"] == reversal.json()["data"]["id"]
 
     restored = next(
         s
@@ -567,15 +561,16 @@ async def test_chitti_partial_reversal_restores_ledger_and_audit(client, test_us
     assert contribution.status_code == 200, contribution.text
     original_id = contribution.json()["data"]["transaction_id"]
 
+    reversal_headers = await _reversal_headers(db_session)
     reversal = await client.post(
         f"/api/v1/chitti/{chitti['id']}/transactions/{original_id}/reverse",
-        json={"reversal_reason": "regression reversal"}, headers=headers,
+        json={"reversal_reason": "regression reversal"}, headers=reversal_headers,
     )
     assert reversal.status_code == 200, reversal.text
     assert reversal.json()["data"]["duplicate"] is False
     repeated = await client.post(
         f"/api/v1/chitti/{chitti['id']}/transactions/{original_id}/reverse",
-        json={"reversal_reason": "retry"}, headers=headers,
+        json={"reversal_reason": "retry"}, headers=reversal_headers,
     )
     assert repeated.status_code == 200
     assert repeated.json()["data"]["duplicate"] is True
@@ -973,10 +968,11 @@ async def test_reversal_rejects_insufficient_balance_and_invalid_type(
     contribution_row.remaining_amount = Decimal("900")
     await db_session.flush()
 
+    reversal_headers = await _reversal_headers(db_session)
     insufficient_response = await client.post(
         f"/api/v1/chitti/{chitti['id']}/transactions/{genuine_transaction_id}/reverse",
         json={"reversal_reason": "balance does not support reversal"},
-        headers=headers,
+        headers=reversal_headers,
     )
     assert insufficient_response.status_code == 400
     assert insufficient_response.json()["error"]["code"] == "BAD_REQUEST"
@@ -996,7 +992,7 @@ async def test_reversal_rejects_insufficient_balance_and_invalid_type(
     response = await client.post(
         f"/api/v1/chitti/{chitti['id']}/transactions/{invalid.id}/reverse",
         json={"reversal_reason": "invalid transaction type"},
-        headers=headers,
+        headers=reversal_headers,
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "BAD_REQUEST"
@@ -1206,6 +1202,16 @@ async def test_normal_and_duplicate_payout_posting(
     assert first.status_code == 200, first.text
     assert first.json()["data"]["duplicate"] is False
     await db_session.commit()
+
+    listed = await client.get(
+        f"/api/v1/chitti/{chitti['id']}/payouts", headers=headers
+    )
+    assert listed.status_code == 200, listed.text
+    payout_rows = listed.json()["data"]
+    assert len(payout_rows) == 1
+    assert payout_rows[0]["member_id"] == members[0]["id"]
+    assert payout_rows[0]["customer_name"]
+    assert payout_rows[0]["customer_name"] != chitti["name"]
 
     repeated = await client.post(
         f"/api/v1/chitti/{chitti['id']}/payouts",
@@ -1780,11 +1786,31 @@ async def test_concurrent_lift_requests(
         )).scalars().all())
         assert len(active) == 1
 
+    # Free period 1 so the next batch can use a genuinely eligible period.
+    async with fresh_sessions() as fresh:
+        first_event = (await fresh.execute(
+            select(ChittiLiftEvent).where(
+                ChittiLiftEvent.chitti_id == UUID(chitti["id"]),
+                ChittiLiftEvent.reversed_at.is_(None),
+            )
+        )).scalar_one()
+        first_event_id = first_event.id
+
+    async with sessions() as session:
+        await ChittiService(session).reverse_lift(
+            UUID(chitti["id"]), first_event_id,
+            reason="test setup for peer slots",
+            reversed_by=test_user["user"].id,
+        )
+        await session.commit()
+
+    # Multi-slot rule: each membership slot lifts independently, so two
+    # different members may record the same period in the same Chitti.
     different_members = await asyncio.gather(
-        lift(members[0]["id"], 2),
-        lift(members[1]["id"], 2),
+        lift(members[0]["id"], 1),
+        lift(members[1]["id"], 1),
     )
-    assert sum(isinstance(value, Exception) for value in different_members) >= 1
+    assert all(isinstance(value, dict) for value in different_members), different_members
 
     async with fresh_sessions() as fresh:
         active = list((await fresh.execute(
@@ -1793,7 +1819,8 @@ async def test_concurrent_lift_requests(
                 ChittiLiftEvent.reversed_at.is_(None),
             )
         )).scalars().all())
-        assert len(active) <= 2
+        assert len(active) == 2
+        assert len({event.member_id for event in active}) == 2
 
 
 @pytest.mark.asyncio
@@ -2427,23 +2454,14 @@ async def test_daily_report_separates_and_totals_both_ledgers(client, test_user)
 
     # ---- A finance installment is collected on its own account --------------
     customer = members[0]["customer_id"]
-    account = await client.post(
-        "/api/v1/finance/",
-        json={
-            "customer_id": customer,
-            "principal_amount": "3000.00",
-            "interest_rate": "0",
-            "interest_type": "FLAT",
-            "fees": "0",
-            "frequency": "WEEKLY",
-            "start_date": today,
-            "first_due_date": today,
-            "number_of_installments": 3,
-        },
-        headers=headers,
+    account, _ = await create_finance_account(
+        client,
+        headers,
+        customer,
+        frequency="WEEKLY",
+        number_of_installments=3,
     )
-    assert account.status_code == 200, account.text
-    account_id = account.json()["data"]["id"]
+    account_id = account["id"]
 
     schedule = await client.get(f"/api/v1/finance/{account_id}/schedule", headers=headers)
     assert schedule.status_code == 200, schedule.text

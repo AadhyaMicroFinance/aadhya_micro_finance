@@ -118,6 +118,8 @@ export default function CollectPaymentPage() {
 
   const selectAccount = async (a: FinanceAccount, targetScheduleId?: string) => {
     setSelectedChitti(null);
+    setPaymentMethod("CASH");
+    setReferenceNumber("");
     setSelectedAccount(a);
     setSelectedFinanceScheduleId(null);
     setSchedule([]);
@@ -145,6 +147,10 @@ export default function CollectPaymentPage() {
 
   const selectChitti = async (membership: (typeof chittiMemberships)[number], targetPeriod?: number) => {
     setSelectedAccount(null);
+    // Chitti accepts only CASH/UPI here. Resetting prevents a Finance-only
+    // method from being submitted invisibly after switching sources.
+    setPaymentMethod("CASH");
+    setReferenceNumber("");
     setSelectedChitti(membership);
     setStep("enter-amount");
     setLoading(true);
@@ -213,6 +219,10 @@ export default function CollectPaymentPage() {
 
   const submitPayment = async () => {
     if (!selectedCustomer || (!selectedAccount && !selectedChitti) || !amount) return;
+    if (!selectedChitti && !selectedFinanceScheduleId) {
+      setError("Select a Finance installment before recording this repayment.");
+      return;
+    }
     setLoading(true);
     setError("");
     try {
@@ -232,7 +242,7 @@ export default function CollectPaymentPage() {
         : await paymentsApi.create({
         customer_id: selectedCustomer.id,
         finance_account_id: selectedAccount!.id,
-        finance_schedule_id: selectedFinanceScheduleId || undefined,
+        finance_schedule_id: selectedFinanceScheduleId!,
         amount: parseFloat(amount),
         payment_method: paymentMethod,
         payment_date: paymentDate,
@@ -396,6 +406,9 @@ export default function CollectPaymentPage() {
                                         <span className={cn("badge", getStatusColor(record.status))}>{record.status.replace(/_/g, " ")}</span>
                                       </div>
                                       <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs sm:grid-cols-4">
+                                        {record.source === "CHITTI" && (
+                                          <div><dt className="text-surface-500">Slot</dt><dd className="mt-0.5 font-medium text-surface-800">#{record.member_number}{record.member_alias ? ` · ${record.member_alias}` : ""}</dd></div>
+                                        )}
                                         <div><dt className="text-surface-500">{record.source === "FINANCE" ? "Installment" : "Contribution period"}</dt><dd className="mt-0.5 font-medium text-surface-800">{record.period_number}</dd></div>
                                         <div><dt className="text-surface-500">Due date</dt><dd className="mt-0.5 font-medium text-surface-800">{formatDate(record.due_date)}</dd></div>
                                         <div><dt className="text-surface-500">Expected</dt><dd className="mt-0.5 font-medium text-surface-800">{formatCurrency(record.expected_amount)}</dd></div>
@@ -440,7 +453,7 @@ export default function CollectPaymentPage() {
               </section>}
               {chittiMemberships.length > 0 && <section className="space-y-2"><h4 className="text-xs font-bold uppercase tracking-wide text-surface-500">Chitti memberships</h4>
                 {chittiMemberships.map((m) => <button key={m.member_id} onClick={() => selectChitti(m)} className="w-full rounded-xl border border-purple-100 p-4 text-left hover:border-purple-300">
-                  <div className="flex items-start justify-between gap-3"><div><p className="font-semibold">{m.chitti_name} <span className="font-mono text-xs text-surface-500">{m.chitti_code}</span></p><p className="text-xs text-surface-500">Member #{m.member_number} · {m.frequency} · Period {m.current_period}{m.due_date ? ` · Due ${m.due_date}` : ""}</p><p className="mt-1 text-xs text-surface-500">Chitti value {formatCurrency(m.total_value)} · Outstanding {formatCurrency(m.outstanding)}</p></div><span className="badge bg-purple-50 text-purple-700">Due {formatCurrency(m.amount_due)}</span></div>
+                  <div className="flex items-start justify-between gap-3"><div><p className="font-semibold">{m.chitti_name} <span className="font-mono text-xs text-surface-500">{m.chitti_code}</span></p><p className="text-xs text-surface-500">Member #{m.member_number}{m.member_alias ? ` · ${m.member_alias}` : ""} · {m.frequency} · Period {m.current_period}{m.due_date ? ` · Due ${m.due_date}` : ""}</p><p className="mt-1 text-xs text-surface-500">Chitti value {formatCurrency(m.total_value)} · Outstanding {formatCurrency(m.outstanding)}</p></div><span className="badge bg-purple-50 text-purple-700">Due {formatCurrency(m.amount_due)}</span></div>
                 </button>)}
               </section>}
             </div>}
@@ -453,7 +466,7 @@ export default function CollectPaymentPage() {
           <div className="card max-w-2xl space-y-5 animate-fade-in">
             <h3 className="text-sm font-semibold text-surface-900">Record Payment</h3>
             <div className="rounded-xl bg-surface-50 p-4 text-sm">
-              {selectedAccount ? <><p>Finance account: <span className="font-mono font-semibold">{selectedAccount.account_number}</span></p><p>Installment {selectedFinanceSchedule?.installment_number ?? "—"} · Due {formatDate(selectedFinanceSchedule?.due_date || "")} · Outstanding <span className="font-semibold">{formatCurrency(selectedFinanceSchedule?.remaining_amount || 0)}</span></p></> : <><p>Chitti: <span className="font-semibold">{selectedChitti?.chitti_name} ({selectedChitti?.chitti_code})</span></p><p>Member #{selectedChitti?.member_number} · Period {selectedChittiPeriod || selectedChitti?.current_period} · Due {formatDate(selectedChitti?.due_date || "")}</p><p>Outstanding: <span className="font-semibold">{formatCurrency(selectedChitti?.amount_due || 0)}</span> for this period</p></>}
+              {selectedAccount ? <><p>Finance account: <span className="font-mono font-semibold">{selectedAccount.account_number}</span></p><p>Installment {selectedFinanceSchedule?.installment_number ?? "—"} · Due {formatDate(selectedFinanceSchedule?.due_date || "")} · Outstanding <span className="font-semibold">{formatCurrency(selectedFinanceSchedule?.remaining_amount || 0)}</span></p></> : <><p>Chitti: <span className="font-semibold">{selectedChitti?.chitti_name} ({selectedChitti?.chitti_code})</span></p><p>Member #{selectedChitti?.member_number}{selectedChitti?.member_alias ? ` · ${selectedChitti.member_alias}` : ""} · Period {selectedChittiPeriod || selectedChitti?.current_period} · Due {formatDate(selectedChitti?.due_date || "")}</p><p>Outstanding: <span className="font-semibold">{formatCurrency(selectedChitti?.amount_due || 0)}</span> for this period</p></>}
             </div>
 
             {error && <div className="rounded-xl bg-danger-50 border border-danger-100 p-3 text-sm text-danger-700">{error}</div>}

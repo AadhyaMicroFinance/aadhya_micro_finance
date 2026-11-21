@@ -28,9 +28,9 @@ class AuditService:
         new_value: Optional[dict] = None,
         ip_address: Optional[str] = None,
         user_agent: Optional[str] = None,
-    ) -> None:
-        """Log an audit entry."""
-        await self.audit_repo.log(
+    ):
+        """Log an audit entry and return the stored row."""
+        return await self.audit_repo.log(
             user_id=user_id,
             action=action,
             entity_type=entity_type,

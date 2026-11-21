@@ -32,6 +32,17 @@ TEST_DATABASE_HOSTS = {"127.0.0.1", "localhost", "::1"}
 TEST_DATABASE_PORT = 5434
 TEST_DATABASE_NAME = "finance_chitti_test"
 
+# Labels added by revision 0007 (see alembic/versions/0007_chitti_credit_resolution.py).
+# The schema here is built from model metadata, so the migrated labels have to
+# be applied explicitly; PostgreSQL 12+ permits ADD VALUE in a transaction block.
+_MIGRATION_0007_LABELS = (
+    ("chitti_payment_allocation_type_enum", "UNRESOLVED"),
+    ("chitti_payment_allocation_event_type_enum", "EXCESS_RESOLUTION"),
+    ("chitti_transaction_type_enum", "CREDIT_UTILIZATION"),
+    ("chitti_transaction_type_enum", "EXCESS_RESOLUTION"),
+    ("chitti_transaction_type_enum", "REFUND"),
+)
+
 
 # The engine and every session fixture share one (function-scoped) event loop.
 # A custom event_loop fixture used to be defined here; it conflicted with
@@ -83,6 +94,19 @@ async def test_engine():
         await conn.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")
         await conn.exec_driver_sql("CREATE SCHEMA public")
         await conn.run_sync(Base.metadata.create_all)
+
+    # The models keep the historical enum labels so revision 0005 still
+    # validates a clean install; revision 0007 adds the rest. A new enum value
+    # is only usable once the transaction that added it has committed, so this
+    # runs on its own autocommit connection after the schema transaction.
+    # The 0007 CHECK constraints and customer index now live in the model
+    # metadata, so create_all() and Alembic produce the same schema.
+    async with engine.connect() as conn:
+        autocommit = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        for enum_name, label in _MIGRATION_0007_LABELS:
+            await autocommit.exec_driver_sql(
+                f"ALTER TYPE {enum_name} ADD VALUE IF NOT EXISTS '{label}'"
+            )
     yield engine
     async with engine.begin() as conn:
         await conn.exec_driver_sql("DROP SCHEMA IF EXISTS public CASCADE")

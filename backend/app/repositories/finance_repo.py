@@ -5,11 +5,12 @@ Finance repository.
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.finance import FinanceAccount, FinanceSchedule
+from app.models.customer import Customer
+from app.models.finance import FinanceAccount, FinanceAgreement, FinanceSchedule
 from app.repositories.base import BaseRepository
 
 
@@ -38,15 +39,81 @@ class FinanceAccountRepository(BaseRepository[FinanceAccount]):
         return list(result.scalars().all())
 
     async def get_by_id(self, id) -> Optional[FinanceAccount]:
-        """Get finance account by ID with schedules."""
+        """Get finance account by ID with schedules and customer summary."""
         if isinstance(id, str):
             id = UUID(id)
         result = await self.session.execute(
             select(FinanceAccount)
-            .options(selectinload(FinanceAccount.schedules))
+            .options(
+                selectinload(FinanceAccount.schedules),
+                selectinload(FinanceAccount.customer),
+            )
             .where(FinanceAccount.id == id)
         )
         return result.scalar_one_or_none()
+
+    async def list_with_customer(
+        self,
+        *,
+        skip: int = 0,
+        limit: int = 25,
+        filters: Optional[dict] = None,
+        search: Optional[str] = None,
+        agreement_status: Optional[str] = None,
+    ) -> tuple[list[tuple[FinanceAccount, Customer]], int]:
+        """List accounts with their customer row for display without N+1 lookups."""
+        query = select(FinanceAccount, Customer).join(
+            Customer, Customer.id == FinanceAccount.customer_id
+        )
+        count_query = select(func.count()).select_from(FinanceAccount).join(
+            Customer, Customer.id == FinanceAccount.customer_id
+        )
+
+        if search:
+            pattern = f"%{search.strip()}%"
+            condition = or_(
+                Customer.full_name.ilike(pattern),
+                Customer.mobile_number.ilike(pattern),
+                FinanceAccount.account_number.ilike(pattern),
+            )
+            query = query.where(condition)
+            count_query = count_query.where(condition)
+
+        if agreement_status:
+            linked = exists(
+                select(FinanceAgreement.id).where(
+                    FinanceAgreement.finance_account_id == FinanceAccount.id
+                )
+            )
+            condition = (
+                ~linked
+                if agreement_status == "NONE"
+                else exists(
+                    select(FinanceAgreement.id).where(
+                        FinanceAgreement.finance_account_id == FinanceAccount.id,
+                        FinanceAgreement.agreement_status == agreement_status,
+                    )
+                )
+            )
+            query = query.where(condition)
+            count_query = count_query.where(condition)
+
+        for key, value in (filters or {}).items():
+            if value is not None and hasattr(FinanceAccount, key):
+                condition = getattr(FinanceAccount, key) == value
+                query = query.where(condition)
+                count_query = count_query.where(condition)
+
+        total = (await self.session.execute(count_query)).scalar_one()
+        rows = (
+            await self.session.execute(
+                query
+                .order_by(FinanceAccount.created_at.desc(), FinanceAccount.id.desc())
+                .offset(skip)
+                .limit(limit)
+            )
+        ).all()
+        return [(row[0], row[1]) for row in rows], int(total)
 
     async def count_active(self) -> int:
         """Count active finance accounts."""
@@ -74,7 +141,7 @@ class FinanceScheduleRepository(BaseRepository[FinanceSchedule]):
             select(FinanceSchedule)
             .where(
                 FinanceSchedule.finance_account_id == finance_account_id,
-                FinanceSchedule.status.in_(["DUE", "UPCOMING"]),
+                FinanceSchedule.status.in_(["DUE", "UPCOMING", "PARTIALLY_PAID"]),
             )
             .order_by(FinanceSchedule.due_date)
             .limit(1)

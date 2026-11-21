@@ -261,6 +261,9 @@ export default function TodayCollectionPage() {
                           <p className="text-xs text-surface-500">
                             {p.source} • {p.period_label}
                             {p.account_number ? ` • ${p.account_number}` : ""}
+                            {p.source === "CHITTI" && p.member_number != null
+                              ? ` • #${p.member_number}${p.member_alias ? ` · ${p.member_alias}` : ""}`
+                              : ""}
                           </p>
                         </div>
                         <div className="text-right">

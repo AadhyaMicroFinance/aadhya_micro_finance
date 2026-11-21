@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import MetaData, select, text
+from sqlalchemy import Index, MetaData, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 
@@ -45,6 +45,8 @@ CONSTRAINT_NAMES = (
     "ck_chitti_payout_net_nonnegative",
     "ck_chitti_payout_net_arithmetic",
     "ck_chitti_transaction_amount_nonnegative",
+    "ck_chitti_payment_allocation_target",
+    "ck_chitti_transaction_refund_unlinked",
 )
 
 
@@ -337,24 +339,43 @@ def _legacy_metadata(include_lift_events=False):
             table._columns.remove(column)
 
     if include_lift_events:
-        ChittiLiftEvent.__table__.to_metadata(metadata)
+        lift_table = ChittiLiftEvent.__table__.to_metadata(metadata)
+        # Simulate the schema revision 0002 created, before per-slot lift.
+        for index in list(lift_table.indexes):
+            if index.name == "uq_chitti_lift_period_active":
+                lift_table.indexes.remove(index)
+        Index(
+            "uq_chitti_lift_period_active",
+            lift_table.c.chitti_id,
+            lift_table.c.period_number,
+            unique=True,
+            postgresql_where=text("reversed_at IS NULL"),
+        )
     return metadata
 
 
 def _normalize_definition(value):
     value = re.sub(r"\bcheck\b", "", value.lower())
-    value = re.sub(r"::\s*(numeric|integer|bigint|smallint|real|double precision)", "", value)
+    value = re.sub(r"::\s*(?:double precision|[a-z0-9_]+)", "", value)
     value = re.sub(r'"([^"]+)"', r"\1", value)
     return "".join(char for char in value if char.isalnum() or char in "_<>=+-")
 
 
 def _parse_check_expression(definition):
+    """Parse a CHECK expression into a tuple tree for structural comparison.
+
+    PostgreSQL adds enum casts and extra parentheses that the model metadata
+    does not. The parser below ignores redundant nesting but keeps operand
+    grouping, so `a - (b - c)` remains distinct from `a - b - c`.
+    """
     value = re.sub(r"\bcheck\b", "", definition.lower())
-    value = re.sub(r"::\s*(numeric|integer|bigint|smallint|real|double precision)", "", value)
-    compact = re.sub(r"\s+", "", value.replace('"', ""))
+    value = re.sub(r"::\s*(?:double precision|[a-z0-9_]+)", "", value)
+    value = value.replace('"', "").replace("'", "")
+    compact = re.sub(r"\s+", "", value)
+    # Tokenise before stripping whitespace so keywords such as AND and IS
+    # remain separate tokens when adjacent to removed string literals.
     tokens = re.findall(
-        r"[a-z_][a-z0-9_]*|\d+(?:\.\d+)?|>=|<=|<>|!=|[=()+\-*/]",
-        compact,
+        r"[a-z_][a-z0-9_.]*|\d+(?:\.\d+)?|>=|<=|<>|!=|[=()+\-*/]", value
     )
     assert "".join(tokens) == compact
     position = 0
@@ -364,11 +385,14 @@ def _parse_check_expression(definition):
         token = tokens[position]
         if token == "(":
             position += 1
-            result = comparison()
+            result = or_expression()
             assert tokens[position] == ")"
             position += 1
             return result
-        assert token not in (")", "=", ">=", "<=", "<>", "!=", "+", "-", "*", "/")
+        assert token not in (
+            ")", "and", "or", "not", "is", "null", "=", ">=", "<=", "<>", "!=",
+            "+", "-", "*", "/",
+        )
         position += 1
         return token
 
@@ -397,9 +421,41 @@ def _parse_check_expression(definition):
             operator = tokens[position]
             position += 1
             result = (operator, result, addition())
+        if position < len(tokens) and tokens[position] == "is":
+            position += 1
+            negated = False
+            if tokens[position] == "not":
+                negated = True
+                position += 1
+            assert tokens[position] == "null"
+            position += 1
+            result = ("isnotnull" if negated else "isnull", result)
         return result
 
-    result = comparison()
+    def not_expression():
+        nonlocal position
+        if tokens[position] == "not":
+            position += 1
+            return ("not", not_expression())
+        return comparison()
+
+    def and_expression():
+        nonlocal position
+        result = not_expression()
+        while position < len(tokens) and tokens[position] == "and":
+            position += 1
+            result = ("and", result, not_expression())
+        return result
+
+    def or_expression():
+        nonlocal position
+        result = and_expression()
+        while position < len(tokens) and tokens[position] == "or":
+            position += 1
+            result = ("or", result, and_expression())
+        return result
+
+    result = or_expression()
     assert position == len(tokens)
     return result
 
@@ -593,6 +649,17 @@ async def _assert_financial_migration_schema(test_url):
                 assert column_name in index_def
                 assert "UNIQUE" not in index_def.upper()
 
+            customer_index = await conn.scalar(
+                text(
+                    "SELECT indexdef FROM pg_indexes "
+                    "WHERE schemaname = current_schema() "
+                    "AND indexname = 'ix_chitti_members_customer_id'"
+                )
+            )
+            assert customer_index is not None
+            assert "customer_id" in customer_index
+            assert "UNIQUE" not in customer_index.upper()
+
             lift_columns = (
                 await conn.execute(
                     text(
@@ -707,9 +774,12 @@ async def _assert_financial_migration_schema(test_url):
             ).all():
                 allocation_enums.setdefault(enum_name, []).append(label)
             assert allocation_enums == {
-                "chitti_payment_allocation_type_enum": ["CONTRIBUTION", "CREDIT"],
+                "chitti_payment_allocation_type_enum": [
+                    "CONTRIBUTION", "CREDIT", "UNRESOLVED",
+                ],
                 "chitti_payment_allocation_event_type_enum": [
                     "PAYMENT", "REVERSAL", "CREDIT_UTILIZATION", "LIFT_ADJUSTMENT",
+                    "EXCESS_RESOLUTION",
                 ],
             }
     finally:
@@ -1157,5 +1227,166 @@ async def test_migration_rejects_wrong_existing_link_unique_definition():
 
         with pytest.raises(RuntimeError, match="unique constraint chitti_transactions"):
             await _run_migration(command.upgrade, config, "head")
+    finally:
+        await _reset_migration_schema(test_url)
+
+
+@pytest.mark.asyncio
+async def test_0007_upgrade_partial_recovery_and_downgrade_guard():
+    """0007 adds five labels, recovers a partial run and refuses to hide data."""
+    test_url, config = await _prepare_migration_schema()
+    try:
+        await _run_migration(command.upgrade, config, "0006_multi_slot_membership")
+
+        async def labels():
+            engine = create_async_engine(test_url, echo=False)
+            try:
+                async with engine.connect() as conn:
+                    rows = (
+                        await conn.execute(
+                            text(
+                                "SELECT t.typname, e.enumlabel FROM pg_type t "
+                                "JOIN pg_enum e ON e.enumtypid = t.oid "
+                                "WHERE t.typname IN "
+                                "('chitti_payment_allocation_type_enum', "
+                                "'chitti_payment_allocation_event_type_enum', "
+                                "'chitti_transaction_type_enum')"
+                            )
+                        )
+                    ).all()
+            finally:
+                await engine.dispose()
+            result = {}
+            for name, label in rows:
+                result.setdefault(name, []).append(label)
+            return result
+
+        before = await labels()
+        assert "UNRESOLVED" not in before["chitti_payment_allocation_type_enum"]
+        assert "REFUND" not in before["chitti_transaction_type_enum"]
+
+        # A partially applied upgrade must still complete.
+        engine = create_async_engine(test_url, echo=False)
+        try:
+            async with engine.connect() as conn:
+                autocommit = await conn.execution_options(isolation_level="AUTOCOMMIT")
+                await autocommit.exec_driver_sql(
+                    "ALTER TYPE chitti_payment_allocation_type_enum "
+                    "ADD VALUE IF NOT EXISTS 'UNRESOLVED'"
+                )
+        finally:
+            await engine.dispose()
+
+        await _run_migration(command.upgrade, config, "head")
+        await _run_migration(command.upgrade, config, "head")
+
+        after = await labels()
+        # ADD VALUE appends to the physical enum order, so compare as sets.
+        assert sorted(after["chitti_payment_allocation_type_enum"]) == [
+            "CONTRIBUTION", "CREDIT", "UNRESOLVED",
+        ]
+        assert sorted(after["chitti_payment_allocation_event_type_enum"]) == sorted([
+            "PAYMENT", "REVERSAL", "CREDIT_UTILIZATION", "LIFT_ADJUSTMENT",
+            "EXCESS_RESOLUTION",
+        ])
+        assert set(after["chitti_transaction_type_enum"]) == {
+            "CONTRIBUTION", "PAYOUT", "PENALTY", "FEE", "REVERSAL",
+            "CREDIT_UTILIZATION", "EXCESS_RESOLUTION", "REFUND",
+        }
+
+        engine = create_async_engine(test_url, echo=False)
+        try:
+            async with engine.connect() as conn:
+                definitions = dict(
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT conname, pg_get_constraintdef(oid) "
+                                "FROM pg_constraint "
+                                "WHERE conrelid = 'chitti_payment_allocations'::regclass "
+                                "AND conname = 'ck_chitti_payment_allocation_target' "
+                                "UNION ALL "
+                                "SELECT conname, pg_get_constraintdef(oid) "
+                                "FROM pg_constraint "
+                                "WHERE conrelid = 'chitti_transactions'::regclass "
+                                "AND conname = 'ck_chitti_transaction_refund_unlinked'"
+                            )
+                        )
+                    ).all()
+                )
+        finally:
+            await engine.dispose()
+        assert "UNRESOLVED" in definitions["ck_chitti_payment_allocation_target"]
+        assert "REFUND" in definitions["ck_chitti_transaction_refund_unlinked"]
+
+        reversal_id, payout_id, lift_id, allocation_id = (
+            await _create_linked_financial_test_records(test_url)
+        )
+
+        engine = create_async_engine(test_url, echo=False)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "UPDATE chitti_payment_allocations "
+                        "SET allocation_type = 'UNRESOLVED', contribution_id = NULL "
+                        "WHERE id = :id"
+                    ),
+                    {"id": allocation_id},
+                )
+        finally:
+            await engine.dispose()
+
+        with pytest.raises(RuntimeError, match="unresolved excess"):
+            await _run_migration(
+                command.downgrade, config, "0006_multi_slot_membership"
+            )
+
+        engine = create_async_engine(test_url, echo=False)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM chitti_payment_allocations WHERE id = :id"),
+                    {"id": allocation_id},
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE chitti_transactions SET transaction_type = 'REFUND', "
+                        "original_transaction_id = NULL WHERE id = :id"
+                    ),
+                    {"id": reversal_id},
+                )
+        finally:
+            await engine.dispose()
+
+        with pytest.raises(RuntimeError, match="refunds exist"):
+            await _run_migration(
+                command.downgrade, config, "0006_multi_slot_membership"
+            )
+
+        engine = create_async_engine(test_url, echo=False)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "DELETE FROM chitti_lift_events WHERE id = :id"
+                    ),
+                    {"id": lift_id},
+                )
+                await conn.execute(
+                    text("DELETE FROM chitti_payouts WHERE id = :id"),
+                    {"id": payout_id},
+                )
+                await conn.execute(
+                    text("DELETE FROM chitti_transactions WHERE id = :id"),
+                    {"id": reversal_id},
+                )
+        finally:
+            await engine.dispose()
+
+        await _run_migration(command.downgrade, config, "0006_multi_slot_membership")
+        kept = await labels()
+        assert "UNRESOLVED" in kept["chitti_payment_allocation_type_enum"]
+        assert "REFUND" in kept["chitti_transaction_type_enum"]
     finally:
         await _reset_migration_schema(test_url)

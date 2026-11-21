@@ -108,6 +108,7 @@ ROLE_PERMISSIONS: dict[str, list[Permission]] = {
         Permission.CHITTI_READ,
         Permission.PAYMENTS_READ,
         Permission.PAYMENTS_CREATE,
+        Permission.REPORTS_READ,
     ],
     "COLLECTOR": [
         Permission.CUSTOMERS_READ,
@@ -115,6 +116,7 @@ ROLE_PERMISSIONS: dict[str, list[Permission]] = {
         Permission.CHITTI_READ,
         Permission.PAYMENTS_READ,
         Permission.PAYMENTS_CREATE,
+        Permission.REPORTS_READ,
     ],
 }
 

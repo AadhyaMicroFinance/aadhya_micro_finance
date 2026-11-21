@@ -12,6 +12,7 @@ export interface AnalyticsFilters {
   chitti_id: string | null;
   member_id: string | null;
   payment_mode: string | null;
+  /** Member-status filter for the member table only. */
   status: string | null;
 }
 
@@ -120,6 +121,7 @@ export interface MemberPaymentRow {
   member_id: string;
   chitti_id: string;
   member_number: number;
+  member_alias: string | null;
   member_name: string;
   customer_code: string | null;
   mobile_number: string | null;
@@ -140,6 +142,8 @@ export interface MemberPaymentRow {
 
 export interface PendingDetail {
   member_id: string;
+  member_number: number;
+  member_alias: string | null;
   member_name: string;
   mobile_number: string | null;
   chitti_id: string;

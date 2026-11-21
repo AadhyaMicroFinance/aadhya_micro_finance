@@ -105,11 +105,28 @@ export default function CustomerDetailPage() {
           {ledger?.chittis && ledger.chittis.length > 0 ? (
             <div className="space-y-3">
               {ledger.chittis.map((c) => (
-                <Link key={c.id} href={`/chitti/${c.id}`}>
+                <Link key={c.member_id} href={`/chitti/${c.id}#members`}>
                   <div className="flex items-center justify-between rounded-lg border border-gray-200 p-4 hover:bg-gray-50">
-                    <div>
-                      <p className="font-medium text-primary-600">{c.name}</p>
-                      <p className="text-sm text-gray-500">{c.chitti_code}</p>
+                    <div className="min-w-0">
+                      <p className="font-medium text-primary-600">
+                        {c.name} <span className="font-mono text-sm text-gray-600">#{c.member_number}</span>
+                      </p>
+                      <p className="text-sm text-gray-500">
+                        {c.chitti_code}
+                        {c.alias ? ` · ${c.alias}` : ""}
+                        {c.payout_order ? ` · Payout #${c.payout_order}` : ""}
+                      </p>
+                      <p className="mt-1 text-xs text-gray-500">
+                        Outstanding: <span className="font-medium text-gray-800">{formatCurrency(c.outstanding)}</span>
+                        {" · Paid: "}<span className="font-medium text-gray-800">{formatCurrency(c.total_paid)}</span>
+                        {" · Slot: "}{c.slot_status.replace(/_/g, " ")}
+                      </p>
+                      <p className="mt-0.5 text-xs text-gray-500">
+                        Agreement: {c.agreement_status.replace(/_/g, " ")}
+                        {c.agreement_number ? ` (${c.agreement_number})` : ""}
+                        {" · "}{c.lift_status}
+                      </p>
+                      <p className="mt-0.5 font-mono text-[11px] text-gray-400">Membership {c.member_id}</p>
                     </div>
                     <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${getStatusColor(c.status)}`}>
                       {c.status}
@@ -164,6 +181,7 @@ export default function CustomerDetailPage() {
                     <th className="px-3 py-2">Source</th>
                     <th className="px-3 py-2">Customer / Member</th>
                     <th className="px-3 py-2">Account / Chitti</th>
+                    <th className="px-3 py-2">Slot</th>
                     <th className="px-3 py-2">Period</th>
                     <th className="px-3 py-2">Amount</th>
                     <th className="px-3 py-2">Method</th>
@@ -179,14 +197,24 @@ export default function CustomerDetailPage() {
                       <td className="px-3 py-2">{p.source}</td>
                       <td className="px-3 py-2">{p.customer_name}</td>
                       <td className="px-3 py-2">{p.account_name || '—'}</td>
+                      <td className="px-3 py-2">
+                        {p.source === "CHITTI" && p.member_number != null
+                          ? `#${p.member_number}${p.alias ? ` · ${p.alias}` : ""}`
+                          : "—"}
+                      </td>
                       <td className="px-3 py-2">{p.period_number == null ? '—' : `${p.source === 'FINANCE' ? 'Installment' : 'Period'} ${p.period_number}`}</td>
                       <td className="px-3 py-2 font-medium">{formatCurrency(p.amount)}</td>
                       <td className="px-3 py-2">{p.payment_method || '—'}</td>
                       <td className="px-3 py-2">{p.payment_date ? formatDate(p.payment_date) : '—'}</td>
                       <td className="px-3 py-2">
-                        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${getStatusColor(p.status)}`}>
-                          {p.status}
-                        </span>
+                        <div className="flex flex-col gap-0.5">
+                          <span className={`inline-flex w-fit items-center rounded-full px-2 py-0.5 text-xs font-medium ${getStatusColor(p.status)}`}>
+                            {p.status}
+                          </span>
+                          {p.source === "CHITTI" && p.event_type && (
+                            <span className="text-[10px] text-gray-500">{p.event_type.replace(/_/g, " ")}</span>
+                          )}
+                        </div>
                       </td>
                       <td className="px-3 py-2 text-xs">
                         {p.is_reversal

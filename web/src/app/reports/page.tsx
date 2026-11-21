@@ -4,8 +4,9 @@ import { useState } from "react";
 import BrandLockup from "@/components/branding/BrandLockup";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import { reportApi, type RangeReport } from "@/services/reports";
-import { formatCurrency } from "@/lib/utils";
-import { Calendar, Download, FileText } from "lucide-react";
+import { getApiErrorMessage } from "@/services/api-client";
+import { cn, formatCurrency } from "@/lib/utils";
+import { AlertCircle, Calendar, Download, FileText } from "lucide-react";
 
 const reportTypes = [
   { id: "daily", label: "Daily Collection" }, { id: "weekly", label: "Weekly Collection" },
@@ -23,21 +24,24 @@ export default function ReportsPage() {
   const [endDate, setEndDate] = useState(today());
   const [report, setReport] = useState<RangeReport | null>(null);
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState<"csv" | "xlsx" | null>(null);
   const [error, setError] = useState("");
 
   const generate = async () => {
     setLoading(true); setError("");
     try { setReport(await reportApi.getRangeReport(startDate, endDate, selectedReport)); }
-    catch (e) { setError("Could not retrieve this report. Check the date range and try again."); setReport(null); }
+    catch (e) { setError(getApiErrorMessage(e, "Could not retrieve this report. Check the date range and try again.")); setReport(null); }
     finally { setLoading(false); }
   };
 
   const exportFile = async (format: "csv" | "xlsx") => {
+    setExporting(format); setError("");
     try {
       const blob = await reportApi.exportRangeReport(startDate, endDate, selectedReport, format);
       const url = URL.createObjectURL(blob); const anchor = document.createElement("a");
       anchor.href = url; anchor.download = `${selectedReport}-${startDate}-${endDate}.${format}`; anchor.click(); URL.revokeObjectURL(url);
-    } catch { setError("Could not export this report."); }
+    } catch (e) { setError(getApiErrorMessage(e, "Could not export this report.")); }
+    finally { setExporting(null); }
   };
 
   const value = (key: string, raw: unknown) => /amount|total|pending|expected|paid/i.test(key) && typeof raw === "number" ? formatCurrency(raw) : String(raw ?? "—");
@@ -53,12 +57,16 @@ export default function ReportsPage() {
       <section className="card report-print space-y-5 lg:col-span-3">
         <div className="hidden border-b pb-4 print:block"><BrandLockup variant="document" /><p className="mt-2 text-xs">H.No: 10-2-41/1, Sainagar, Sircilla · CIN: U64990TS2025PTC199452</p><p className="text-xs">9182838496 · 9886232471</p></div>
         <h2 className="text-sm font-semibold">{reportTypes.find((r) => r.id === selectedReport)?.label}</h2>
-        <div className="flex flex-wrap items-end gap-4"><div><label className="input-label">From</label><input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="input-field" /></div><div><label className="input-label">To</label><input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="input-field" /></div><button className="btn-primary" onClick={generate} disabled={loading || !startDate || !endDate}><Calendar size={16} />{loading ? "Generating…" : "Generate"}</button></div>
-        {error && <div role="alert" className="rounded-xl border border-danger-100 bg-danger-50 p-3 text-sm text-danger-700">{error}</div>}
+        <div className="flex flex-wrap items-end gap-4"><div><label className="input-label">From</label><input type="date" value={startDate} onChange={(e) => { setStartDate(e.target.value); setReport(null); }} className="input-field" /></div><div><label className="input-label">To</label><input type="date" value={endDate} onChange={(e) => { setEndDate(e.target.value); setReport(null); }} className="input-field" /></div><button className="btn-primary" onClick={generate} disabled={loading || !startDate || !endDate}><Calendar size={16} />{loading ? "Generating…" : "Generate"}</button></div>
+        {error && <div role="alert" className="flex items-center gap-2 rounded-xl border border-danger-100 bg-danger-50 p-3 text-sm text-danger-700"><AlertCircle size={15} />{error}</div>}
         {report && <>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3"><div className="rounded-xl bg-surface-50 p-4"><p className="text-xs text-surface-500">Net collections</p><p className="text-lg font-bold">{formatCurrency(report.collected_total)}</p></div><div className="rounded-xl bg-brand-50 p-4"><p className="text-xs text-surface-500">Finance collected</p><p className="text-lg font-bold">{formatCurrency(report.finance_collected)}</p><p className="text-xs text-surface-500">Pending {formatCurrency(report.finance_pending)}</p></div><div className="rounded-xl bg-purple-50 p-4"><p className="text-xs text-surface-500">Chitti collected</p><p className="text-lg font-bold">{formatCurrency(report.chitti_collected)}</p><p className="text-xs text-surface-500">Pending {formatCurrency(report.chitti_pending)}</p><p className="mt-1 text-xs text-surface-500">Available member credit {formatCurrency(report.chitti_unallocated_credit)}</p></div></div>
+          <div className={cn("grid grid-cols-1 gap-3", selectedReport === "finance" ? "sm:grid-cols-2" : "sm:grid-cols-3")}>
+            <div className="rounded-xl bg-surface-50 p-4"><p className="text-xs text-surface-500">Net collections</p><p className="text-lg font-bold">{formatCurrency(report.net_collections ?? report.collected_total)}</p><p className="mt-1 text-xs text-surface-500">{formatCurrency(report.reversals_total ?? 0)} reversed · gross {formatCurrency(report.gross_collections ?? report.collected_total)}</p></div>
+            <div className="rounded-xl bg-brand-50 p-4"><p className="text-xs text-surface-500">Finance collected</p><p className="text-lg font-bold">{formatCurrency(report.finance_collected)}</p><p className="text-xs text-surface-500">Pending {formatCurrency(report.finance_pending)}</p></div>
+            {selectedReport !== "finance" && <div className="rounded-xl bg-purple-50 p-4"><p className="text-xs text-surface-500">Chitti collected</p><p className="text-lg font-bold">{formatCurrency(report.chitti_collected)}</p><p className="text-xs text-surface-500">Pending {formatCurrency(report.chitti_pending)}</p><p className="mt-1 text-xs text-surface-500">Available member credit {formatCurrency(report.chitti_unallocated_credit)}</p></div>}
+          </div>
           <div className="space-y-5">{report.breakdown?.length ? renderTable(selectedReport === "collector" ? "Collector breakdown" : "Payment method breakdown", report.breakdown) : null}{renderTable("Transactions", report.transactions)}{renderTable("Pending dues", report.pending_details)}</div>
-          <div className="flex flex-wrap gap-3 print:hidden"><button className="btn-secondary btn-sm" onClick={() => exportFile("csv")}><Download size={14} /> Export CSV</button><button className="btn-secondary btn-sm" onClick={() => exportFile("xlsx")}><Download size={14} /> Export Excel</button><button className="btn-secondary btn-sm" onClick={() => window.print()}><FileText size={14} /> Print / Save PDF</button></div>
+          <div className="flex flex-wrap gap-3 print:hidden"><button className="btn-secondary btn-sm" onClick={() => exportFile("csv")} disabled={exporting !== null}><Download size={14} /> {exporting === "csv" ? "Exporting…" : "Export CSV"}</button><button className="btn-secondary btn-sm" onClick={() => exportFile("xlsx")} disabled={exporting !== null}><Download size={14} /> {exporting === "xlsx" ? "Exporting…" : "Export Excel"}</button><button className="btn-secondary btn-sm" onClick={() => window.print()}><FileText size={14} /> Print / Save PDF</button></div>
         </>}
         {!report && !loading && <p className="rounded-xl bg-surface-50 p-6 text-center text-sm text-surface-500">Choose a report and date range, then generate it.</p>}
       </section>

@@ -118,6 +118,46 @@ async def test_customer_payment_history_reads_chitti_only_once(client, db_sessio
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_customer_payment_history_includes_all_chitti_ledger_events(
+    client, db_session, test_user, test_customer
+):
+    from app.models.chitti import ChittiTransaction
+
+    contributions = await _add_chitti_payment_data(db_session, test_customer)
+    first = contributions[0]
+    event_types = ("CREDIT_UTILIZATION", "EXCESS_RESOLUTION", "REFUND", "PAYOUT")
+    for index, event_type in enumerate(event_types):
+        db_session.add(ChittiTransaction(
+            chitti_id=first.chitti_id, member_id=first.member_id,
+            transaction_type=event_type, amount=Decimal("25"),
+            payment_method="CASH", period_number=1,
+            payment_date=date(2026, 1, 5),
+            idempotency_key=f"test-{event_type.lower()}-{uuid.uuid4()}",
+        ))
+    await db_session.commit()
+
+    response = await client.get(
+        f"/api/v1/customers/{test_customer.id}/ledger",
+        headers={"Authorization": f"Bearer {test_user['token']}"},
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    history = data["payment_history"]
+    assert len(history) == 7
+
+    by_event = {row["event_type"]: row for row in history if row["source"] == "CHITTI"}
+    assert set(event_types).issubset(by_event)
+    assert by_event["CREDIT_UTILIZATION"]["status"] == "CREDIT_APPLIED"
+    assert by_event["EXCESS_RESOLUTION"]["status"] == "CREDIT_ADDED"
+    assert by_event["REFUND"]["status"] == "REFUNDED"
+    assert by_event["PAYOUT"]["status"] == "PAID_OUT"
+    assert by_event["CONTRIBUTION"]["status"] == "COMPLETED"
+    # Credits, refunds and payouts are visible but are not customer payments.
+    assert data["payment_summary"]["successful_paid_total"] == 300
+
+
+@pytest.mark.asyncio
 async def test_customer_payment_history_keeps_finance_only_history_working(
     client, db_session, test_user, test_customer
 ):

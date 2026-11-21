@@ -5,10 +5,11 @@ User management API endpoints.
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from app.core.permissions import Permission, require_permissions
-from app.dependencies import CurrentUser, DBSession
+from app.dependencies import DBSession
+from app.models.user import User
 from app.schemas.user import UserCreate, UserUpdate, UserResponse
 from app.schemas.common import ApiResponse, PaginatedResponse
 from app.services.user_service import UserService
@@ -20,7 +21,7 @@ router = APIRouter()
 async def create_user(
     body: UserCreate,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.USERS_WRITE),
+    current_user: User = Depends(require_permissions(Permission.USERS_WRITE)),
 ):
     """Create a new user (Super Admin only)."""
     service = UserService(db)
@@ -30,6 +31,7 @@ async def create_user(
         password=body.password,
         full_name=body.full_name,
         role=body.role,
+        actor_id=current_user.id,
     )
     return ApiResponse(data=user)
 
@@ -40,7 +42,7 @@ async def list_users(
     page: int = Query(1, ge=1),
     per_page: int = Query(25, ge=1, le=100),
     role: Optional[str] = None,
-    current_user: CurrentUser = require_permissions(Permission.USERS_READ),
+    current_user: User = Depends(require_permissions(Permission.USERS_READ)),
 ):
     """List all users with pagination."""
     service = UserService(db)
@@ -60,7 +62,7 @@ async def list_users(
 async def get_user(
     user_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.USERS_READ),
+    current_user: User = Depends(require_permissions(Permission.USERS_READ)),
 ):
     """Get a user by ID."""
     service = UserService(db)
@@ -73,7 +75,7 @@ async def update_user(
     user_id: UUID,
     body: UserUpdate,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.USERS_WRITE),
+    current_user: User = Depends(require_permissions(Permission.USERS_WRITE)),
 ):
     """Update a user."""
     service = UserService(db)
@@ -83,6 +85,7 @@ async def update_user(
         full_name=body.full_name,
         role=body.role,
         is_active=body.is_active,
+        actor_id=current_user.id,
     )
     return ApiResponse(data=user)
 
@@ -91,9 +94,9 @@ async def update_user(
 async def delete_user(
     user_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.USERS_DELETE),
+    current_user: User = Depends(require_permissions(Permission.USERS_DELETE)),
 ):
     """Deactivate a user."""
     service = UserService(db)
-    await service.delete_user(user_id)
+    await service.delete_user(user_id, actor_id=current_user.id)
     return ApiResponse(data={"message": "User deactivated successfully."})

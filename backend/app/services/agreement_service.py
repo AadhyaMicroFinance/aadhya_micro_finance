@@ -11,17 +11,20 @@ Workflow:
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.aliases import normalize_slot_alias
 from app.core.exceptions import (
     BadRequestException,
     ConflictException,
     NotFoundException,
 )
+from sqlalchemy.exc import IntegrityError
 from app.repositories.agreement_repo import ChittiAgreementRepository
 from app.repositories.chitti_repo import (
+    ENROLLED_EXCLUDED_STATUSES,
     ChittiContributionRepository,
     ChittiMemberRepository,
     ChittiRepository,
@@ -43,6 +46,11 @@ MEMBER_STATUS_TRANSITIONS = {
     "LEFT": [],
     "REPLACED": [],
 }
+
+
+def _normalize_alias(value: Optional[str], *, error_code: str = "INVALID_ALIAS") -> Optional[str]:
+    """Compatibility wrapper around the shared alias normalizer."""
+    return normalize_slot_alias(value, error_code=error_code)
 
 
 class AgreementService:
@@ -70,7 +78,7 @@ class AgreementService:
         alias: Optional[str] = None,
     ) -> dict:
         """Add a customer to a chitti as PENDING_AGREEMENT member."""
-        chitti = await self.chitti_repo.get_by_id(chitti_id)
+        chitti = await self.chitti_repo.get_by_id_for_update(chitti_id)
         if not chitti:
             raise NotFoundException("Chitti", chitti_id)
         if chitti.status not in ("DRAFT", "UPCOMING"):
@@ -81,15 +89,36 @@ class AgreementService:
         if not customer:
             raise NotFoundException("Customer", customer_id)
 
-        # Multiple slots for the same customer are allowed; prevent duplicate member
-        # numbers and duplicate aliases within this chitti.
-        existing_num = await self.member_repo.get_by_chitti_and_member_number(
-            chitti.id, payout_order or 1
+        # Multiple slots for the same customer are allowed. Every additional
+        # slot must carry a unique alias so payments and agreements can be
+        # attributed to one exact membership, never to the customer's main slot.
+        normalized_alias = _normalize_alias(alias, error_code="INVALID_ALIAS")
+        existing_slots = await self.member_repo.list_by_chitti_and_customer(
+            chitti.id, UUID(customer_id)
         )
-        # We don't know the member_number here yet; skip member_number duplicate
-        # check at this layer (handled when number is assigned). Keep alias check.
-        if alias:
-            existing_alias = await self.member_repo.get_by_chitti_and_alias(chitti.id, alias)
+        enrolled_slots = [
+            slot for slot in existing_slots
+            if slot.status not in ENROLLED_EXCLUDED_STATUSES
+        ]
+        if enrolled_slots and not normalized_alias:
+            raise BadRequestException(
+                "This customer already has a slot in this Chitti. Enter a unique alias for the new slot.",
+                error_code="ALIAS_REQUIRED",
+                details={
+                    "existing_slots": [
+                        {
+                            "member_id": str(slot.id),
+                            "member_number": slot.member_number,
+                            "alias": slot.alias,
+                        }
+                        for slot in enrolled_slots
+                    ]
+                },
+            )
+        if normalized_alias:
+            existing_alias = await self.member_repo.get_by_chitti_and_alias(
+                chitti.id, normalized_alias
+            )
             if existing_alias:
                 raise ConflictException(
                     "Alias already used in this Chitti.",
@@ -114,18 +143,26 @@ class AgreementService:
         max_num = await self.member_repo.max_member_number(chitti.id)
         member_number = max_num + 1
 
-        member = await self.member_repo.create(
-            chitti_id=chitti.id,
-            customer_id=UUID(customer_id),
-            member_number=member_number,
-            payout_order=payout_order or member_number,
-            status="PENDING_AGREEMENT",
-            total_expected_amount=Decimal("0"),
-            total_paid_amount=Decimal("0"),
-            outstanding_amount=Decimal("0"),
-            lifted=False,
-            alias=alias or None,
-        )
+        try:
+            member = await self.member_repo.create_with_savepoint(
+                chitti_id=chitti.id,
+                customer_id=UUID(customer_id),
+                member_number=member_number,
+                payout_order=payout_order if payout_order is not None else member_number,
+                status="PENDING_AGREEMENT",
+                total_expected_amount=Decimal("0"),
+                total_paid_amount=Decimal("0"),
+                outstanding_amount=Decimal("0"),
+                lifted=False,
+                alias=normalized_alias,
+            )
+        except IntegrityError as exc:
+            # A racing enrollment can pass the pre-check; the unique index is
+            # the final guard. Map its violation to the same structured 409.
+            raise ConflictException(
+                "Alias already used in this Chitti.",
+                error_code="DUPLICATE_ALIAS",
+            ) from exc
 
         from app.services.audit_service import AuditService
         await AuditService(self.session).log(
@@ -137,6 +174,7 @@ class AgreementService:
                 "chitti_id": str(chitti.id),
                 "customer_id": str(customer.id),
                 "member_number": member_number,
+                "alias": normalized_alias,
                 "status": "PENDING_AGREEMENT",
             },
         )
@@ -157,12 +195,20 @@ class AgreementService:
         
         Creates a full snapshot of terms at enrollment time.
         """
-        member = await self.member_repo.get_by_id(member_id)
+        # Serialise concurrent generate calls for the same slot. The unique
+        # constraint on chitti_member_id is the final guard if two processes
+        # still race past the application check.
+        member = await self.member_repo.get_by_id_for_update(member_id)
         if not member:
             raise NotFoundException("Chitti Member", member_id)
         if member.status != "PENDING_AGREEMENT":
             raise BadRequestException(
                 f"Cannot generate agreement for member with status {member.status}."
+            )
+        if await self.agreement_repo.get_by_member_id(member_id):
+            raise ConflictException(
+                "An agreement already exists for this member.",
+                error_code="DUPLICATE_AGREEMENT",
             )
 
         chitti = await self.chitti_repo.get_by_id(member.chitti_id)
@@ -181,16 +227,26 @@ class AgreementService:
 
         now = now_ist()
 
-        agreement = await self.agreement_repo.create(
-            agreement_number=agreement_number,
-            chitti_id=chitti.id,
-            chitti_member_id=member.id,
-            customer_id=customer.id,
-            agreement_date=today_ist(),
-            agreement_status="GENERATED",
-            agreement_snapshot=snapshot,
-            generated_at=now,
-        )
+        try:
+            agreement = await self.agreement_repo.create_with_savepoint(
+                agreement_number=agreement_number,
+                chitti_id=chitti.id,
+                chitti_member_id=member.id,
+                customer_id=customer.id,
+                agreement_date=today_ist(),
+                agreement_status="GENERATED",
+                agreement_snapshot=snapshot,
+                generated_at=now,
+            )
+        except IntegrityError as exc:
+            # The status check above is not enough on its own: two separate
+            # sessions can both pass it before either commits. The database
+            # constraint decides the winner and this maps the loser to a
+            # structured conflict rather than an opaque 500.
+            raise ConflictException(
+                "An agreement already exists for this member.",
+                error_code="DUPLICATE_AGREEMENT",
+            ) from exc
 
         # Update member status and link agreement
         await self.member_repo.update(
@@ -474,17 +530,14 @@ class AgreementService:
             return (total_value / Decimal(str(member_count))) * Decimal(str(duration))
 
     async def _generate_agreement_number(self) -> str:
-        """Generate unique agreement number: AGR-YYYY-NNNNNN"""
+        """Generate a collision-resistant agreement number: AGR-YYYY-NNNNNNNNNNNN.
+
+        A count-based suffix races when two agreements are created in different
+        transactions; a random suffix keeps the number unique without taking
+        another lock. The database unique constraint remains the final guard.
+        """
         year = today_ist().year
-        count = await self.agreement_repo.count_by_chitti(UUID("00000000-0000-0000-0000-000000000000"))
-        # Use a simple counter based on total agreements
-        from sqlalchemy import func, select
-        from app.models.chitti import ChittiAgreement
-        result = await self.session.execute(
-            select(func.count()).select_from(ChittiAgreement)
-        )
-        total = result.scalar() or 0
-        return f"AGR-{year}-{total + 1:06d}"
+        return f"AGR-{year}-{uuid4().int % 10**12:012d}"
 
     def _member_to_dict(self, member, customer=None) -> dict:
         return {
@@ -494,6 +547,7 @@ class AgreementService:
             "customer_name": customer.full_name if customer else None,
             "customer_code": customer.customer_code if customer else None,
             "mobile_number": customer.mobile_number if customer else None,
+            "alias": getattr(member, "alias", None),
             "member_number": member.member_number,
             "payout_order": member.payout_order,
             "status": member.status,

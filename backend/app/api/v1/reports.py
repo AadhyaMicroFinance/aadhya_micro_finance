@@ -6,13 +6,14 @@ from datetime import date
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from io import BytesIO, StringIO
 import csv
 
 from app.core.permissions import Permission, require_permissions
-from app.dependencies import CurrentUser, DBSession
+from app.dependencies import DBSession
+from app.models.user import User
 from app.schemas.common import ApiResponse
 from app.services.report_service import ReportService
 
@@ -25,7 +26,7 @@ async def range_report(
     start_date: date = Query(...),
     end_date: date = Query(...),
     report_type: str = Query("daily"),
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+    current_user: User = Depends(require_permissions(Permission.REPORTS_READ)),
 ):
     """Generate a date-bounded report from the Finance and Chitti ledgers."""
     data = await ReportService(db).get_range_report(start_date, end_date, report_type)
@@ -39,7 +40,7 @@ async def export_range_report(
     end_date: date = Query(...),
     report_type: str = Query("daily"),
     file_format: str = Query("csv", pattern="^(csv|xlsx)$"),
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+    current_user: User = Depends(require_permissions(Permission.REPORTS_READ)),
 ):
     data = await ReportService(db).get_range_report(start_date, end_date, report_type)
     transactions = [{"record_type": "TRANSACTION", **row} for row in data["transactions"]]
@@ -82,7 +83,7 @@ async def export_range_report(
 async def daily_report(
     db: DBSession,
     report_date: Optional[date] = Query(None, alias="date"),
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+    current_user: User = Depends(require_permissions(Permission.REPORTS_READ)),
 ):
     """Full calendar-day report: headline metrics, by-user collections,
     by-method split, pending details and the day's payments."""
@@ -95,7 +96,7 @@ async def daily_report(
 async def daily_summary(
     db: DBSession,
     report_date: Optional[date] = Query(None, alias="date"),
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+    current_user: User = Depends(require_permissions(Permission.REPORTS_READ)),
 ):
     """Headline metrics only for a calendar day (lighter weight)."""
     svc = ReportService(db)
@@ -107,7 +108,7 @@ async def daily_summary(
 async def chitti_plan_metrics(
     plan_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     """Aggregate metrics for every chitti spawned from a plan."""
     svc = ReportService(db)

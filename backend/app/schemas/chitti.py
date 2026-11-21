@@ -175,7 +175,7 @@ class ChittiDashboardItem(BaseModel):
 class ChittiMemberAdd(BaseModel):
     customer_id: str
     payout_order: Optional[int] = Field(None, ge=0)
-    alias: Optional[str] = None
+    alias: Optional[str] = Field(None, max_length=100)
 
 
 class MemberAgreementSummary(BaseModel):
@@ -195,6 +195,7 @@ class ChittiMemberResponse(BaseModel):
     customer_name: Optional[str] = None
     customer_code: Optional[str] = None
     mobile_number: Optional[str] = None
+    alias: Optional[str] = None
     member_number: int
     payout_order: Optional[int] = None
     status: str
@@ -465,3 +466,63 @@ class ChittiMemberDetail(BaseModel):
     agreement: Optional[AgreementResponse] = None
 
     model_config = {"from_attributes": True}
+
+
+# ===========================================================================
+# Operator credit, excess, over-allocation and refund requests
+# ===========================================================================
+
+
+class ChittiCreditApplication(BaseModel):
+    """Apply credit that already belongs to one receipt to a target period."""
+
+    member_id: str
+    source_receipt_id: str
+    source_period_number: Optional[int] = Field(
+        None, ge=1, description="Omit to apply credit on the receipt"
+    )
+    target_period_number: int = Field(..., ge=1)
+    amount: Decimal = Field(..., gt=0)
+    reason: str = Field(..., min_length=3, max_length=500)
+    idempotency_key: str = Field(..., min_length=1, max_length=100)
+
+
+class ChittiCreditReversal(BaseModel):
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+class ChittiExcessResolution(BaseModel):
+    """Convert unresolved excess on a receipt into available credit."""
+
+    member_id: str
+    source_receipt_id: str
+    amount: Decimal = Field(..., gt=0)
+    reason: str = Field(..., min_length=3, max_length=500)
+    idempotency_key: str = Field(..., min_length=1, max_length=100)
+
+
+class ChittiOverallocationResolution(BaseModel):
+    """Move a period's over-allocation to another period or to credit."""
+
+    member_id: str
+    source_period_number: int = Field(..., ge=1)
+    source_receipt_id: str
+    mode: str = Field(..., pattern=r"^(REALLOCATE|TO_CREDIT)$")
+    amount: Decimal = Field(..., gt=0)
+    target_period_number: Optional[int] = Field(None, ge=1)
+    reason: str = Field(..., min_length=3, max_length=500)
+    idempotency_key: str = Field(..., min_length=1, max_length=100)
+
+
+class ChittiRefundRequest(BaseModel):
+    """Cash refund against one receipt and one bucket. Irreversible."""
+
+    source_receipt_id: str
+    source_bucket: str = Field(..., pattern=r"^(CONTRIBUTION|CREDIT)$")
+    source_member_id: str
+    source_period_number: Optional[int] = Field(None, ge=1)
+    amount: Decimal = Field(..., gt=0)
+    refund_method: str = Field(..., pattern=r"^(CASH|UPI|BANK_TRANSFER|OTHER)$")
+    reference_number: Optional[str] = Field(None, max_length=100)
+    reason: str = Field(..., min_length=3, max_length=500)
+    idempotency_key: str = Field(..., min_length=1, max_length=100)

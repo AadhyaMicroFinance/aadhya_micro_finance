@@ -40,6 +40,16 @@ CHECKS = {
         "(allocation_type = 'CONTRIBUTION' AND contribution_id IS NOT NULL)))"
     ),
 }
+
+# The 0001 baseline is built from the current model metadata. A fresh install
+# can therefore already carry the 0007-compatible target CHECK before 0005 is
+# validated. Accept that future-proof definition as well as the original one.
+CURRENT_TARGET_CHECK = (
+    "CHECK (((allocation_type = 'CREDIT' AND contribution_id IS NULL) OR "
+    "(allocation_type = 'CONTRIBUTION' AND contribution_id IS NOT NULL) OR "
+    "(allocation_type = 'UNRESOLVED' AND contribution_id IS NULL)))"
+)
+
 FOREIGN_KEYS = {
     "fk_chitti_payment_allocations_chitti_id": (
         ("chitti_id",), "chittis", ("id",), "CASCADE"
@@ -161,11 +171,14 @@ def _validate_existing(bind):
     for name, definition in CHECKS.items():
         row = named_checks.get(name)
         constraint_type = row[1].decode() if row and isinstance(row[1], bytes) else (row[1] if row else None)
+        accepted = {_normalize(definition)}
+        if name == "ck_chitti_payment_allocation_target":
+            accepted.add(_normalize(CURRENT_TARGET_CHECK))
         if (
             not row
             or constraint_type != "c"
             or not row[3]
-            or _normalize(row[2]) != _normalize(definition)
+            or _normalize(row[2]) not in accepted
         ):
             raise RuntimeError(f"Existing {TABLE}.{name} has an incompatible definition.")
 

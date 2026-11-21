@@ -3,12 +3,15 @@ Finance schemas.
 """
 
 from decimal import Decimal
-from pydantic import BaseModel, Field
+from uuid import UUID
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import date
 
 
-class FinanceAccountCreate(BaseModel):
+class FinanceLoanTerms(BaseModel):
+    """Loan fields shared by agreement generation and account creation."""
+
     customer_id: str
     principal_amount: Decimal = Field(..., gt=0)
     interest_rate: Decimal = Field(default=Decimal("0"), ge=0)
@@ -21,6 +24,33 @@ class FinanceAccountCreate(BaseModel):
     custom_installment_amount: Optional[Decimal] = Field(None, gt=0)
     notes: Optional[str] = None
 
+    @field_validator("customer_id", mode="before")
+    @classmethod
+    def validate_customer_id_format(cls, value):
+        """Reject malformed IDs here (422) instead of as an opaque 500."""
+        UUID(str(value))
+        return value
+
+
+class FinanceAgreementGenerate(FinanceLoanTerms):
+    """Body for POST /finance/agreements/generate (loan fields only)."""
+
+
+class FinanceAgreementConfirm(BaseModel):
+    confirmation_text: str
+
+
+class FinanceAccountCreate(FinanceLoanTerms):
+    """Finance account creation requires a confirmed agreement."""
+
+    agreement_id: str
+
+    @field_validator("agreement_id", mode="before")
+    @classmethod
+    def validate_agreement_id_format(cls, value):
+        UUID(str(value))
+        return value
+
 
 class FinanceAccountUpdate(BaseModel):
     status: Optional[str] = Field(None, pattern=r"^(ACTIVE|COMPLETED|DEFAULTED|CLOSED)$")
@@ -31,6 +61,10 @@ class FinanceAccountResponse(BaseModel):
     id: str
     account_number: str
     customer_id: str
+    customer_name: Optional[str] = None
+    customer_code: Optional[str] = None
+    mobile_number: Optional[str] = None
+    agreement_status: str = "NONE"
     principal_amount: Decimal
     interest_rate: Decimal
     interest_type: str

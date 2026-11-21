@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import NumericInput from "@/components/ui/NumericInput";
 import { chittiApi } from "@/services/chitti";
+import { getApiErrorMessage } from "@/services/api-client";
+import { AlertCircle } from "lucide-react";
 
 interface PlanField {
   id: string;
@@ -12,11 +14,6 @@ interface PlanField {
   value: string;
   type: "currency" | "percentage" | "number" | "text" | "select";
   options?: string[];
-}
-
-interface CustomScheduleRow {
-  period: number;
-  amount: string;
 }
 
 const CALC_METHODS = [
@@ -34,26 +31,12 @@ const CALC_METHODS = [
       { label: "Regular Contribution per Period", key: "regular_amount", type: "currency" as const },
     ],
   },
-  {
-    id: "CUSTOM",
-    label: "Custom Schedule",
-    description: "Define exact amount for each period manually",
-    fields: [],
-  },
-  {
-    id: "AUCTION",
-    label: "Auction",
-    description: "Members bid for the pot each period",
-    fields: [
-      { label: "Regular Installment", key: "installment_amount", type: "currency" as const },
-      { label: "Commission %", key: "commission_pct", type: "percentage" as const },
-    ],
-  },
 ];
 
 export default function NewPlanPage() {
   const router = useRouter();
   const [creating, setCreating] = useState(false);
+  const [error, setError] = useState("");
 
   // Basic info
   const [name, setName] = useState("");
@@ -69,9 +52,6 @@ export default function NewPlanPage() {
   // Dynamic fields for the selected method
   const [fields, setFields] = useState<Record<string, string>>({});
 
-  // Custom schedule (for CUSTOM method)
-  const [customSchedule, setCustomSchedule] = useState<CustomScheduleRow[]>([]);
-
   // Extra custom fields (admin can add their own)
   const [extraFields, setExtraFields] = useState<PlanField[]>([]);
 
@@ -84,20 +64,6 @@ export default function NewPlanPage() {
       initial[f.key] = "";
     });
     setFields(initial);
-
-    // Initialize custom schedule if needed
-    if (method === "CUSTOM" && duration) {
-      initCustomSchedule(parseInt(duration));
-    }
-  };
-
-  const initCustomSchedule = (d: number) => {
-    const schedule: CustomScheduleRow[] = [];
-    for (let i = 1; i <= d; i++) {
-      const existing = customSchedule.find((s) => s.period === i);
-      schedule.push({ period: i, amount: existing?.amount || "" });
-    }
-    setCustomSchedule(schedule);
   };
 
   const addExtraField = () => {
@@ -123,41 +89,26 @@ export default function NewPlanPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setCreating(true);
+    setError("");
 
-    // Build contribution rules from fields
-    let contributionRules: Record<string, unknown>;
-    let payoutRules: Record<string, unknown>;
-
-    switch (calcMethod) {
-      case "LIFT_BASED":
-        contributionRules = {
+    // Only FIXED and LIFT_BASED plans can be instantiated from the Chitti
+    // workspace, so those are the only methods offered on this form.
+    const contributionRules: Record<string, unknown> = calcMethod === "LIFT_BASED"
+      ? {
           type: "LIFT_BASED",
           regular_amount: parseFloat(fields.regular_amount || "0"),
-        };
-        break;
-      case "CUSTOM":
-        contributionRules = {
-          type: "CUSTOM",
-          schedule: customSchedule
-            .filter((s) => s.amount)
-            .map((s) => ({ period: s.period, amount: parseFloat(s.amount) })),
-          repeat_last_for_remaining: true,
-        };
-        break;
-      case "AUCTION":
-        contributionRules = {
+        }
+      : {
           type: "FIXED",
           installment_amount: parseFloat(fields.installment_amount || "0"),
           partial_payments_allowed: true,
         };
-        break;
-      default:
-        contributionRules = {
-          type: "FIXED",
-          installment_amount: parseFloat(fields.installment_amount || "0"),
-          partial_payments_allowed: true,
-        };
-    }
+    const payoutRules: Record<string, unknown> = {
+      type: "SCHEDULED",
+      payout_order: "MEMBER_NUMBER",
+      commission_percentage: 0,
+      commission_fixed: 0,
+    };
 
     // Add extra custom fields to the rules
     const customFields: Record<string, unknown> = {};
@@ -168,23 +119,6 @@ export default function NewPlanPage() {
     });
     if (Object.keys(customFields).length > 0) {
       contributionRules.custom_fields = customFields;
-    }
-
-    // Payout rules
-    if (calcMethod === "AUCTION") {
-      payoutRules = {
-        type: "AUCTION",
-        reserve_price_percentage: 80,
-        commission_percentage: parseFloat(fields.commission_pct || "2"),
-        highest_bidder_wins: true,
-      };
-    } else {
-      payoutRules = {
-        type: "SCHEDULED",
-        payout_order: "MEMBER_NUMBER",
-        commission_percentage: 0,
-        commission_fixed: 0,
-      };
     }
 
     try {
@@ -204,7 +138,7 @@ export default function NewPlanPage() {
       });
       router.push("/chitti/plans");
     } catch (e) {
-      console.error(e);
+      setError(getApiErrorMessage(e, "Could not create this plan."));
     } finally {
       setCreating(false);
     }
@@ -266,10 +200,7 @@ export default function NewPlanPage() {
                   <NumericInput
                     integer
                     value={duration}
-                    onValueChange={(value) => {
-                      setDuration(value);
-                      if (calcMethod === "CUSTOM" && value) initCustomSchedule(parseInt(value, 10));
-                    }}
+                    onValueChange={setDuration}
                     className="input-field"
                     placeholder="25"
                     required
@@ -351,49 +282,6 @@ export default function NewPlanPage() {
               </div>
             )}
 
-            {/* ===== CUSTOM SCHEDULE ===== */}
-            {calcMethod === "CUSTOM" && (
-              <div className="space-y-4">
-                <h3 className="font-semibold text-gray-800 border-b pb-2">
-                  Custom Schedule — Define Each Period
-                </h3>
-                {customSchedule.length > 0 ? (
-                  <div className="max-h-64 overflow-y-auto space-y-2">
-                    {customSchedule.map((row, idx) => (
-                      <div key={row.period} className="flex items-center gap-3">
-                        <span className="w-24 text-sm font-medium text-gray-700">
-                          Period {row.period}
-                        </span>
-                        <NumericInput
-                          value={row.amount}
-                          onValueChange={(value) => {
-                            const newSchedule = [...customSchedule];
-                            newSchedule[idx] = { ...newSchedule[idx], amount: value };
-                            setCustomSchedule(newSchedule);
-                          }}
-                          className="input-field flex-1"
-                          placeholder={`Amount for period ${row.period}`}
-                        />
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-sm text-gray-500">Set the Duration above first.</p>
-                )}
-                {customSchedule.length > 0 && customSchedule.some((s) => s.amount) && (
-                  <div className="rounded-lg bg-gray-50 p-3 text-sm">
-                    <p className="font-medium text-gray-700">Summary:</p>
-                    <p className="text-gray-600">
-                      Total per member: ₹
-                      {customSchedule
-                        .reduce((sum, s) => sum + (parseFloat(s.amount) || 0), 0)
-                        .toLocaleString("en-IN")}
-                    </p>
-                  </div>
-                )}
-              </div>
-            )}
-
             {/* ===== EXTRA CUSTOM FIELDS ===== */}
             <div className="space-y-4">
               <div className="flex items-center justify-between border-b pb-2">
@@ -463,7 +351,7 @@ export default function NewPlanPage() {
                   <p><span className="text-gray-500">Total Value:</span> ₹{parseFloat(totalValue).toLocaleString("en-IN")}</p>
                   <p><span className="text-gray-500">Members:</span> {memberCount}</p>
                   <p><span className="text-gray-500">Duration:</span> {duration} {frequency.toLowerCase()} periods</p>
-                  <p><span className="text-gray-500">Per Member / Period:</span> ₹{(parseFloat(totalValue) / parseInt(memberCount)).toLocaleString("en-IN")}</p>
+                  <p><span className="text-gray-500">Per Member / Period:</span> ₹{(parseFloat(totalValue) / (parseInt(memberCount) || 1) / (parseInt(duration) || 1)).toLocaleString("en-IN", { maximumFractionDigits: 2 })}</p>
                 </div>
                 {Object.keys(fields).length > 0 && (
                   <div className="mt-2 text-sm">
@@ -486,6 +374,12 @@ export default function NewPlanPage() {
                   </div>
                 )}
               </div>
+            )}
+
+            {error && (
+              <p role="alert" className="flex items-center gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                <AlertCircle size={15} /> {error}
+              </p>
             )}
 
             <div className="flex flex-col-reverse gap-2 sm:flex-row sm:justify-end sm:gap-3">

@@ -59,5 +59,8 @@ deploy/aws/terraform/*.tfstate.*
 deploy/aws/terraform/crash.log
 # Local verification artifacts
 backend/.venv-verification/
+backend/.venv-test/
 web/.next-browser-verification/
 web/tsconfig.tsbuildinfo
+# Generated local documents
+*.pdf

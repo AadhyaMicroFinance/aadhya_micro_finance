@@ -118,6 +118,8 @@ export interface ChittiMember {
   total_paid: number;
   outstanding: number;
   unallocated_credit?: number;
+  /** Cash received beyond the instalments that still needs an operator decision. */
+  unresolved_excess?: number;
   lifted?: boolean;
   lifted_at?: string | null;
   lift_period?: number | null;
@@ -259,8 +261,110 @@ export interface ChittiContributionReceipt {
   status: string;
   allocated_amount: number;
   unallocated_credit: number;
+  unresolved_excess?: number;
   allocations: ChittiContributionAllocation[];
   duplicate: boolean;
+}
+
+export interface ChittiCreditApplicationInput {
+  member_id: string;
+  source_receipt_id: string;
+  source_period_number?: number;
+  target_period_number: number;
+  amount: number;
+  reason: string;
+  idempotency_key: string;
+}
+
+export interface ChittiExcessResolutionInput {
+  member_id: string;
+  source_receipt_id: string;
+  amount: number;
+  reason: string;
+  idempotency_key: string;
+}
+
+export interface ChittiOverallocationResolutionInput {
+  member_id: string;
+  source_period_number: number;
+  source_receipt_id: string;
+  mode: "REALLOCATE" | "TO_CREDIT";
+  amount: number;
+  target_period_number?: number;
+  reason: string;
+  idempotency_key: string;
+}
+
+export interface ChittiRefundInput {
+  source_receipt_id: string;
+  source_bucket: "CONTRIBUTION" | "CREDIT";
+  source_member_id: string;
+  source_period_number?: number;
+  amount: number;
+  refund_method: string;
+  reference_number?: string;
+  reason: string;
+  idempotency_key: string;
+}
+
+/** Result of any audited credit, excess or refund movement. */
+export interface ChittiResolutionResult {
+  transaction_id: string;
+  member_id: string;
+  amount: number;
+  audit_log_id: string;
+  duplicate: boolean;
+  [key: string]: unknown;
+}
+
+export interface ChittiOverAllocation {
+  contribution_id: string;
+  period_number: number;
+  paid_amount: number;
+  expected_amount: number;
+  overallocated_amount: number;
+  funding: Array<{ receipt_id: string; amount: number }>;
+}
+
+export interface ChittiOverAllocationList {
+  chitti_id: string;
+  member_id: string;
+  overallocations: ChittiOverAllocation[];
+  total_overallocated: number;
+}
+
+export interface ChittiCustomerCredit {
+  customer_id: string;
+  memberships: Array<{
+    chitti_id: string;
+    chitti_code?: string | null;
+    member_id: string;
+    member_number: number;
+    cash_received: number;
+    allocated: number;
+    available_credit: number;
+    unresolved_excess: number;
+    outstanding: number;
+    refunded: number;
+  }>;
+  cash_received: number;
+  allocated: number;
+  available_credit: number;
+  unresolved_excess: number;
+  outstanding: number;
+  refunded: number;
+}
+
+export interface ChittiRefundRecord {
+  transaction_id: string;
+  source_receipt_ids: string[];
+  member_id: string | null;
+  amount: number;
+  refund_method: string | null;
+  reference_number: string | null;
+  period_number: number | null;
+  notes: string | null;
+  created_at: string;
 }
 
 export interface Agreement {
@@ -570,6 +674,115 @@ export const chittiApi = {
     const res = await apiClient.post<ApiResponse<ChittiContributionReceipt>>(
       `/chitti/${chittiId}/contributions`,
       data
+    );
+    return res.data.data;
+  },
+
+  // ---- Credit, excess, over-allocation & refunds ----
+  getCustomerCredit: async (customerId: string): Promise<ChittiCustomerCredit> => {
+    const res = await apiClient.get<ApiResponse<ChittiCustomerCredit>>(
+      `/chitti/customers/${customerId}/credit`
+    );
+    return res.data.data;
+  },
+
+  applyCredit: async (
+    chittiId: string,
+    data: ChittiCreditApplicationInput
+  ): Promise<ChittiResolutionResult> => {
+    const res = await apiClient.post<ApiResponse<ChittiResolutionResult>>(
+      `/chitti/${chittiId}/credit-applications`,
+      data
+    );
+    return res.data.data;
+  },
+
+  reverseCreditApplication: async (
+    chittiId: string,
+    utilizationId: string,
+    reason: string
+  ): Promise<ChittiResolutionResult> => {
+    const res = await apiClient.post<ApiResponse<ChittiResolutionResult>>(
+      `/chitti/${chittiId}/credit-applications/${utilizationId}/reverse`,
+      { reason }
+    );
+    return res.data.data;
+  },
+
+  resolveExcess: async (
+    chittiId: string,
+    data: ChittiExcessResolutionInput
+  ): Promise<ChittiResolutionResult> => {
+    const res = await apiClient.post<ApiResponse<ChittiResolutionResult>>(
+      `/chitti/${chittiId}/excess-resolutions`,
+      data
+    );
+    return res.data.data;
+  },
+
+  reverseExcessResolution: async (
+    chittiId: string,
+    resolutionId: string,
+    reason: string
+  ): Promise<ChittiResolutionResult> => {
+    const res = await apiClient.post<ApiResponse<ChittiResolutionResult>>(
+      `/chitti/${chittiId}/excess-resolutions/${resolutionId}/reverse`,
+      { reason }
+    );
+    return res.data.data;
+  },
+
+  listOverallocations: async (
+    chittiId: string,
+    memberId: string
+  ): Promise<ChittiOverAllocationList> => {
+    const res = await apiClient.get<ApiResponse<ChittiOverAllocationList>>(
+      `/chitti/${chittiId}/members/${memberId}/overallocations`
+    );
+    return res.data.data;
+  },
+
+  resolveOverallocation: async (
+    chittiId: string,
+    data: ChittiOverallocationResolutionInput
+  ): Promise<ChittiResolutionResult> => {
+    const res = await apiClient.post<ApiResponse<ChittiResolutionResult>>(
+      `/chitti/${chittiId}/overallocation-resolutions`,
+      data
+    );
+    return res.data.data;
+  },
+
+  reverseOverallocationResolution: async (
+    chittiId: string,
+    resolutionId: string,
+    reason: string
+  ): Promise<ChittiResolutionResult> => {
+    const res = await apiClient.post<ApiResponse<ChittiResolutionResult>>(
+      `/chitti/${chittiId}/overallocation-resolutions/${resolutionId}/reverse`,
+      { reason }
+    );
+    return res.data.data;
+  },
+
+  recordRefund: async (
+    chittiId: string,
+    data: ChittiRefundInput
+  ): Promise<ChittiResolutionResult> => {
+    const res = await apiClient.post<ApiResponse<ChittiResolutionResult>>(
+      `/chitti/${chittiId}/refunds`,
+      data
+    );
+    return res.data.data;
+  },
+
+  listRefunds: async (
+    chittiId: string,
+    receiptId?: string
+  ): Promise<ChittiRefundRecord[]> => {
+    const res = await apiClient.get<ApiResponse<ChittiRefundRecord[]>>(
+      `/chitti/${chittiId}/refunds`,
+      { params: receiptId ? { receipt_id: receiptId } : undefined }
     );
     return res.data.data;
   },

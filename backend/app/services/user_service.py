@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.exceptions import ConflictException, NotFoundException
 from app.core.security import hash_password
 from app.repositories.user_repo import UserRepository
+from app.services.audit_service import AuditService
 
 
 class UserService:
@@ -27,6 +28,7 @@ class UserService:
         password: str,
         full_name: str,
         role: str,
+        actor_id: Optional[UUID] = None,
     ) -> dict:
         """Create a new user."""
         # Check uniqueness
@@ -47,7 +49,7 @@ class UserService:
             is_active=True,
         )
 
-        return {
+        payload = {
             "id": str(user.id),
             "username": user.username,
             "email": user.email,
@@ -55,6 +57,14 @@ class UserService:
             "role": user.role,
             "is_active": user.is_active,
         }
+        await AuditService(self.session).log(
+            user_id=actor_id,
+            action="USER_CREATED",
+            entity_type="USER",
+            entity_id=user.id,
+            new_value=payload,
+        )
+        return payload
 
     async def get_user(self, user_id: UUID) -> dict:
         """Get a user by ID."""
@@ -99,6 +109,31 @@ class UserService:
         ]
         return items, total
 
+    async def _assert_active_super_admin_remains(
+        self,
+        user,
+        updates: dict,
+    ) -> None:
+        """Prevent the final active SUPER_ADMIN from being demoted/disabled."""
+        loses_admin = (
+            user.role == "SUPER_ADMIN"
+            and (
+                updates.get("role") not in (None, "SUPER_ADMIN")
+                or updates.get("is_active") is False
+            )
+        )
+        if not loses_admin:
+            return
+        _, total = await self.user_repo.get_all(
+            filters={"role": "SUPER_ADMIN", "is_active": True},
+            limit=1,
+        )
+        if total <= 1:
+            raise ConflictException(
+                "At least one active SUPER_ADMIN must remain.",
+                error_code="LAST_SUPER_ADMIN",
+            )
+
     async def update_user(
         self,
         user_id: UUID,
@@ -107,6 +142,7 @@ class UserService:
         full_name: Optional[str] = None,
         role: Optional[str] = None,
         is_active: Optional[bool] = None,
+        actor_id: Optional[UUID] = None,
     ) -> dict:
         """Update a user."""
         user = await self.user_repo.get_by_id(user_id)
@@ -127,7 +163,27 @@ class UserService:
             updates["is_active"] = is_active
 
         if updates:
+            await self._assert_active_super_admin_remains(user, updates)
+            previous = {
+                "email": user.email,
+                "full_name": user.full_name,
+                "role": user.role,
+                "is_active": user.is_active,
+            }
             await self.user_repo.update(user, **updates)
+            await AuditService(self.session).log(
+                user_id=actor_id,
+                action="USER_UPDATED",
+                entity_type="USER",
+                entity_id=user.id,
+                previous_value=previous,
+                new_value={
+                    "email": user.email,
+                    "full_name": user.full_name,
+                    "role": user.role,
+                    "is_active": user.is_active,
+                },
+            )
 
         return {
             "id": str(user.id),
@@ -138,9 +194,26 @@ class UserService:
             "is_active": user.is_active,
         }
 
-    async def delete_user(self, user_id: UUID) -> None:
+    async def delete_user(
+        self,
+        user_id: UUID,
+        *,
+        actor_id: Optional[UUID] = None,
+    ) -> None:
         """Soft-delete a user by deactivating."""
         user = await self.user_repo.get_by_id(user_id)
         if not user:
             raise NotFoundException("User", user_id)
+        await self._assert_active_super_admin_remains(
+            user, {"is_active": False}
+        )
+        previous = {"is_active": user.is_active}
         await self.user_repo.update(user, is_active=False)
+        await AuditService(self.session).log(
+            user_id=actor_id,
+            action="USER_DEACTIVATED",
+            entity_type="USER",
+            entity_id=user.id,
+            previous_value=previous,
+            new_value={"is_active": user.is_active},
+        )

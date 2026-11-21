@@ -9,7 +9,7 @@ export default function TopBar({ onMenu }: { onMenu?: () => void }) {
   const { user, logout } = useAuthStore();
 
   return (
-    <header className="sticky top-0 z-30 flex h-14 items-center justify-between gap-2 border-b border-surface-100 bg-white/90 px-3 backdrop-blur-xl sm:h-16 sm:px-5 lg:px-8">
+    <header className="relative z-30 flex h-14 flex-shrink-0 select-none items-center justify-between gap-2 border-b border-surface-100 bg-white/90 px-3 backdrop-blur-xl sm:h-16 sm:px-5 lg:px-8">
       <div className="flex min-w-0 items-center gap-2">
         <button
           type="button"

@@ -5,10 +5,11 @@ Payment API endpoints.
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query
 
 from app.core.permissions import Permission, require_permissions
-from app.dependencies import CurrentUser, DBSession
+from app.dependencies import DBSession
+from app.models.user import User
 from app.schemas.payment import PaymentCreate, PaymentReversalRequest, PaymentResponse, DueInfo
 from app.schemas.common import ApiResponse, PaginatedResponse
 from app.services.payment_service import PaymentService
@@ -19,7 +20,7 @@ router = APIRouter()
 @router.get("/pending", response_model=ApiResponse)
 async def list_pending_payments(
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+    current_user: User = Depends(require_permissions(Permission.PAYMENTS_READ)),
 ):
     """List due unpaid Finance installments and Chitti contributions."""
     service = PaymentService(db)
@@ -30,7 +31,7 @@ async def list_pending_payments(
 async def eligible_collection_accounts(
     customer_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+    current_user: User = Depends(require_permissions(Permission.PAYMENTS_READ)),
 ):
     """Return finance accounts and running Chitti memberships as separate ledgers."""
     from app.repositories.finance_repo import FinanceAccountRepository
@@ -73,6 +74,7 @@ async def eligible_collection_accounts(
             "chitti_id": str(chitti.id), "chitti_code": chitti.chitti_code,
             "chitti_name": chitti.name, "member_id": str(member.id),
             "member_number": member.member_number,
+            "member_alias": member.alias,
             "total_value": float(chitti.total_value),
             "frequency": (chitti.plan_snapshot or {}).get("frequency", "MONTHLY"),
             "current_period": contribution.period_number,
@@ -88,17 +90,14 @@ async def eligible_collection_accounts(
 async def record_payment(
     body: PaymentCreate,
     db: DBSession,
-    request: Request,
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_CREATE),
+    current_user: User = Depends(require_permissions(Permission.PAYMENTS_CREATE)),
 ):
-    """Record a new payment. Atomic operation."""
+    """Record a Finance repayment. Chitti uses its own contribution endpoint."""
     service = PaymentService(db)
     payment = await service.record_payment(
         customer_id=body.customer_id,
         finance_account_id=body.finance_account_id,
-        chitti_account_id=body.chitti_account_id,
         finance_schedule_id=body.finance_schedule_id,
-        chitti_schedule_id=body.chitti_schedule_id,
         amount=body.amount,
         payment_method=body.payment_method,
         payment_date=body.payment_date,
@@ -115,15 +114,17 @@ async def list_payments(
     db: DBSession,
     page: int = Query(1, ge=1),
     per_page: int = Query(25, ge=1, le=100),
-    customer_id: Optional[str] = None,
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+    customer_id: Optional[UUID] = None,
+    finance_account_id: Optional[UUID] = None,
+    current_user: User = Depends(require_permissions(Permission.PAYMENTS_READ)),
 ):
     """List Finance receipts and Chitti contribution ledger entries together."""
     service = PaymentService(db)
     items, total = await service.list_payment_history(
         page=page,
         per_page=per_page,
-        customer_id=UUID(customer_id) if customer_id else None,
+        customer_id=customer_id,
+        finance_account_id=finance_account_id,
     )
     return PaginatedResponse(
         data=items,
@@ -140,12 +141,12 @@ async def list_payments(
 async def get_due_info(
     customer_id: UUID,
     db: DBSession,
-    finance_account_id: str = Query(...),
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_READ),
+    finance_account_id: UUID = Query(...),
+    current_user: User = Depends(require_permissions(Permission.PAYMENTS_READ)),
 ):
     """Get amount due and outstanding for an account."""
     service = PaymentService(db)
-    due_info = await service.get_due_info(str(customer_id), finance_account_id)
+    due_info = await service.get_due_info(str(customer_id), str(finance_account_id))
     return ApiResponse(data=due_info)
 
 
@@ -154,7 +155,7 @@ async def reverse_payment(
     payment_id: UUID,
     body: PaymentReversalRequest,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_REVERSE),
+    current_user: User = Depends(require_permissions(Permission.PAYMENTS_REVERSE)),
 ):
     """Reverse a payment. Creates a reversal transaction."""
     service = PaymentService(db)

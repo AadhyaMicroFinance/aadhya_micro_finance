@@ -7,9 +7,9 @@ from datetime import date, datetime
 from decimal import Decimal
 
 from sqlalchemy import (
-    Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, func,
+    Date, DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, func,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import BaseModel
@@ -77,6 +77,70 @@ class FinanceAccount(BaseModel):
     payments: Mapped[list["PaymentTransaction"]] = relationship(
         "PaymentTransaction", back_populates="finance_account"
     )
+
+
+class FinanceAgreement(BaseModel):
+    """Finance loan agreement — immutable snapshot of the confirmed loan terms.
+
+    This is deliberately a separate table and a separate enum from the Chitti
+    agreement. Generation/printing alone never activates a Finance account: an
+    agreement must be CONFIRMED before FinanceService can consume it.
+    """
+
+    __tablename__ = "finance_agreements"
+    __table_args__ = (
+        # One Finance account can only ever be backed by one agreement.
+        UniqueConstraint("finance_account_id", name="uq_finance_agreement_account"),
+    )
+
+    agreement_number: Mapped[str] = mapped_column(
+        String(30), unique=True, nullable=False, index=True
+    )
+    customer_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("customers.id", ondelete="CASCADE"), nullable=False
+    )
+
+    # Separate enum name: Chitti's agreement status is untouched.
+    agreement_status: Mapped[str] = mapped_column(
+        Enum(
+            "DRAFT", "GENERATED", "PRINTED", "CONFIRMED", "CANCELLED",
+            name="finance_agreement_status_enum",
+        ),
+        default="GENERATED",
+        nullable=False,
+    )
+
+    # Immutable snapshot of customer, loan terms and schedule at generation.
+    agreement_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # SHA-256 over the canonical customer id + loan fields. The create endpoint
+    # recomputes this independently, so edited terms cannot be smuggled in.
+    terms_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+
+    generated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    printed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    print_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    confirmed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    confirmed_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Set exactly once, when the confirmed agreement is consumed by account
+    # creation. Until then it is NULL, which keeps the agreement reusable for
+    # neither a second account nor a modified set of terms.
+    finance_account_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("finance_accounts.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    customer: Mapped["Customer"] = relationship("Customer")
+    finance_account: Mapped["FinanceAccount | None"] = relationship("FinanceAccount")
 
 
 class FinanceSchedule(BaseModel):

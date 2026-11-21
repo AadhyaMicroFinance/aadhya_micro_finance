@@ -24,6 +24,7 @@ export interface DailySummary {
   finance_pending: number;
   chitti_pending: number;
   chitti_unallocated_credit: number;
+  chitti_refunded: number;
   collection_rate: number;
 }
 
@@ -57,6 +58,7 @@ export interface PendingDetail {
   period_label: string;
   chitti_name?: string | null;
   member_number?: number | null;
+  member_alias?: string | null;
   expected: number;
   paid: number;
   pending: number;
@@ -85,9 +87,16 @@ export interface DailyReport extends DailySummary {
 
 export interface RangeReport {
   report_type: string; start_date: string; end_date: string;
+  /** Gross receipts before reversals. */
+  gross_collections?: number;
+  /** Cash returned to customers in this range. */
+  reversals_total?: number;
+  /** Gross receipts minus reversals; `collected_total` is kept for compatibility. */
+  net_collections?: number;
   collected_total: number; finance_collected: number; chitti_collected: number;
   finance_pending: number; chitti_pending: number;
   chitti_unallocated_credit: number;
+  chitti_refunded: number;
   breakdown?: Array<Record<string, string | number | boolean | null>>;
   transactions: Array<Record<string, string | number | boolean | null>>;
   pending_details: Array<Record<string, string | number | boolean | null>>;

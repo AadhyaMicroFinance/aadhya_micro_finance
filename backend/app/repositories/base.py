@@ -4,7 +4,7 @@ All entity repositories inherit from this.
 """
 
 import uuid
-from typing import Any, Generic, Optional, Sequence, Type, TypeVar
+from typing import Any, Generic, Iterable, Optional, Sequence, Type, TypeVar
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +27,11 @@ class BaseRepository(Generic[ModelType]):
         self.session.add(instance)
         await self.session.flush()
         return instance
+
+    async def create_with_savepoint(self, **kwargs) -> ModelType:
+        """Insert in a savepoint so a racing unique-key violation is recoverable."""
+        async with self.session.begin_nested():
+            return await self.create(**kwargs)
 
     async def get_by_id(self, id: uuid.UUID) -> Optional[ModelType]:
         """Get a single record by ID."""
@@ -63,11 +68,26 @@ class BaseRepository(Generic[ModelType]):
 
         return items, total
 
-    async def update(self, instance: ModelType, **kwargs) -> ModelType:
-        """Update an existing record."""
+    async def update(
+        self,
+        instance: ModelType,
+        *,
+        allow_none: Iterable[str] = (),
+        **kwargs,
+    ) -> ModelType:
+        """Update an existing record.
+
+        ``None`` is ignored unless the field is explicitly listed in
+        ``allow_none`` so callers can clear a nullable column without changing
+        the behaviour of older callers.
+        """
+        clearable = set(allow_none)
         for key, value in kwargs.items():
-            if value is not None and hasattr(instance, key):
-                setattr(instance, key, value)
+            if not hasattr(instance, key):
+                continue
+            if value is None and key not in clearable:
+                continue
+            setattr(instance, key, value)
         await self.session.flush()
         return instance
 

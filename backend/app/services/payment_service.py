@@ -14,7 +14,8 @@ from decimal import Decimal
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import (
@@ -48,7 +49,7 @@ class PaymentService:
         self.finance_repo = FinanceAccountRepository(session)
         self.schedule_repo = FinanceScheduleRepository(session)
 
-    async def list_pending_collections(self) -> list[dict]:
+    async def list_pending_collections(self, *, finance_only: bool = False) -> list[dict]:
         """Return due, unpaid installments across the separate ledgers.
 
         This is a read-only projection. It never creates or reallocates a
@@ -104,7 +105,7 @@ class PaymentService:
                 "status": status,
             })
 
-        chitti_rows = (
+        chitti_rows = [] if finance_only else (
             await self.session.execute(
                 select(
                     ChittiMemberContribution,
@@ -139,12 +140,14 @@ class PaymentService:
             group[1].append((contribution, period, member, customer))
 
         if grouped:
+            # Explicit cross-module read interface: Chitti owns its calculation;
+            # Payments only consumes the projected effective values.
             from app.services.chitti_service import ChittiService
 
             chitti_service = ChittiService(self.session)
             for chitti, rows in grouped.values():
                 contributions = [row[0] for row in rows]
-                effective = await chitti_service._effective_contribution_values(chitti, contributions)
+                effective = await chitti_service.get_effective_contribution_values(chitti, contributions)
                 for contribution, period, member, customer in rows:
                     values = effective[contribution.id]
                     remaining = values["remaining"]
@@ -172,6 +175,8 @@ class PaymentService:
                         "account_code": chitti.chitti_code,
                         "schedule_id": None,
                         "member_id": str(member.id),
+                        "member_number": member.member_number,
+                        "member_alias": member.alias,
                         "period_number": contribution.period_number,
                         "due_date": str(period.due_date),
                         "expected_amount": float(values["expected"]),
@@ -183,23 +188,68 @@ class PaymentService:
         return records
 
     async def list_payment_history(
-        self, *, page: int = 1, per_page: int = 25, customer_id: Optional[UUID] = None
+        self,
+        *,
+        page: int = 1,
+        per_page: int = 25,
+        customer_id: Optional[UUID] = None,
+        finance_account_id: Optional[UUID] = None,
+        finance_only: bool = False,
+        date_from: Optional[object] = None,
+        date_to: Optional[object] = None,
+        search: Optional[str] = None,
     ) -> tuple[list[dict], int]:
         """Return Finance receipts and Chitti contribution ledger entries together.
 
         The ledgers stay separate in storage and accounting. This is a combined
-        read model for the Payments history screen only.
+        read model for the Payments history screen only. ``finance_only`` skips
+        the Chitti projection entirely for Finance-scoped screens.
         """
         skip = (page - 1) * per_page
         limit = skip + per_page
 
         finance_count_query = select(func.count()).select_from(PaymentTransaction)
         finance_query = (
-            select(PaymentTransaction, Customer.full_name)
+            select(
+                PaymentTransaction,
+                Customer.full_name,
+                FinanceSchedule.installment_number,
+                FinanceAccount.account_number,
+            )
             .outerjoin(Customer, Customer.id == PaymentTransaction.customer_id)
+            .outerjoin(FinanceSchedule, FinanceSchedule.id == PaymentTransaction.finance_schedule_id)
+            .outerjoin(FinanceAccount, FinanceAccount.id == PaymentTransaction.finance_account_id)
             .order_by(PaymentTransaction.created_at.desc(), PaymentTransaction.id.desc())
             .limit(limit)
         )
+        if finance_only:
+            only_finance = PaymentTransaction.finance_account_id.is_not(None)
+            finance_count_query = finance_count_query.where(only_finance)
+            finance_query = finance_query.where(only_finance)
+        if date_from is not None:
+            finance_count_query = finance_count_query.where(
+                PaymentTransaction.payment_date >= date_from
+            )
+            finance_query = finance_query.where(PaymentTransaction.payment_date >= date_from)
+        if date_to is not None:
+            finance_count_query = finance_count_query.where(
+                PaymentTransaction.payment_date <= date_to
+            )
+            finance_query = finance_query.where(PaymentTransaction.payment_date <= date_to)
+        if search:
+            finance_count_query = finance_count_query.outerjoin(
+                Customer, Customer.id == PaymentTransaction.customer_id
+            ).outerjoin(
+                FinanceAccount, FinanceAccount.id == PaymentTransaction.finance_account_id
+            )
+            pattern = f"%{search.strip()}%"
+            search_condition = or_(
+                PaymentTransaction.transaction_id.ilike(pattern),
+                Customer.full_name.ilike(pattern),
+                FinanceAccount.account_number.ilike(pattern),
+            )
+            finance_count_query = finance_count_query.where(search_condition)
+            finance_query = finance_query.where(search_condition)
         if customer_id:
             finance_count_query = finance_count_query.where(
                 PaymentTransaction.customer_id == customer_id
@@ -207,45 +257,60 @@ class PaymentService:
             finance_query = finance_query.where(
                 PaymentTransaction.customer_id == customer_id
             )
+        if finance_account_id:
+            finance_count_query = finance_count_query.where(
+                PaymentTransaction.finance_account_id == finance_account_id
+            )
+            finance_query = finance_query.where(
+                PaymentTransaction.finance_account_id == finance_account_id
+            )
         finance_total = (await self.session.execute(finance_count_query)).scalar_one()
         finance_rows = (await self.session.execute(finance_query)).all()
 
         chitti_types = ("CONTRIBUTION", "REVERSAL", "PENALTY", "FEE")
-        chitti_count_query = select(func.count()).select_from(ChittiTransaction).where(
-            ChittiTransaction.transaction_type.in_(chitti_types)
-        )
-        chitti_query = (
-            select(
-                ChittiTransaction,
-                ChittiMember.customer_id,
-                Customer.full_name,
-                Chitti.name,
+        chitti_total = 0
+        chitti_rows: list = []
+        if not finance_account_id and not finance_only:
+            chitti_count_query = select(func.count()).select_from(ChittiTransaction).where(
+                ChittiTransaction.transaction_type.in_(chitti_types)
             )
-            .outerjoin(ChittiMember, ChittiMember.id == ChittiTransaction.member_id)
-            .outerjoin(Customer, Customer.id == ChittiMember.customer_id)
-            .join(Chitti, Chitti.id == ChittiTransaction.chitti_id)
-            .where(ChittiTransaction.transaction_type.in_(chitti_types))
-            .order_by(ChittiTransaction.created_at.desc(), ChittiTransaction.id.desc())
-            .limit(limit)
-        )
-        if customer_id:
-            chitti_count_query = chitti_count_query.join(
-                ChittiMember,
-                ChittiMember.id == ChittiTransaction.member_id,
-            ).where(ChittiMember.customer_id == customer_id)
-            chitti_query = chitti_query.where(ChittiMember.customer_id == customer_id)
-        chitti_total = (await self.session.execute(chitti_count_query)).scalar_one()
-        chitti_rows = (await self.session.execute(chitti_query)).all()
+            chitti_query = (
+                select(
+                    ChittiTransaction,
+                    ChittiMember.customer_id,
+                    Customer.full_name,
+                    Chitti.name,
+                    ChittiMember.member_number,
+                    ChittiMember.alias,
+                )
+                .outerjoin(ChittiMember, ChittiMember.id == ChittiTransaction.member_id)
+                .outerjoin(Customer, Customer.id == ChittiMember.customer_id)
+                .join(Chitti, Chitti.id == ChittiTransaction.chitti_id)
+                .where(ChittiTransaction.transaction_type.in_(chitti_types))
+                .order_by(ChittiTransaction.created_at.desc(), ChittiTransaction.id.desc())
+                .limit(limit)
+            )
+            if customer_id:
+                chitti_count_query = chitti_count_query.join(
+                    ChittiMember,
+                    ChittiMember.id == ChittiTransaction.member_id,
+                ).where(ChittiMember.customer_id == customer_id)
+                chitti_query = chitti_query.where(ChittiMember.customer_id == customer_id)
+            chitti_total = (await self.session.execute(chitti_count_query)).scalar_one()
+            chitti_rows = (await self.session.execute(chitti_query)).all()
 
         items: list[tuple[object, dict]] = []
-        for payment, customer_name in finance_rows:
+        for payment, customer_name, installment_number, account_number in finance_rows:
             items.append((payment.created_at, {
                 "id": str(payment.id),
                 "transaction_id": payment.transaction_id,
                 "customer_id": str(payment.customer_id),
                 "customer_name": customer_name,
                 "finance_account_id": str(payment.finance_account_id) if payment.finance_account_id else None,
-                "chitti_account_id": str(payment.chitti_account_id) if payment.chitti_account_id else None,
+                "account_number": account_number,
+                "finance_schedule_id": str(payment.finance_schedule_id) if payment.finance_schedule_id else None,
+                "installment_number": installment_number,
+                "chitti_account_id": None,
                 "member_id": None,
                 "member_name": None,
                 "chitti_name": None,
@@ -263,7 +328,7 @@ class PaymentService:
                 "created_at": str(payment.created_at),
             }))
 
-        for txn, linked_customer_id, customer_name, chitti_name in chitti_rows:
+        for txn, linked_customer_id, customer_name, chitti_name, member_number, alias in chitti_rows:
             is_reversal = txn.transaction_type == "REVERSAL"
             items.append((txn.created_at, {
                 "id": str(txn.id),
@@ -273,6 +338,8 @@ class PaymentService:
                 "finance_account_id": None,
                 "chitti_account_id": str(txn.chitti_id),
                 "member_id": str(txn.member_id) if txn.member_id else None,
+                "member_number": member_number,
+                "member_alias": alias,
                 "member_name": customer_name,
                 "chitti_name": chitti_name,
                 "period_number": txn.period_number,
@@ -296,10 +363,8 @@ class PaymentService:
         self,
         *,
         customer_id: str,
-        finance_account_id: Optional[str] = None,
-        chitti_account_id: Optional[str] = None,
-        finance_schedule_id: Optional[str] = None,
-        chitti_schedule_id: Optional[str] = None,
+        finance_account_id: str,
+        finance_schedule_id: str,
         amount: Decimal,
         payment_method: str,
         payment_date,
@@ -319,25 +384,9 @@ class PaymentService:
         if existing:
             raise DuplicatePaymentException()
 
-        # 2. Chitti money must never enter the finance ledger. Recording it here
-        # would count the same collection twice (finance ledger + chitti ledger)
-        # and leave the member's contribution row untouched.
-        if chitti_account_id or chitti_schedule_id:
-            raise BadRequestException(
-                "Chitti contributions must be recorded through the Chitti contribution "
-                "endpoint so member balances and period totals stay in sync.",
-                error_code="USE_CHITTI_CONTRIBUTION_ENDPOINT",
-            )
-
-        if not finance_account_id:
-            raise BadRequestException("Select a Finance account to record this payment.")
-        if not finance_schedule_id:
-            raise BadRequestException(
-                "Select a Finance installment so the payment is allocated to the correct due.",
-                error_code="FINANCE_SCHEDULE_REQUIRED",
-            )
-
-        # 3. Validate finance account if provided
+        # 2. This service owns Finance repayments only. Chitti contributions are
+        # rejected at the API schema boundary and are recorded in chitti_transactions.
+        # 3. Validate finance account and installment
         if finance_account_id:
             account = await self.finance_repo.get_by_id(UUID(finance_account_id))
             if not account:
@@ -363,15 +412,14 @@ class PaymentService:
         # 3. Generate unique transaction ID
         transaction_id = await generate_payment_id(self.session)
 
-        # 4. Record payment
-        payment = await self.payment_repo.create(
+        # 4. Record payment atomically. The unique idempotency key decides a
+        # concurrent replay; the loser returns the winning row instead of a 500.
+        payment_kwargs = dict(
             transaction_id=transaction_id,
             idempotency_key=idempotency_key,
             customer_id=UUID(customer_id),
-            finance_account_id=UUID(finance_account_id) if finance_account_id else None,
-            chitti_account_id=UUID(chitti_account_id) if chitti_account_id else None,
-            finance_schedule_id=UUID(finance_schedule_id) if finance_schedule_id else None,
-            chitti_schedule_id=UUID(chitti_schedule_id) if chitti_schedule_id else None,
+            finance_account_id=UUID(finance_account_id),
+            finance_schedule_id=UUID(finance_schedule_id),
             amount=amount,
             payment_method=payment_method,
             payment_date=payment_date,
@@ -381,6 +429,13 @@ class PaymentService:
             status="COMPLETED",
             is_reversal=False,
         )
+        try:
+            payment = await self.payment_repo.create_with_savepoint(**payment_kwargs)
+        except IntegrityError:
+            replay = await self.payment_repo.get_by_idempotency_key(idempotency_key)
+            if replay is None:
+                raise
+            return self._payment_response(replay)
 
         # 5. Update schedule if applicable
         if finance_schedule_id:
@@ -388,12 +443,15 @@ class PaymentService:
                 UUID(finance_schedule_id), amount
             )
 
+        return self._payment_response(payment)
+
+    @staticmethod
+    def _payment_response(payment) -> dict:
         return {
             "id": str(payment.id),
             "transaction_id": payment.transaction_id,
             "customer_id": str(payment.customer_id),
             "finance_account_id": str(payment.finance_account_id) if payment.finance_account_id else None,
-            "chitti_account_id": str(payment.chitti_account_id) if payment.chitti_account_id else None,
             "amount": float(payment.amount),
             "payment_method": payment.payment_method,
             "payment_date": str(payment.payment_date),
@@ -480,6 +538,14 @@ class PaymentService:
         original = await self.payment_repo.get_by_id(payment_id)
         if not original:
             raise NotFoundException("Payment", payment_id)
+
+        reversal_key = f"reversal-{original.idempotency_key}"
+        existing = await self.payment_repo.get_by_idempotency_key(reversal_key)
+        if existing and existing.is_reversal and existing.reversed_by == original.id:
+            # Replaying a reversal must not create a second ledger row or undo
+            # the schedule allocation twice.
+            return self._reversal_response(existing, original)
+
         if original.is_reversal:
             raise BadRequestException("Cannot reverse a reversal transaction.")
         if original.status == "REVERSED":
@@ -489,24 +555,30 @@ class PaymentService:
 
         # Create reversal transaction
         reversal_id = await generate_payment_id(self.session)
-        reversal = await self.payment_repo.create(
-            transaction_id=reversal_id,
-            idempotency_key=f"reversal-{original.idempotency_key}",
-            customer_id=original.customer_id,
-            finance_account_id=original.finance_account_id,
-            chitti_account_id=original.chitti_account_id,
-            finance_schedule_id=original.finance_schedule_id,
-            chitti_schedule_id=original.chitti_schedule_id,
-            amount=original.amount,
-            payment_method=original.payment_method,
-            payment_date=today_ist(),
-            notes=reversal_reason,
-            collected_by=reversed_by,
-            status="REVERSED",
-            is_reversal=True,
-            reversed_by=original.id,
-            reversal_reason=reversal_reason,
-        )
+        try:
+            reversal = await self.payment_repo.create_with_savepoint(
+                transaction_id=reversal_id,
+                idempotency_key=reversal_key,
+                customer_id=original.customer_id,
+                finance_account_id=original.finance_account_id,
+                finance_schedule_id=original.finance_schedule_id,
+                amount=original.amount,
+                payment_method=original.payment_method,
+                payment_date=today_ist(),
+                notes=reversal_reason,
+                collected_by=reversed_by,
+                status="REVERSED",
+                is_reversal=True,
+                reversed_by=original.id,
+                reversal_reason=reversal_reason,
+            )
+        except IntegrityError:
+            # A concurrent retry can race past the lookup above. The unique
+            # idempotency key decides the winner; the loser replays that row.
+            replay = await self.payment_repo.get_by_idempotency_key(reversal_key)
+            if replay and replay.is_reversal and replay.reversed_by == original.id:
+                return self._reversal_response(replay, original)
+            raise
 
         # Mark original as reversed
         await self.payment_repo.update(original, status="REVERSED")
@@ -528,6 +600,10 @@ class PaymentService:
             new_value={"reversal_id": str(reversal.id), "reason": reversal_reason},
         )
 
+        return self._reversal_response(reversal, original)
+
+    @staticmethod
+    def _reversal_response(reversal, original) -> dict:
         return {
             "id": str(reversal.id),
             "transaction_id": reversal.transaction_id,
@@ -540,30 +616,30 @@ class PaymentService:
     async def get_due_info(
         self, customer_id: str, finance_account_id: str
     ) -> dict:
-        """Get payment due information for an account."""
-        account = await self.finance_repo.get_by_id(UUID(finance_account_id))
+        """Get payment due information for one of this customer's accounts."""
+        account_uuid = UUID(finance_account_id)
+        account = await self.finance_repo.get_by_id(account_uuid)
         if not account:
             raise NotFoundException("Finance account", finance_account_id)
+        if str(account.customer_id) != customer_id:
+            raise BadRequestException("Account does not belong to this customer.")
 
         # Calculate from ledger
         from app.services.calculation_engine import CalculationEngine
         calc = CalculationEngine()
 
-        payments = await self.payment_repo.get_by_finance_account_id(
-            UUID(finance_account_id)
-        )
+        payments = await self.payment_repo.get_by_finance_account_id(account_uuid)
         balance = calc.calculate_balance(account.total_payable, payments)
 
-        # Get next due schedule
-        next_schedule = await self.schedule_repo.get_upcoming_due(
-            UUID(finance_account_id)
-        )
+        # A partially paid installment is still the next due; only its unpaid
+        # remainder should be offered for collection.
+        next_schedule = await self.schedule_repo.get_upcoming_due(account_uuid)
 
         return {
             "account_id": str(account.id),
             "account_number": account.account_number,
             "account_type": "FINANCE",
-            "amount_due": float(next_schedule.expected_amount) if next_schedule else 0,
+            "amount_due": float(next_schedule.remaining_amount) if next_schedule else 0,
             "outstanding": float(balance["outstanding"]),
             "next_due_date": str(next_schedule.due_date) if next_schedule else None,
             "next_installment_number": next_schedule.installment_number if next_schedule else None,

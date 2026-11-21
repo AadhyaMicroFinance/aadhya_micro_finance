@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useCallback, useState, useEffect } from "react";
 import Link from "next/link";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import { paymentsApi } from "@/services/payments";
+import { getApiErrorMessage } from "@/services/api-client";
 import { formatCurrency, formatDate, cn, getStatusColor } from "@/lib/utils";
 import EmptyState from "@/components/ui/EmptyState";
 import { TableSkeleton } from "@/components/ui/Skeleton";
@@ -14,16 +15,20 @@ import BrandLockup from "@/components/branding/BrandLockup";
 export default function PaymentsPage() {
   const [payments, setPayments] = useState<Payment[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
   const [selectedReceipt, setSelectedReceipt] = useState<Payment | null>(null);
 
-  useEffect(() => {
-    const load = async () => {
-      try { const res = await paymentsApi.list({ per_page: 100 }); setPayments(res.data); }
-      catch (e) { console.error(e); }
-      finally { setLoading(false); }
-    };
-    load();
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError("");
+    try { const res = await paymentsApi.list({ per_page: 100 }); setPayments(res.data); }
+    catch (e) { setError(getApiErrorMessage(e, "Unable to load payment history.")); setPayments([]); }
+    finally { setLoading(false); }
   }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
 
   return (
     <DashboardLayout>
@@ -35,6 +40,13 @@ export default function PaymentsPage() {
           </div>
           <Link href="/payments/collect" className="btn-primary"><Zap size={16} /> Collect Payment</Link>
         </div>
+
+        {error && (
+          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-danger-200 bg-danger-50 px-4 py-3 text-sm text-danger-700">
+            <span className="flex-1">{error}</span>
+            <button type="button" onClick={() => void load()} className="btn-secondary btn-sm">Retry</button>
+          </div>
+        )}
 
         {loading ? <TableSkeleton rows={5} cols={6} /> : payments.length === 0 ? (
           <EmptyState icon="💳" title="No payments yet" description="Record your first payment to see it here." action={<Link href="/payments/collect" className="btn-primary"><Zap size={16} /> Collect Payment</Link>} />

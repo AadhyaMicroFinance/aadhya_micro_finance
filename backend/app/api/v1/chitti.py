@@ -4,11 +4,12 @@ Chitti API endpoints — Plans, Instances, Members, Schedule, Contributions, Pay
 
 from uuid import UUID
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
 from app.core.permissions import Permission, require_permissions
 from app.core.exceptions import NotFoundException
-from app.dependencies import CurrentUser, DBSession
+from app.dependencies import DBSession
+from app.models.user import User
 from app.schemas.chitti import (
     AgreementConfirm,
     ChittiContributionPayment,
@@ -31,6 +32,16 @@ from app.services.chitti_service import ChittiService
 router = APIRouter()
 
 
+async def _assert_member_in_chitti(db, chitti_id: UUID, member_id: UUID) -> None:
+    """Reject member actions whose URL Chitti does not own the member.
+
+    Every agreement/cancellation endpoint carries both identifiers. The service
+    calls below intentionally take only ``member_id``, so this check is the
+    single place that keeps a mismatched URL from acting on another Chitti.
+    """
+    await ChittiService(db).get_member_for_chitti(chitti_id, member_id)
+
+
 # ===========================================================================
 # Plans
 # ===========================================================================
@@ -40,7 +51,7 @@ router = APIRouter()
 async def create_plan(
     body: ChittiPlanCreate,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_CREATE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_CREATE)),
 ):
     svc = ChittiService(db)
     plan = await svc.create_plan(
@@ -55,7 +66,7 @@ async def list_plans(
     page: int = Query(1, ge=1),
     per_page: int = Query(25, ge=1, le=100),
     active_only: bool = Query(True),
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     items, total = await svc.list_plans(
@@ -76,7 +87,7 @@ async def list_plans(
 async def get_plan(
     plan_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     plan = await svc.get_plan(plan_id)
@@ -88,7 +99,7 @@ async def update_plan(
     plan_id: UUID,
     body: ChittiPlanUpdate,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     data = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -100,7 +111,7 @@ async def update_plan(
 async def duplicate_plan(
     plan_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_CREATE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_CREATE)),
 ):
     svc = ChittiService(db)
     plan = await svc.duplicate_plan(plan_id, created_by=current_user.id)
@@ -111,7 +122,7 @@ async def duplicate_plan(
 async def deactivate_plan(
     plan_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     plan = await svc.deactivate_plan(plan_id)
@@ -122,7 +133,7 @@ async def deactivate_plan(
 async def activate_plan(
     plan_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     plan = await svc.activate_plan(plan_id)
@@ -134,7 +145,7 @@ async def preview_plan(
     plan_id: UUID,
     body: ChittiPreviewRequest,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     preview = await svc.preview_chitti(
@@ -158,7 +169,7 @@ async def preview_plan(
 async def create_chitti(
     body: ChittiCreate,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_CREATE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_CREATE)),
 ):
     svc = ChittiService(db)
     chitti = await svc.create_chitti(
@@ -171,7 +182,7 @@ async def create_chitti(
 async def preview_direct_chitti(
     body: ChittiDirectPreviewRequest,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     return ApiResponse(data=await svc.preview_direct_chitti(body.model_dump()))
@@ -183,7 +194,7 @@ async def list_chittis(
     page: int = Query(1, ge=1),
     per_page: int = Query(25, ge=1, le=100),
     status: str | None = Query(None),
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     items, total = await svc.list_chittis(
@@ -203,7 +214,7 @@ async def list_chittis(
 @router.get("/dashboard", response_model=ApiResponse)
 async def chitti_dashboard(
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     items = await svc.get_dashboard()
@@ -214,7 +225,7 @@ async def chitti_dashboard(
 async def get_chitti(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     chitti = await svc.get_chitti(chitti_id)
@@ -226,7 +237,7 @@ async def update_chitti(
     chitti_id: UUID,
     body: ChittiUpdate,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     data = {k: v for k, v in body.model_dump().items() if v is not None}
@@ -238,7 +249,7 @@ async def update_chitti(
 async def chitti_activation(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     """Activation prerequisites: can this chitti start, and if not, why."""
     svc = ChittiService(db)
@@ -249,7 +260,7 @@ async def chitti_activation(
 async def start_chitti(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     chitti = await svc.change_status(chitti_id, "RUNNING", created_by=current_user.id)
@@ -260,7 +271,7 @@ async def start_chitti(
 async def pause_chitti(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     chitti = await svc.change_status(chitti_id, "PAUSED", created_by=current_user.id)
@@ -271,7 +282,7 @@ async def pause_chitti(
 async def resume_chitti(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     chitti = await svc.change_status(chitti_id, "RUNNING", created_by=current_user.id)
@@ -282,7 +293,7 @@ async def resume_chitti(
 async def complete_chitti(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     chitti = await svc.change_status(chitti_id, "COMPLETED", created_by=current_user.id)
@@ -293,7 +304,7 @@ async def complete_chitti(
 async def cancel_chitti(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     chitti = await svc.change_status(chitti_id, "CANCELLED", created_by=current_user.id)
@@ -304,7 +315,7 @@ async def cancel_chitti(
 async def chitti_summary(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     summary = await svc.get_summary(chitti_id)
@@ -321,7 +332,7 @@ async def add_member(
     chitti_id: UUID,
     body: ChittiMemberAdd,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     from app.services.agreement_service import AgreementService
     svc = AgreementService(db)
@@ -339,7 +350,7 @@ async def add_member(
 async def list_members(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     members = await svc.list_members(chitti_id)
@@ -351,7 +362,7 @@ async def get_member(
     chitti_id: UUID,
     member_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     member = await svc.get_member_detail(chitti_id, member_id)
@@ -363,7 +374,7 @@ async def remove_member(
     chitti_id: UUID,
     member_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     await svc.remove_member(chitti_id, member_id)
@@ -380,9 +391,10 @@ async def generate_agreement(
     chitti_id: UUID,
     member_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     """Generate agreement for a PENDING_AGREEMENT member."""
+    await _assert_member_in_chitti(db, chitti_id, member_id)
     from app.services.agreement_service import AgreementService
     svc = AgreementService(db)
     agreement = await svc.generate_agreement(
@@ -396,9 +408,10 @@ async def get_agreement(
     chitti_id: UUID,
     member_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     """Get the agreement for a member."""
+    await _assert_member_in_chitti(db, chitti_id, member_id)
     from app.services.agreement_service import AgreementService
     svc = AgreementService(db)
     agreement = await svc.get_agreement_by_member(member_id)
@@ -412,9 +425,10 @@ async def print_agreement(
     chitti_id: UUID,
     member_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     """Record that the agreement was printed."""
+    await _assert_member_in_chitti(db, chitti_id, member_id)
     from app.services.agreement_service import AgreementService
     svc = AgreementService(db)
     agreement = await svc.get_agreement_by_member(member_id)
@@ -430,9 +444,10 @@ async def confirm_agreement(
     chitti_id: UUID,
     member_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     """Confirm agreement after physical signature. Activates the member."""
+    await _assert_member_in_chitti(db, chitti_id, member_id)
     from app.services.agreement_service import AgreementService
     svc = AgreementService(db)
     agreement = await svc.get_agreement_by_member(member_id)
@@ -451,9 +466,10 @@ async def cancel_member(
     member_id: UUID,
     body: MemberCancel,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     """Cancel a member enrollment."""
+    await _assert_member_in_chitti(db, chitti_id, member_id)
     from app.services.agreement_service import AgreementService
     svc = AgreementService(db)
     result = await svc.cancel_member(
@@ -471,7 +487,7 @@ async def cancel_member(
 async def get_schedule(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     schedule = await svc.get_schedule(chitti_id)
@@ -483,7 +499,7 @@ async def get_member_contributions(
     chitti_id: UUID,
     member_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     contributions = await svc.get_member_contributions(chitti_id, member_id)
@@ -495,7 +511,7 @@ async def record_contribution(
     chitti_id: UUID,
     body: ChittiContributionPayment,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_CREATE),
+    current_user: User = Depends(require_permissions(Permission.PAYMENTS_CREATE)),
 ):
     svc = ChittiService(db)
     result = await svc.record_contribution(
@@ -519,7 +535,7 @@ async def reverse_chitti_contribution(
     transaction_id: UUID,
     body: PaymentReversalRequest,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.PAYMENTS_REVERSE),
+    current_user: User = Depends(require_permissions(Permission.PAYMENTS_REVERSE)),
 ):
     svc = ChittiService(db)
     result = await svc.reverse_contribution(
@@ -538,7 +554,7 @@ async def reverse_chitti_contribution(
 async def list_lift_events(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     return ApiResponse(data=await ChittiService(db).list_lift_events(chitti_id))
 
@@ -548,7 +564,7 @@ async def record_lift_event(
     chitti_id: UUID,
     body: ChittiLiftRecord,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     result = await ChittiService(db).record_lift(
         chitti_id,
@@ -566,7 +582,7 @@ async def reverse_lift_event(
     lift_id: UUID,
     body: ChittiLiftReversal,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     result = await ChittiService(db).reverse_lift(
         chitti_id, lift_id, reason=body.reversal_reason, reversed_by=current_user.id
@@ -578,7 +594,7 @@ async def reverse_lift_event(
 async def list_payouts(
     chitti_id: UUID,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_READ),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_READ)),
 ):
     svc = ChittiService(db)
     payouts = await svc.list_payouts(chitti_id)
@@ -590,7 +606,7 @@ async def record_payout(
     chitti_id: UUID,
     body: ChittiPayoutRecord,
     db: DBSession,
-    current_user: CurrentUser = require_permissions(Permission.CHITTI_WRITE),
+    current_user: User = Depends(require_permissions(Permission.CHITTI_WRITE)),
 ):
     svc = ChittiService(db)
     result = await svc.record_payout(

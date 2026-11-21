@@ -1,21 +1,30 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useCallback, useState, useEffect } from "react";
 import Link from "next/link";
 import DashboardLayout from "@/components/layout/DashboardLayout";
 import { customersApi } from "@/services/customers";
+import { getApiErrorMessage } from "@/services/api-client";
 import { getStatusColor, formatDate, cn } from "@/lib/utils";
 import Avatar from "@/components/ui/Avatar";
 import EmptyState from "@/components/ui/EmptyState";
+import Pagination from "@/components/ui/Pagination";
 import { TableSkeleton } from "@/components/ui/Skeleton";
 import type { Customer } from "@/types";
-import { Plus, Search, X, UserPlus, ChevronRight } from "lucide-react";
+import { AlertCircle, Plus, Search, X, UserPlus, ChevronRight } from "lucide-react";
+
+const PER_PAGE = 25;
 
 export default function CustomersPage() {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [page, setPage] = useState(1);
+  const [totalPages, setTotalPages] = useState(1);
+  const [total, setTotal] = useState(0);
   const [showCreate, setShowCreate] = useState(false);
+  const [createError, setCreateError] = useState("");
   const [creating, setCreating] = useState(false);
   const [form, setForm] = useState({
     full_name: "", mobile_number: "", alternate_mobile: "", email: "",
@@ -24,26 +33,38 @@ export default function CustomersPage() {
     nominee_name: "", nominee_phone: "", nominee_relation: "", notes: "",
   });
 
-  const fetchCustomers = async () => {
+  const fetchCustomers = useCallback(async (nextPage: number = page) => {
     setLoading(true);
+    setError("");
     try {
-      const res = await customersApi.list({ search: search || undefined, per_page: 50 });
-      setCustomers(res.data);
-    } catch (e) { console.error(e); }
+      const res = await customersApi.list({
+        search: search || undefined,
+        page: nextPage,
+        per_page: PER_PAGE,
+      });
+      setCustomers(res.data ?? []);
+      setTotal(res.meta?.total ?? 0);
+      setTotalPages(Math.max(1, res.meta?.total_pages ?? 1));
+    } catch (e) {
+      setError(getApiErrorMessage(e, "Unable to load customers."));
+      setCustomers([]);
+    }
     finally { setLoading(false); }
-  };
+  }, [search, page]);
 
-  useEffect(() => { fetchCustomers(); }, [search]);
+  useEffect(() => { void fetchCustomers(); }, [fetchCustomers]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     setCreating(true);
+    setCreateError("");
     try {
       await customersApi.create({ ...form, date_of_birth: form.date_of_birth || undefined, gender: form.gender || undefined });
       setShowCreate(false);
       setForm({ full_name: "", mobile_number: "", alternate_mobile: "", email: "", date_of_birth: "", gender: "", address: "", city: "", state: "", pincode: "", pan_number: "", aadhar_number: "", occupation: "", nominee_name: "", nominee_phone: "", nominee_relation: "", notes: "" });
-      fetchCustomers();
-    } catch (e) { console.error(e); }
+      setPage(1);
+      await fetchCustomers(1);
+    } catch (e) { setCreateError(getApiErrorMessage(e, "Could not register this customer.")); }
     finally { setCreating(false); }
   };
 
@@ -60,13 +81,20 @@ export default function CustomersPage() {
           <button onClick={() => setShowCreate(true)} className="btn-primary"><Plus size={16} /> Register Customer</button>
         </div>
 
+        {error && (
+          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-danger-200 bg-danger-50 px-4 py-3 text-sm text-danger-700">
+            <span className="flex-1">{error}</span>
+            <button type="button" onClick={() => void fetchCustomers()} className="btn-secondary btn-sm">Retry</button>
+          </div>
+        )}
+
         {/* Search */}
         <div className="relative max-w-md">
           <Search size={16} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-surface-400" />
           <input
             type="text"
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => { setSearch(e.target.value); setPage(1); }}
             placeholder="Search by name, code, mobile, PAN..."
             className="input-field pl-10"
           />
@@ -78,45 +106,48 @@ export default function CustomersPage() {
         ) : customers.length === 0 ? (
           <EmptyState icon="👥" title="No customers yet" description="Register your first customer to get started." action={<button onClick={() => setShowCreate(true)} className="btn-primary"><UserPlus size={16} /> Register Customer</button>} />
         ) : (
-          <div className="table-container">
-            <table className="table">
-              <thead>
-                <tr>
-                  <th>Customer</th>
-                  <th>Mobile</th>
-                  <th>PAN</th>
-                  <th>City</th>
-                  <th>Status</th>
-                  <th>Created</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {customers.map((c) => (
-                  <tr key={c.id}>
-                    <td>
-                      <div className="flex items-center gap-3">
-                        <Avatar name={c.full_name} size="sm" />
-                        <div>
-                          <Link href={`/customers/${c.id}`} className="text-sm font-semibold text-surface-900 hover:text-brand-600 transition-colors">{c.full_name}</Link>
-                          <p className="text-xs text-surface-400">{c.customer_code}</p>
-                        </div>
-                      </div>
-                    </td>
-                    <td className="text-sm text-surface-600">{c.mobile_number}</td>
-                    <td className="text-sm font-mono text-surface-500">{c.pan_number || "—"}</td>
-                    <td className="text-sm text-surface-500">{c.city || "—"}</td>
-                    <td><span className={cn("badge", getStatusColor(c.status))}>{c.status}</span></td>
-                    <td className="text-sm text-surface-500">{formatDate(c.created_at)}</td>
-                    <td>
-                      <Link href={`/customers/${c.id}`} className="text-brand-600 hover:text-brand-700">
-                        <ChevronRight size={16} />
-                      </Link>
-                    </td>
+          <div className="card space-y-4">
+            <div className="table-container">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>Customer</th>
+                    <th>Mobile</th>
+                    <th>PAN</th>
+                    <th>City</th>
+                    <th>Status</th>
+                    <th>Created</th>
+                    <th></th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {customers.map((c) => (
+                    <tr key={c.id}>
+                      <td>
+                        <div className="flex items-center gap-3">
+                          <Avatar name={c.full_name} size="sm" />
+                          <div>
+                            <Link href={`/customers/${c.id}`} className="text-sm font-semibold text-surface-900 hover:text-brand-600 transition-colors">{c.full_name}</Link>
+                            <p className="text-xs text-surface-400">{c.customer_code}</p>
+                          </div>
+                        </div>
+                      </td>
+                      <td className="text-sm text-surface-600">{c.mobile_number}</td>
+                      <td className="text-sm font-mono text-surface-500">{c.pan_number || "—"}</td>
+                      <td className="text-sm text-surface-500">{c.city || "—"}</td>
+                      <td><span className={cn("badge", getStatusColor(c.status))}>{c.status}</span></td>
+                      <td className="text-sm text-surface-500">{formatDate(c.created_at)}</td>
+                      <td>
+                        <Link href={`/customers/${c.id}`} className="text-brand-600 hover:text-brand-700">
+                          <ChevronRight size={16} />
+                        </Link>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <Pagination page={page} totalPages={totalPages} total={total} perPage={PER_PAGE} onChange={setPage} disabled={loading} />
           </div>
         )}
       </div>
@@ -189,6 +220,12 @@ export default function CustomersPage() {
 
               {/* Notes */}
               <div><label className="input-label">Notes</label><textarea value={form.notes} onChange={(e) => update("notes", e.target.value)} className="input-field" rows={2} placeholder="Any additional notes..." /></div>
+
+              {createError && (
+                <p role="alert" className="flex items-center gap-2 rounded-xl border border-danger-200 bg-danger-50 p-3 text-sm text-danger-700">
+                  <AlertCircle size={15} /> {createError}
+                </p>
+              )}
 
               <div className="flex justify-end gap-3 border-t border-surface-100 pt-4">
                 <button type="button" onClick={() => setShowCreate(false)} className="btn-secondary">Cancel</button>

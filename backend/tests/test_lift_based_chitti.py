@@ -55,7 +55,12 @@ def test_lift_surcharge_starts_next_period_and_uses_original_value(
         Decimal("6200"),  # original final period; no extension
     ]
     schedule = engine.generate_period_schedule(date(2026, 1, 1), 10)
-    assert schedule[1]["due_date"] == date(2026, 1, 1) + timedelta(days=days_per_period)
+    expected_second_due = (
+        date(2026, 2, 1)
+        if frequency == "MONTHLY"
+        else date(2026, 1, 1) + timedelta(days=days_per_period)
+    )
+    assert schedule[1]["due_date"] == expected_second_due
     assert schedule[0]["expected_collection"] == Decimal("50000")
     # Generic period projection has no member lift events; member-specific
     # expected rows above verify the surcharge formula and API projections

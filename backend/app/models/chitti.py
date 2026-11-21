@@ -35,6 +35,7 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import BaseModel
+from app.models.enum_types import PermissiveEnum
 
 
 # ---------------------------------------------------------------------------
@@ -179,13 +180,16 @@ class ChittiMember(BaseModel):
     __tablename__ = "chitti_members"
     __table_args__ = (
         UniqueConstraint("chitti_id", "member_number", name="uq_chitti_member_number"),
+        # Aliases are compared case-insensitively; both the application check
+        # and this index use lower(alias) so a racing insert cannot bypass it.
         Index(
-            "uq_chitti_member_alias",
+            "uq_chitti_member_alias_ci",
             "chitti_id",
-            "alias",
+            text("lower(alias)"),
             unique=True,
             postgresql_where=text("alias IS NOT NULL"),
         ),
+        Index("ix_chitti_members_customer_id", "customer_id"),
     )
 
     chitti_id: Mapped[uuid.UUID] = mapped_column(
@@ -264,7 +268,9 @@ class ChittiLiftEvent(BaseModel):
 
     __tablename__ = "chitti_lift_events"
     __table_args__ = (
-        Index("uq_chitti_lift_period_active", "chitti_id", "period_number",
+        # One active lift per membership slot and period. A Chitti can now hold
+        # several slots for the same customer, and each slot lifts independently.
+        Index("uq_chitti_lift_period_active", "chitti_id", "member_id", "period_number",
               unique=True, postgresql_where=text("reversed_at IS NULL")),
     )
 
@@ -484,6 +490,11 @@ class ChittiAgreement(BaseModel):
     """Chitti enrollment agreement — snapshot of terms at enrollment time."""
 
     __tablename__ = "chitti_agreements"
+    __table_args__ = (
+        # Exactly one live agreement document belongs to one membership slot.
+        # The database constraint also serialises concurrent generation.
+        UniqueConstraint("chitti_member_id", name="uq_chitti_agreement_member"),
+    )
 
     agreement_number: Mapped[str] = mapped_column(
         String(30), unique=True, nullable=False, index=True
@@ -551,6 +562,12 @@ class ChittiTransaction(BaseModel):
     __tablename__ = "chitti_transactions"
     __table_args__ = (
         CheckConstraint("amount >= 0", name="ck_chitti_transaction_amount_nonnegative"),
+        # The cast keeps metadata-only DDL independent of when revision 0007
+        # adds the REFUND enum label; semantically this matches 0007's CHECK.
+        CheckConstraint(
+            "transaction_type::text <> 'REFUND' OR original_transaction_id IS NULL",
+            name="ck_chitti_transaction_refund_unlinked",
+        ),
         UniqueConstraint(
             "original_transaction_id",
             name="uq_chitti_transaction_original",
@@ -563,9 +580,10 @@ class ChittiTransaction(BaseModel):
         nullable=False,
     )
     transaction_type: Mapped[str] = mapped_column(
-        Enum(
+        PermissiveEnum(
             "CONTRIBUTION", "PAYOUT", "PENALTY", "FEE", "REVERSAL",
             name="chitti_transaction_type_enum",
+            validate_strings=False,
         ),
         nullable=False,
     )
@@ -622,9 +640,12 @@ class ChittiPaymentAllocation(BaseModel):
             "amount <> 0",
             name="ck_chitti_payment_allocation_amount_nonzero",
         ),
+        # Casts avoid requiring the 0007 enum labels at create_all() time.
+        # 0007's equivalent CHECK is unchanged; the casts are DDL-only.
         CheckConstraint(
-            "(allocation_type = 'CREDIT' AND contribution_id IS NULL) OR "
-            "(allocation_type = 'CONTRIBUTION' AND contribution_id IS NOT NULL)",
+            "(allocation_type::text = 'CREDIT' AND contribution_id IS NULL) OR "
+            "(allocation_type::text = 'CONTRIBUTION' AND contribution_id IS NOT NULL) OR "
+            "(allocation_type::text = 'UNRESOLVED' AND contribution_id IS NULL)",
             name="ck_chitti_payment_allocation_target",
         ),
         Index(
@@ -688,13 +709,18 @@ class ChittiPaymentAllocation(BaseModel):
         nullable=True,
     )
     allocation_type: Mapped[str] = mapped_column(
-        Enum("CONTRIBUTION", "CREDIT", name="chitti_payment_allocation_type_enum"),
+        PermissiveEnum(
+            "CONTRIBUTION", "CREDIT",
+            name="chitti_payment_allocation_type_enum",
+            validate_strings=False,
+        ),
         nullable=False,
     )
     event_type: Mapped[str] = mapped_column(
-        Enum(
+        PermissiveEnum(
             "PAYMENT", "REVERSAL", "CREDIT_UTILIZATION", "LIFT_ADJUSTMENT",
             name="chitti_payment_allocation_event_type_enum",
+            validate_strings=False,
         ),
         nullable=False,
     )

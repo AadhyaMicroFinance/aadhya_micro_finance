@@ -30,6 +30,8 @@ type StatusTab = "all" | "draft" | "running" | "completed";
 
 interface PendingRow {
   member_id: string;
+  member_number: number;
+  member_alias: string | null;
   member_name: string;
   mobile_number: string | null;
   chitti_id: string;
@@ -439,7 +441,11 @@ export default function ChittiWorkspacePage() {
                         <p className="truncate text-sm font-semibold text-surface-900">
                           {row.member_name}
                         </p>
-                        <p className="text-[11px] text-surface-500">{row.mobile_number || "—"}</p>
+                        <p className="text-[11px] text-surface-500">
+                          #{row.member_number}
+                          {row.member_alias ? ` · ${row.member_alias}` : ""}
+                          {" · "}{row.mobile_number || "—"}
+                        </p>
                       </div>
                       <p className="shrink-0 text-sm font-bold text-warning-600">
                         {money(row.amount_pending)}
@@ -465,7 +471,7 @@ export default function ChittiWorkspacePage() {
                         onClick={() =>
                           setCollect({
                             chittiId: row.chitti_id,
-                            member: { id: row.member_id, name: row.member_name },
+                            member: { id: row.member_id, name: row.member_name, number: row.member_number },
                             period: row.period_number,
                           })
                         }
@@ -494,7 +500,11 @@ export default function ChittiWorkspacePage() {
                       <tr key={`${row.chitti_id}-${row.member_id}-${row.period_number}`}>
                         <td>
                           <p className="font-medium text-surface-900">{row.member_name}</p>
-                          <p className="text-xs text-surface-500">{row.mobile_number || "—"}</p>
+                          <p className="text-xs text-surface-500">
+                            #{row.member_number}
+                            {row.member_alias ? ` · ${row.member_alias}` : ""}
+                            {" · "}{row.mobile_number || "—"}
+                          </p>
                         </td>
                         <td className="text-surface-600">{row.chitti_name}</td>
                         <td className="text-surface-600">Period {row.period_number}</td>
@@ -520,7 +530,7 @@ export default function ChittiWorkspacePage() {
                             onClick={() =>
                               setCollect({
                                 chittiId: row.chitti_id,
-                                member: { id: row.member_id, name: row.member_name },
+                                member: { id: row.member_id, name: row.member_name, number: row.member_number },
                                 period: row.period_number,
                               })
                             }

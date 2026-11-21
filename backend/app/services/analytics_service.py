@@ -99,7 +99,14 @@ class ChittiAnalyticsService:
 
         chittis = await self._load_chittis(chitti_id)
         if not chittis:
-            return self._empty_overview(start, end)
+            return self._empty_overview(
+                start,
+                end,
+                chitti_id=chitti_id,
+                member_id=member_id,
+                payment_mode=payment_mode,
+                status=status,
+            )
 
         chitti_ids = [c.id for c in chittis]
         plan_names = await self._load_plan_names(chittis)
@@ -254,7 +261,11 @@ class ChittiAnalyticsService:
         today_by_method = self._method_totals(today_txns)
 
         # ---- today's people counts ----
-        paid_member_ids = {t.member_id for t in today_txns if t.member_id}
+        paid_member_ids = {
+            t.member_id
+            for t in today_txns
+            if t.member_id and t.transaction_type == "CONTRIBUTION"
+        }
         due_today_members = {
             con.member_id
             for con, s in ((c, schedule_by_key.get((c.chitti_id, c.period_number))) for c in contributions)
@@ -297,17 +308,7 @@ class ChittiAnalyticsService:
         )
         advance_total = total_unallocated_credit + sum(
             (
-                max(row["contribution"].paid_amount - row["effective"]["expected"], ZERO)
-                + (
-                    row["effective"]["paid"]
-                    if schedule_by_key.get(
-                        (row["contribution"].chitti_id, row["contribution"].period_number)
-                    )
-                    and schedule_by_key[
-                        (row["contribution"].chitti_id, row["contribution"].period_number)
-                    ].due_date > today
-                    else ZERO
-                )
+                self._advance_amount(row, schedule_by_key, today)
                 for row in contribution_rows
                 if row["contribution"].chitti_id in financial_ids
             ),
@@ -594,6 +595,19 @@ class ChittiAnalyticsService:
         return total
 
     @staticmethod
+    def _advance_amount(row: dict, schedule_by_key: dict, today: date) -> Decimal:
+        """Advance cash for one contribution row, counted exactly once."""
+        schedule = schedule_by_key.get(
+            (row["contribution"].chitti_id, row["contribution"].period_number)
+        )
+        if schedule and schedule.due_date > today:
+            return row["effective"]["paid"]
+        return max(
+            row["contribution"].paid_amount - row["effective"]["expected"],
+            ZERO,
+        )
+
+    @staticmethod
     def _contribution_state(
         con: ChittiMemberContribution,
         due_date: Optional[date],
@@ -717,6 +731,7 @@ class ChittiAnalyticsService:
                     "member_id": str(member.id),
                     "chitti_id": str(member.chitti_id),
                     "member_number": member.member_number,
+                    "member_alias": member.alias,
                     "member_name": customer.full_name if customer else "—",
                     "customer_code": customer.customer_code if customer else None,
                     "mobile_number": customer.mobile_number if customer else None,
@@ -773,6 +788,8 @@ class ChittiAnalyticsService:
             details.append(
                 {
                     "member_id": str(member.id),
+                    "member_number": member.member_number,
+                    "member_alias": member.alias,
                     "member_name": customer.full_name if customer else "—",
                     "mobile_number": customer.mobile_number if customer else None,
                     "chitti_id": str(con.chitti_id),
@@ -812,10 +829,9 @@ class ChittiAnalyticsService:
     def _daily_series(
         self, schedules, ledger, start: date, end: date, today: date, period_values: dict
     ) -> list[dict]:
+        # The chart keeps the full requested range so its totals agree with the
+        # KPI cards; callers control performance through the date filter.
         span = (end - start).days
-        if span > 120:
-            start = end - timedelta(days=119)
-            span = 119
 
         expected_by_date: dict = {}
         pending_by_date: dict = {}
@@ -1032,7 +1048,7 @@ class ChittiAnalyticsService:
             rows.append(
                 {
                     "id": str(t.id),
-                    "transaction_id": f"CTX-{str(t.id).split('-')[0].upper()}",
+                    "transaction_id": f"CTX-{str(t.id).upper()}",
                     "member_id": str(t.member_id) if t.member_id else None,
                     "member_name": customer.full_name if customer else "—",
                     "chitti_id": str(t.chitti_id),
@@ -1057,15 +1073,26 @@ class ChittiAnalyticsService:
     # Empty payload
     # =========================================================================
 
-    def _empty_overview(self, start: date, end: date) -> dict:
+    def _empty_overview(
+        self,
+        start: date,
+        end: date,
+        *,
+        chitti_id: Optional[UUID] = None,
+        member_id: Optional[UUID] = None,
+        payment_mode: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> dict:
         return {
             "filters": {
                 "start_date": str(start),
                 "end_date": str(end),
-                "chitti_id": None,
-                "member_id": None,
-                "payment_mode": None,
-                "status": None,
+                # Keep the requested scope visible; an empty result must not
+                # silently look like an unfiltered overview.
+                "chitti_id": str(chitti_id) if chitti_id else None,
+                "member_id": str(member_id) if member_id else None,
+                "payment_mode": payment_mode,
+                "status": status,
             },
             "today": {
                 "date": str(today_ist()),

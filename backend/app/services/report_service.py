@@ -183,14 +183,27 @@ class ReportService:
                 elif row["source"] == "CHITTI":
                     group["chitti_collected"] += amount
             breakdown = sorted(groups.values(), key=lambda group: group["name"])
+        gross_collections = sum(
+            (Decimal(str(r["amount"])) for r in rows if not r.get("is_reversal")),
+            Decimal("0"),
+        )
+        reversals_total = sum(
+            (Decimal(str(r["amount"])) for r in rows if r.get("is_reversal")),
+            Decimal("0"),
+        )
+        net_collections = gross_collections - reversals_total
         return present({
             "report_type": report_type, "start_date": str(start_date), "end_date": str(end_date),
-            "collected_total": sum((Decimal(str(r["amount"])) * (-1 if r.get("is_reversal") else 1) for r in rows), Decimal("0")),
+            "gross_collections": gross_collections,
+            "reversals_total": reversals_total,
+            "net_collections": net_collections,
+            "collected_total": net_collections,
             "finance_collected": sum((Decimal(str(r["amount"])) * (-1 if r.get("is_reversal") else 1) for r in summary_finance_rows), Decimal("0")),
             "chitti_collected": sum((Decimal(str(r["amount"])) * (-1 if r.get("is_reversal") else 1) for r in summary_chitti_rows), Decimal("0")),
             "finance_pending": sum((Decimal(str(r["pending"])) for r in summary_finance_due), Decimal("0")),
             "chitti_pending": sum((Decimal(str(r["pending"])) for r in summary_chitti_due), Decimal("0")),
             "chitti_unallocated_credit": await self._unallocated_credit_total(),
+            "chitti_refunded": await self._chitti_refunded_total(start_date, end_date),
             "transactions": rows, "pending_details": pending,
             "breakdown": breakdown,
         })
@@ -248,8 +261,22 @@ class ReportService:
             "finance_pending": pending["finance"],
             "chitti_pending": pending["chitti"],
             "chitti_unallocated_credit": await self._unallocated_credit_total(),
+            "chitti_refunded": await self._chitti_refunded_total(d),
             "collection_rate": float(collection_rate),
         })
+
+    async def _chitti_refunded_total(
+        self, start_date: Optional[date] = None, end_date: Optional[date] = None
+    ) -> Decimal:
+        """Cash refunded against Chitti receipts; never collection income."""
+        query = select(
+            func.coalesce(func.sum(ChittiTransaction.amount), Decimal("0"))
+        ).where(ChittiTransaction.transaction_type == "REFUND")
+        if start_date is not None:
+            query = query.where(ChittiTransaction.payment_date >= start_date)
+        if end_date is not None:
+            query = query.where(ChittiTransaction.payment_date <= end_date)
+        return Decimal(str((await self.session.execute(query)).scalar_one()))
 
     async def _unallocated_credit_total(self) -> Decimal:
         result = await self.session.execute(
@@ -511,6 +538,7 @@ class ReportService:
                 Chitti.chitti_code,
                 Chitti.name.label("chitti_name"),
                 ChittiMember.member_number,
+                ChittiMember.alias.label("member_alias"),
                 Customer.id.label("customer_id"),
                 Customer.full_name,
                 Customer.customer_code,
@@ -557,6 +585,7 @@ class ReportService:
                 "due_date": str(r.due_date),
                 "chitti_name": r.chitti_name,
                 "member_number": r.member_number,
+                "member_alias": r.member_alias,
                 "expected": effective["expected"],
                 "paid": effective["paid"],
                 "pending": effective["remaining"],
@@ -588,7 +617,9 @@ class ReportService:
                 "collector_name": row.collector_name or "—", "amount": txn.amount,
                 "payment_method": txn.payment_method, "status": txn.status,
                 "is_reversal": txn.is_reversal,
-                "source": "CHITTI" if txn.chitti_account_id else "FINANCE" if txn.finance_account_id else "OTHER",
+                # payment_transactions is Finance-owned; Chitti rows live in
+                # chitti_transactions and are merged below.
+                "source": "FINANCE",
                 "payment_date": str(txn.payment_date),
             }))
         chit = await self.session.execute(
@@ -652,11 +683,9 @@ class ReportService:
                     "payment_method": txn.payment_method,
                     "status": txn.status,
                     "is_reversal": txn.is_reversal,
-                    "source": (
-                        "CHITTI" if txn.chitti_account_id
-                        else "FINANCE" if txn.finance_account_id
-                        else "OTHER"
-                    ),
+                    # payment_transactions is Finance-owned; Chitti rows are
+                    # appended from their own ledger below.
+                    "source": "FINANCE",
                 },
             ))
 
@@ -681,7 +710,7 @@ class ReportService:
                 txn.created_at,
                 {
                     "id": str(txn.id),
-                    "transaction_id": f"CTX-{str(txn.id).split('-')[0].upper()}",
+                    "transaction_id": f"CTX-{str(txn.id).upper()}",
                     "customer_name": row.customer_name or "—",
                     "customer_code": row.customer_code,
                     "collector_name": row.collector_name or "—",

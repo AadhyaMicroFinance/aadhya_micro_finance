@@ -12,6 +12,7 @@ from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
+from app.utils.dates import add_months
 from app.core.chitti_rules import (
     AuctionPayoutRule,
     ContributionRule,
@@ -322,6 +323,8 @@ def get_due_dates(
 ) -> list[date]:
     """Generate due dates for each period based on frequency."""
     days = FREQUENCY_DAYS.get(frequency, 30)
+    if frequency == "MONTHLY":
+        return [add_months(start_date, i) for i in range(total_periods)]
     return [start_date + timedelta(days=days * i) for i in range(total_periods)]
 
 

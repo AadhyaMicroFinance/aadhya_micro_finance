@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuthStore } from "@/hooks/useAuth";
+import { getApiErrorStatus, getApiErrorMessage } from "@/services/api-client";
 import BrandLockup from "@/components/branding/BrandLockup";
 import { Eye, EyeOff, ArrowRight } from "lucide-react";
 
@@ -18,12 +19,33 @@ export default function LoginPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+
+    const normalizedUsername = username.trim();
+    if (!normalizedUsername) {
+      setError("Enter your username.");
+      return;
+    }
+    // Password managers sometimes append an invisible trailing space. Reject
+    // it explicitly instead of silently changing the credential sent to the
+    // server or leaving the user with a misleading authentication error.
+    if (password !== password.trim()) {
+      setError("Password cannot contain leading or trailing spaces.");
+      return;
+    }
+
     setLoading(true);
     try {
-      await login(username, password);
+      await login(normalizedUsername, password);
       router.push("/dashboard");
-    } catch {
-      setError("Invalid username or password");
+    } catch (e) {
+      const status = getApiErrorStatus(e);
+      if (status === 423) {
+        setError(getApiErrorMessage(e, "This account is locked. Please contact an administrator."));
+      } else if (status === 401 || status === 400) {
+        setError(getApiErrorMessage(e, "Invalid username or password."));
+      } else {
+        setError(getApiErrorMessage(e, "Sign-in is unavailable right now. Please try again."));
+      }
     } finally {
       setLoading(false);
     }

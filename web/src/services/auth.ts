@@ -1,9 +1,9 @@
-import apiClient from "./api-client";
+import apiClient, { publicApiClient } from "./api-client";
 import type { ApiResponse, LoginRequest, TokenResponse, MeResponse } from "@/types";
 
 export const authApi = {
   login: async (data: LoginRequest): Promise<TokenResponse> => {
-    const res = await apiClient.post<ApiResponse<TokenResponse>>("/auth/login", data);
+    const res = await publicApiClient.post<ApiResponse<TokenResponse>>("/auth/login", data);
     return res.data.data;
   },
 
@@ -13,7 +13,7 @@ export const authApi = {
   },
 
   refresh: async (refreshToken: string): Promise<TokenResponse> => {
-    const res = await apiClient.post<ApiResponse<TokenResponse>>("/auth/refresh", {
+    const res = await publicApiClient.post<ApiResponse<TokenResponse>>("/auth/refresh", {
       refresh_token: refreshToken,
     });
     return res.data.data;

@@ -229,23 +229,29 @@ function AddMemberModal({
   chittiId,
   currentCount,
   maxCount,
-  enrolledCustomerIds,
+  existingMembers,
   onClose,
   onAdded,
 }: {
   chittiId: string;
   currentCount: number;
   maxCount: number;
-  enrolledCustomerIds: Set<string>;
+  existingMembers: ChittiMember[];
   onClose: () => void;
-  onAdded: () => void;
+  onAdded: (member: ChittiMember) => void;
 }) {
   const [search, setSearch] = useState("");
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState(false);
   const [adding, setAdding] = useState(false);
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
+  const [alias, setAlias] = useState("");
   const [error, setError] = useState("");
+
+  const existingSlotsForSelected = selectedCustomer
+    ? existingMembers.filter((m) => m.customer_id === selectedCustomer.id)
+    : [];
+  const aliasRequired = existingSlotsForSelected.length > 0;
 
   const searchCustomers = useCallback(async (q: string) => {
     if (q.length < 2) { setCustomers([]); return; }
@@ -264,18 +270,22 @@ function AddMemberModal({
 
   const handleAdd = async () => {
     if (!selectedCustomer) return;
+    const trimmedAlias = alias.trim();
+    if (aliasRequired && !trimmedAlias) {
+      setError("This customer already has a slot in this Chitti. Enter a unique alias for the new slot.");
+      return;
+    }
     setAdding(true);
     setError("");
     try {
-      await chittiApi.addMember(chittiId, {
+      const created = await chittiApi.addMember(chittiId, {
         customer_id: selectedCustomer.id,
-        payout_order: currentCount + 1,
+        ...(trimmedAlias ? { alias: trimmedAlias } : {}),
       });
-      onAdded();
+      onAdded(created);
     } catch (e: unknown) {
-      // The API sends a specific 409 (DUPLICATE_ENROLLMENT) message; show it
-      // instead of the generic "Request failed with status code 409". The
-      // dialog stays open with the selected customer preserved.
+      // Keep the dialog open with the selected customer so the operator can
+      // correct the alias or choose another customer.
       setError(getApiErrorMessage(e, "Failed to add member. Please try again."));
     } finally {
       setAdding(false);
@@ -287,8 +297,8 @@ function AddMemberModal({
       <div className="modal-content max-w-lg p-4 sm:p-6" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-6">
           <div>
-            <h2 className="text-lg font-bold text-surface-900">Add Member</h2>
-            <p className="text-sm text-surface-500">Members: {currentCount} / {maxCount} • Next: #{currentCount + 1}</p>
+            <h2 className="text-lg font-bold text-surface-900">Add Member Slot</h2>
+            <p className="text-sm text-surface-500">Slots: {currentCount} / {maxCount} • Member number is assigned by the server</p>
           </div>
           <button onClick={onClose} className="rounded-lg p-2 text-surface-400 hover:bg-surface-100 transition-colors">
             <X size={18} />
@@ -314,24 +324,22 @@ function AddMemberModal({
             {customers.length > 0 && (
               <div className="max-h-60 overflow-y-auto rounded-xl border border-surface-100 divide-y divide-surface-50">
                 {customers.map((c) => {
-                  const alreadyEnrolled = enrolledCustomerIds.has(c.id);
+                  const slotCount = existingMembers.filter((m) => m.customer_id === c.id).length;
                   return (
                     <button
                       key={c.id}
-                      onClick={() => { if (!alreadyEnrolled) setSelectedCustomer(c); }}
-                      disabled={alreadyEnrolled}
-                      className={cn(
-                        "w-full text-left p-4 flex items-center gap-3 transition-colors",
-                        alreadyEnrolled ? "cursor-not-allowed opacity-60" : "hover:bg-surface-50"
-                      )}
+                      onClick={() => { setSelectedCustomer(c); setAlias(""); setError(""); }}
+                      className="w-full text-left p-4 flex items-center gap-3 transition-colors hover:bg-surface-50"
                     >
                       <Avatar name={c.full_name} size="md" />
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium text-surface-900 truncate">{c.full_name}</p>
                         <p className="text-xs text-surface-500">{c.customer_code} • {c.mobile_number}</p>
                       </div>
-                      {alreadyEnrolled ? (
-                        <span className="badge badge-warning">Already enrolled</span>
+                      {slotCount > 0 ? (
+                        <span className="badge badge-brand whitespace-nowrap">
+                          {slotCount} existing slot{slotCount === 1 ? "" : "s"}
+                        </span>
                       ) : (
                         <ChevronRight size={16} className="text-surface-300" />
                       )}
@@ -360,6 +368,38 @@ function AddMemberModal({
               </button>
             </div>
 
+            {existingSlotsForSelected.length > 0 && (
+              <div className="rounded-xl border border-brand-100 bg-brand-50/60 p-3 text-sm">
+                <p className="font-medium text-brand-800">Existing slots for this customer</p>
+                <ul className="mt-1 space-y-0.5 text-xs text-brand-700">
+                  {existingSlotsForSelected.map((slot) => (
+                    <li key={slot.id}>
+                      #{slot.member_number}
+                      {slot.alias ? ` · ${slot.alias}` : ""} · {slot.status.replace(/_/g, " ")}
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-2 text-xs text-brand-700">
+                  Enter a unique alias for this new slot so payments and agreements stay separate.
+                </p>
+              </div>
+            )}
+
+            <div>
+              <label htmlFor="member-alias" className="mb-1.5 block text-sm font-medium text-surface-700">
+                Slot alias {aliasRequired ? <span className="text-danger-600">*</span> : <span className="font-normal text-surface-400">(optional)</span>}
+              </label>
+              <input
+                id="member-alias"
+                type="text"
+                value={alias}
+                onChange={(e) => setAlias(e.target.value)}
+                maxLength={100}
+                placeholder={aliasRequired ? "e.g. Test1 Slot 2" : "e.g. Test1 Slot 1"}
+                className="input-field"
+              />
+            </div>
+
             {error && (
               <div className="rounded-xl bg-danger-50 border border-danger-100 p-3 text-sm text-danger-700">{error}</div>
             )}
@@ -367,7 +407,7 @@ function AddMemberModal({
             <div className="flex flex-col-reverse gap-2 sm:flex-row sm:gap-3">
               <button onClick={onClose} className="btn-secondary flex-1">Cancel</button>
               <button onClick={handleAdd} disabled={adding} className="btn-primary flex-1">
-                {adding ? "Adding..." : `Add as Member #${currentCount + 1}`}
+                {adding ? "Adding..." : "Add slot"}
               </button>
             </div>
           </div>
@@ -442,7 +482,7 @@ export default function ChittiDetailPage() {
 
   const loadMembers = async () => {
     try { setMembers(await chittiApi.listMembers(chittiId)); }
-    catch (e) { console.error(e); }
+    catch (e) { setFeedback({ type: "error", message: getApiErrorMessage(e, "Could not load members.") }); }
   };
 
   const loadTab = async (tab: Tab) => {
@@ -450,7 +490,8 @@ export default function ChittiDetailPage() {
     setSelectedMember(null);
     if (tab === "members") await loadMembers();
     if (tab === "schedule" && schedule.length === 0) {
-      try { setSchedule(await chittiApi.getSchedule(chittiId)); } catch (e) { console.error(e); }
+      try { setSchedule(await chittiApi.getSchedule(chittiId)); }
+      catch (e) { setFeedback({ type: "error", message: getApiErrorMessage(e, "Could not load the schedule.") }); }
     }
     if (tab === "payouts") {
       try {
@@ -460,7 +501,7 @@ export default function ChittiDetailPage() {
         ]);
         setSchedule(periods);
         setPayouts(actualPayouts);
-      } catch (e) { console.error(e); }
+      } catch (e) { setFeedback({ type: "error", message: getApiErrorMessage(e, "Could not load payouts.") }); }
     }
     if (tab === "lifts") {
       try {
@@ -628,7 +669,10 @@ export default function ChittiDetailPage() {
   // a seat and must be counted the same way the Members tab counts them.
   const memberCapacity = summary.member_capacity ?? summary.member_count;
   const currentMemberCount = summary.enrolled_members ?? members.length;
-  const enrolledCustomerIds = new Set(members.map((m) => m.customer_id));
+  const payoutSlotLabel = (memberId?: string | null) => {
+    const member = members.find((m) => m.id === memberId);
+    return member ? `#${member.member_number}${member.alias ? ` · ${member.alias}` : ""}` : null;
+  };
 
   return (
     <DashboardLayout>
@@ -961,7 +1005,14 @@ export default function ChittiDetailPage() {
                             <span className="font-semibold">Period {period.period_number}</span>
                             <span className={cn("badge", actual ? getStatusColor(actual.status) : "badge-warning")}>{actual ? actual.status : "SCHEDULED"}</span>
                           </div>
-                          <p className="mt-1 text-sm text-surface-600">{member?.customer_name || (period.scheduled_member_number ? `Member #${period.scheduled_member_number}` : "Recipient not assigned")}</p>
+                          <p className="mt-1 text-sm text-surface-600">
+                            {member?.customer_name || (period.scheduled_member_number ? `Member #${period.scheduled_member_number}` : "Recipient not assigned")}
+                            {payoutSlotLabel(member?.id) && (
+                              <span className="ml-1 font-mono text-[11px] text-surface-500">
+                                {payoutSlotLabel(member?.id)}
+                              </span>
+                            )}
+                          </p>
                           <p className="mt-1 text-xs text-surface-500">Period due: {formatDate(period.due_date)}</p>
                           <div className="mt-2 flex justify-between gap-2 text-sm"><span className="text-surface-500">Expected net</span><span className="font-semibold">{formatCurrency(period.expected_payout)}</span></div>
                           {Number(period.expected_payout_fee || 0) > 0 && <div className="flex justify-between gap-2 text-xs text-surface-500"><span>Expected fee</span><span>{formatCurrency(period.expected_payout_fee || 0)}</span></div>}
@@ -980,7 +1031,16 @@ export default function ChittiDetailPage() {
                             <tr key={`scheduled-${period.id}`}>
                               <td>{period.period_number}</td>
                               <td>{formatDate(period.due_date)}</td>
-                              <td>{member?.customer_name || (period.scheduled_member_number ? `Member #${period.scheduled_member_number}` : "Not assigned")}</td>
+                              <td>
+                                <div className="flex flex-col">
+                                  <span>{member?.customer_name || (period.scheduled_member_number ? `Member #${period.scheduled_member_number}` : "Not assigned")}</span>
+                                  {payoutSlotLabel(member?.id) && (
+                                    <span className="font-mono text-xs text-surface-500">
+                                      {payoutSlotLabel(member?.id)}
+                                    </span>
+                                  )}
+                                </div>
+                              </td>
                               <td className="font-medium">{formatCurrency(period.expected_payout)}</td>
                               <td>{formatCurrency(period.expected_payout_fee || 0)}</td>
                               <td><span className={cn("badge", actual ? getStatusColor(actual.status) : "badge-warning")}>{actual ? actual.status : "SCHEDULED"}</span></td>
@@ -1013,7 +1073,9 @@ export default function ChittiDetailPage() {
                         <Avatar name={p.customer_name || ""} size="sm" />
                         <div className="min-w-0">
                           <p className="truncate text-sm font-semibold text-surface-900">{p.customer_name || "—"}</p>
-                          <p className="text-[11px] text-surface-500">Period {p.period_number}</p>
+                          <p className="text-[11px] text-surface-500">
+                            {payoutSlotLabel(p.member_id) ? `${payoutSlotLabel(p.member_id)} · ` : ""}Period {p.period_number}
+                          </p>
                         </div>
                       </div>
                       <span className={cn("badge text-[10px]", getStatusColor(p.status))}>{p.status}</span>
@@ -1043,7 +1105,15 @@ export default function ChittiDetailPage() {
                     {payouts.map((p) => (
                       <tr key={p.id}>
                         <td>{p.period_number}</td>
-                        <td><div className="flex items-center gap-2"><Avatar name={p.customer_name || ""} size="sm" /><span className="font-medium">{p.customer_name || "—"}</span></div></td>
+                        <td>
+                          <div className="flex items-center gap-2">
+                            <Avatar name={p.customer_name || ""} size="sm" />
+                            <span className="font-medium">{p.customer_name || "—"}</span>
+                            {payoutSlotLabel(p.member_id) && (
+                              <span className="font-mono text-xs text-surface-500">{payoutSlotLabel(p.member_id)}</span>
+                            )}
+                          </div>
+                        </td>
                         <td>{formatCurrency(p.gross_payout)}</td>
                         <td className="text-danger-600">{formatCurrency(p.discount_amount)}</td>
                         <td>{formatCurrency(p.fee_amount)}</td>
@@ -1152,7 +1222,23 @@ export default function ChittiDetailPage() {
           }}
         />
       )}
-      {showAddMember && <AddMemberModal chittiId={chittiId} currentCount={currentMemberCount} maxCount={memberCapacity} enrolledCustomerIds={enrolledCustomerIds} onClose={() => setShowAddMember(false)} onAdded={async () => { setShowAddMember(false); await loadData(); setFeedback({ type: "success", message: "Member enrolled successfully." }); }} />}
+      {showAddMember && (
+        <AddMemberModal
+          chittiId={chittiId}
+          currentCount={currentMemberCount}
+          maxCount={memberCapacity}
+          existingMembers={members}
+          onClose={() => setShowAddMember(false)}
+          onAdded={async (member) => {
+            setShowAddMember(false);
+            await loadData();
+            setFeedback({
+              type: "success",
+              message: `Slot #${member.member_number}${member.alias ? ` (${member.alias})` : ""} added. Membership ID: ${member.id}.`,
+            });
+          }}
+        />
+      )}
       {showAgreement && selectedMember && <AgreementPreviewModal agreement={showAgreement} chittiName={chitti.name} memberName={selectedMember.customer_name || ""} onClose={() => setShowAgreement(null)} onPrint={() => handlePrintAgreement(selectedMember.id)} onConfirm={() => handleConfirmAgreement(selectedMember.id)} />}
     </DashboardLayout>
   );
